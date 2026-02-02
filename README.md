@@ -3,7 +3,7 @@
 ## Overview
 Prebuilt tensor backend for Pauli propagation surrogate.
 This repo ships **precompiled wheels** in `dist/`.
-
+![alt text](img/image.png)
 ## Requirements
 - Python **3.10**
 - Linux x86_64 (for provided wheel)
