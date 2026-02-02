@@ -50,10 +50,6 @@ Pauli-propagation-surrogate/
 ├── MANIFEST.in                  # Distribution file rules
 ├── dist/                        # Prebuilt wheel files
 │   └── pauli_propagation_surrogate_tensor-0.1.0-cp310-cp310-linux_x86_64.whl
-├── src/                         # Python API (user-facing)
-│   ├── __init__.py
-│   ├── pauli_surrogate_python.py
-│   └── circuit_qasm.py
 └── Tutorial.ipynb               # Main tutorial notebook
 ```
 
