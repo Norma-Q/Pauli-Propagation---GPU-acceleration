@@ -44,7 +44,7 @@ Pauli-propagation-surrogate/
 ├── README.md                    # This file (installation & usage)
 ├── IMPLEMENTATION_SUMMARY.md    # Technical documentation (developers)
 ├── LICENSE                      # GNU AGPLv3 license
-├── environment_310.yml          # Conda environment (Python 3.10)
+├── environment_311.yml          # Conda environment (Python 3.11)
 ├── setup.py                     # Package configuration
 ├── MANIFEST.in                  # Distribution file rules
 ├── dist/                        # Prebuilt wheel files
@@ -59,7 +59,7 @@ Pauli-propagation-surrogate/
 This repository follows a **prebuilt-binary distribution model**:
 - The compiled backend (`src_tensor._pps_tensor_backend*.so`) is included in official wheels
 - Building from this repo alone produces a Python-only wheel (no backend) that will fail at runtime
-- Wheels are **platform and Python-version specific** (e.g., `cp310` = Python 3.10)
+- Wheels are **platform and Python-version specific** (e.g., `cp311` = Python 3.11)
 
 For developers: see [IMPLEMENTATION_SUMMARY.md](IMPLEMENTATION_SUMMARY.md) for technical details.
 
