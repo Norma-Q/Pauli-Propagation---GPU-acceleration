@@ -4,19 +4,19 @@ Prebuilt tensor backend for Pauli propagation surrogate.
 This repo ships **precompiled wheels** in `dist/`.
 ![alt text](img/image.png)
 ## Requirements
-- Python **3.10**
+- Python **3.11**
 - Linux x86_64 (for provided wheel)
 - CUDA 12.x (for GPU use)
 
 ## Environment Setup
 ```bash
-conda env create -f environment_310.yml
-conda activate ENV_310
+conda env create -f environment_311.yml
+conda activate ENV_311
 ```
 
 ## Install Wheel
 ```bash
-pip install dist/pauli_propagation_surrogate_tensor-0.1.0-cp310-cp310-linux_x86_64.whl
+pip install dist/pauli_propagation_surrogate_tensor-0.1.0-cp311-cp311-linux_x86_64.whl
 ```
 
 ## Verify Installation
@@ -48,7 +48,7 @@ Pauli-propagation-surrogate/
 ├── setup.py                     # Package configuration
 ├── MANIFEST.in                  # Distribution file rules
 ├── dist/                        # Prebuilt wheel files
-│   └── pauli_propagation_surrogate_tensor-0.1.0-cp310-cp310-linux_x86_64.whl
+│   └── pauli_propagation_surrogate_tensor-0.1.0-cp311-cp311-linux_x86_64.whl
 └── Tutorial.ipynb               # Main tutorial notebook
 ```
 
