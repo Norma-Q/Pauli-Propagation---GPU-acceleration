@@ -1,5 +1,5 @@
 # Pauli Propagation Surrogate (Tensor)
-
+![alt text](img/NORMA_CI.png)
 ## Overview
 Prebuilt tensor backend for Pauli propagation surrogate.
 This repo ships **precompiled wheels** in `dist/`.
