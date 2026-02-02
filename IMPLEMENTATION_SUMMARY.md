@@ -1,0 +1,142 @@
+# Implementation Summary (Pauli Propagation Surrogate)
+
+This repository contains a tensor-first (PyTorch) implementation of a *Pauli propagation surrogate* pipeline.
+
+High-level goal:
+- Keep a clean, distributable Python API.
+- Hide the sensitive “core propagation engine” logic inside a compiled native extension.
+- Represent propagation as sparse linear maps so later evaluation can be done with batched GPU ops.
+
+## What “tensor surrogate propagation” means here
+
+Given:
+- a quantum circuit (Cliffords + parameterized Pauli rotations), and
+- an observable expressed as a sum of Pauli strings,
+
+we propagate the observable backwards through the circuit (Heisenberg picture) and build a *surrogate representation* consisting of:
+- tensor bitmask arrays for Pauli terms, and
+- a sequence of sparse steps (`TensorSparseStep`) that map coefficient vectors between layers.
+
+Later, the surrogate can be evaluated for specific parameter values by applying these sparse steps with $\cos(\theta)$ / $\sin(\theta)$ mixing.
+
+## Design constraints
+
+- Public entrypoint stays in Python: `propagate_surrogate_tensor` lives in src_tensor/tensor_propagate.py.
+- Core step-building logic is distributed as a compiled extension (C++/pybind + ATen): src_tensor/_pps_tensor_backend*.so.
+- `src_tensor/tensor_propagate_impl.py` is intentionally a thin wrapper around the compiled backend (no pure-Python fallback in production).
+- Current tensor backend supports up to 63 qubits (uses `int64` bitmasks).
+
+## Data representation
+
+### Pauli strings as symplectic bitmasks
+Each Pauli string on `n` qubits is represented by two `int64` bitmasks:
+- `x_mask`: bit `q` is 1 if Pauli has an X on qubit `q` (X or Y)
+- `z_mask`: bit `q` is 1 if Pauli has a Z on qubit `q` (Z or Y)
+
+So:
+- I: (0, 0)
+- X: (1, 0)
+- Z: (0, 1)
+- Y: (1, 1)
+
+### Surrogate as “bitmasks + sparse steps”
+`TensorPauliSum` (src_tensor/tensor_types.py) stores:
+- `x_mask`, `z_mask`: shape `[n_terms]`
+- `coeff_init`: initial coefficients for each term (vector)
+- `steps`: list of `TensorSparseStep`
+
+Each `TensorSparseStep` contains three sparse matrices of identical shape:
+- `mat_const`
+- `mat_cos`
+- `mat_sin`
+
+Interpretation:
+- for a gate with parameter index `k`, the step maps coefficients as
+
+$$
+\mathbf{c}_{out} = \mathbf{M}_{const}\,\mathbf{c}_{in} + \cos(\theta_k)\,\mathbf{M}_{cos}\,\mathbf{c}_{in} + \sin(\theta_k)\,\mathbf{M}_{sin}\,\mathbf{c}_{in}
+$$
+
+For Clifford gates, only `mat_const` is used.
+
+## Key modules and responsibilities
+
+- src_tensor/tensor_propagate.py
+  - Public API:
+    - `propagate_surrogate_tensor(...)`
+    - `zero_filter_tensor(...)`
+    - `zero_filter_tensor_backprop(...)`
+  - Non-sensitive helpers (selection/backprop filtering) implemented in Python.
+
+- src_tensor/tensor_propagate_impl.py
+  - Thin wrapper around the compiled backend.
+  - Exposes:
+    - `build_clifford_step(...)`
+    - `build_pauli_rotation_step(...)`
+  - Raises `CPPBackendUnavailableError` if the native extension is not built.
+
+
+- test/parity_check_tensor_backend.py
+  - Dev-only parity check: compares the compiled backend vs the Python reference.
+
+## Pipeline outline
+
+### 1) Propagation + step construction
+`propagate_surrogate_tensor(...)` iterates gates in reverse order and repeatedly:
+- updates the current `(x_mask, z_mask)` tensors (term identities), and
+- appends a `TensorSparseStep` describing how coefficients map through this gate.
+
+The heavy logic for “how does this gate change terms + coefficients?” lives in the native extension.
+
+### 2) Diagonal-only filtering (optional)
+Many workflows only need diagonal terms (`x_mask == 0`) for expectation values in the computational basis.
+
+Two utilities are provided:
+- `zero_filter_tensor(psum)`: filters terms and appends a selection step.
+- `zero_filter_tensor_backprop(psum)`: aggressively prunes rows/cols through all sparse steps to reduce work.
+
+This pruning is implemented in Python and uses sparse COO introspection.
+
+## Native backend and distribution model
+
+The goal of the C++ backend is *not* raw speed alone; it is also to keep core propagation logic out of distributable Python sources.
+
+Production behavior:
+- If the native extension is missing, `src_tensor/tensor_propagate_impl.py` raises an error instructing you to install an official wheel/binary that includes the backend.
+- Dev-only reference code stays in dev_backend/ and is excluded from sdists/wheels.
+
+## Packaging / build instructions
+
+See README_PACKAGING.md for the canonical commands.
+
+In brief:
+This repo uses a prebuilt-binary distribution model:
+- Official wheels include `src_tensor._pps_tensor_backend*`.
+- The public repo does not ship the backend sources and does not build the extension.
+
+The compiled artifact is placed under `src_tensor/` as:
+- `src_tensor/_pps_tensor_backend*.so`
+
+## Testing / validation
+
+- Parity check (dev-only):
+  - `python test/parity_check_tensor_backend.py`
+
+This compares the sparse steps generated by the compiled backend against a Python reference implementation.
+
+## Current status and roadmap
+
+Current state:
+- Compiled C++ backend builds successfully and is importable.
+- Python wrapper is minimal and requires the compiled backend.
+- Propagation produces `TensorPauliSum` with sparse steps.
+- Optional zero-filtering + backprop pruning exists.
+
+Roadmap (high level):
+1. End-to-end evaluation on GPU using the step sequence (batched theta evaluation)
+2. Benchmarking (CPU vs GPU, pruning effectiveness)
+3. Extend bitmask strategy beyond 63 qubits (if needed)
+
+---
+
+Last updated: 2026-01-30
