@@ -1,5 +1,4 @@
 # Pauli Propagation Surrogate (Tensor)
-![alt text](img/NORMA_CI.png)
 ## Overview
 Prebuilt tensor backend for Pauli propagation surrogate.
 This repo ships **precompiled wheels** in `dist/`.
@@ -23,7 +22,7 @@ pip install dist/pauli_propagation_surrogate_tensor-0.1.0-cp310-cp310-linux_x86_
 ## Verify Installation
 After installing the wheel, verify the backend is working correctly:
 ```python
-python -c "from src_tensor import _pps_tensor_backend; print('Backend loaded successfully!')"
+python -c "from src_tensor import _pps_tensor_backend; print('Backend loaded successfully')"
 ```
 
 If no errors occur, the installation is successful.
@@ -76,3 +75,5 @@ GNU AGPLv3 (see LICENSE)
 Copyright (C) 2026 ys_lee@norma.co.kr
 
 This program is licensed under the GNU Affero General Public License v3.0.
+
+<img src="img/NORMA_CI.png" width="50%">
