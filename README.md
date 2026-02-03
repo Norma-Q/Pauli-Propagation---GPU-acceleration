@@ -30,18 +30,16 @@ Our tensor-based Pauli Propagation approach solves these issues by:
 - **Scaling to larger problems** via intelligent truncation that preserves accuracy
 
 ### Context: where this fits in modern QML
-Many near-term quantum algorithms (e.g., VQE/QAOA-style workflows) are **hybrid**: a parameterized quantum circuit is evaluated, then a classical optimizer updates parameters to improve an objective. In practice, that means **many expectation-value evaluations** of Hamiltonians expressed as **sums of Pauli strings**. This project targets that bottleneck by providing a fast surrogate of Pauli-term propagation and evaluation so you can iterate quickly on CPU/GPU before committing to hardware runs.
+Many near-term quantum algorithms (e.g., VQE/QAOA-style workflows) are **hybrid**: a parameterized quantum circuit is evaluated, then a classical optimizer updates parameters to improve an objective. In practice, that means **many expectation-value evaluations** of Hamiltonians expressed as **sums of Pauli strings**. This project targets that bottleneck by providing a fast surrogate of Pauli-term propagation and evaluation so you can iterate quickly on GPU before committing to hardware runs.
 
 ### High-level idea (no heavy math)
 1. Express the observable (cost/Hamiltonian) as a sum of Pauli strings.
 2. Propagate those Pauli terms *backwards* through the circuit using deterministic rewrite rules.
-3. Convert the rewrite rules into sparse tensor steps.
-4. Evaluate coefficients efficiently, enabling fast expectation estimates for many parameter values.
+3. Evaluate coefficients efficiently, enabling fast expectation estimates for many parameter values.
 
 ### What you gain
 - **Speed**: significant reduction in repeated evaluation time for parameter sweeps.
 - **Scalability**: sparse tensor ops enable larger circuits than naive simulation.
-- **Workflow agility**: quick iteration during model design and training.
 
 ### Typical use cases
 - Variational quantum algorithms (VQE-like energy estimation, QAOA-like optimization)
