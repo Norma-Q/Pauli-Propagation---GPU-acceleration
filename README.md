@@ -6,13 +6,28 @@ This repo ships **precompiled wheels** in `dist/`.
 
 ## Summary
 ### Overview
-A Pauli-propagation surrogate is a learned, tensor-based approximation layer that accelerates quantum circuit evaluation by turning Pauli-term rewrite rules into efficient sparse tensor operations. Instead of simulating full quantum states, the surrogate captures how observables transform through a circuit and evaluates expectations quickly on CPU/GPU.
+**Pauli Propagation** is a modern methodology for accelerating quantum simulation by shifting from the Schrödinger picture to the Heisenberg picture. Instead of evolving quantum states, it backward-propagates observables through the circuit, tracking only the gates that affect the measurement outcome. This eliminates unnecessary computation and enables efficient, fast simulation. The approach has gained renewed attention since 2025, but existing implementations were limited: CPU-only SDKs suffered from speed bottlenecks, while GPU-accelerated versions lacked reliable support for gradient-based learning.
+
+We developed a **GPU-accelerated, differentiable Pauli Propagation SDK** using novel data structures that enable both high-performance computation and seamless integration with modern optimization frameworks (e.g., PyTorch).
+
+**Pauli Propagation Surrogate (PPS)** addresses the exponential term explosion problem inherent in Pauli Propagation by introducing controlled truncation strategies with acceptable approximation error. Our implementation includes:
+- **Max-weight truncation**: limits term complexity by Pauli operator count
+- **Coefficient truncation**: filters terms by magnitude
+- **Max-XY truncation**: custom strategy for balancing accuracy and performance
+
+Internal benchmarks demonstrate stable training and optimization on problems as large as **35-qubit QAOA**, showing that PPS scales effectively to practical quantum machine learning workloads.
 
 ### Why is it needed?
-Conventional quantum optimization can be bottlenecked by repeated circuit executions and expensive simulations. The surrogate approach reduces runtime and cost by:
-- Cutting the number of expensive evaluations needed during optimization
-- Enabling fast, noise-free exploration of parameter landscapes before running on hardware
-- Providing a practical path to scale up experiments while preserving accuracy
+Traditional quantum simulation approaches face critical bottlenecks in variational quantum algorithms:
+- **Repeated circuit evaluation** in VQE/QAOA-style workflows becomes prohibitively expensive
+- **CPU-only implementations** limit iteration speed during model prototyping
+- **Lack of automatic differentiation** in existing GPU tools hinders integration with ML pipelines
+
+Our tensor-based Pauli Propagation approach solves these issues by:
+- **Eliminating redundant computation** via Heisenberg-picture propagation
+- **Leveraging GPU parallelism** with sparse tensor operations optimized for CUDA
+- **Enabling gradient-based learning** through native PyTorch integration
+- **Scaling to larger problems** via intelligent truncation that preserves accuracy
 
 ### Context: where this fits in modern QML
 Many near-term quantum algorithms (e.g., VQE/QAOA-style workflows) are **hybrid**: a parameterized quantum circuit is evaluated, then a classical optimizer updates parameters to improve an objective. In practice, that means **many expectation-value evaluations** of Hamiltonians expressed as **sums of Pauli strings**. This project targets that bottleneck by providing a fast surrogate of Pauli-term propagation and evaluation so you can iterate quickly on CPU/GPU before committing to hardware runs.
