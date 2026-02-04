@@ -1,5 +1,4 @@
 # Pauli Propagation Surrogate (Tensor)
-## Overview
 Prebuilt tensor backend for Pauli propagation surrogate.
 This repo ships **precompiled wheels** in `dist/`.
 ![alt text](img/image.png)
