@@ -143,7 +143,7 @@ For developers: see [IMPLEMENTATION_SUMMARY.md](IMPLEMENTATION_SUMMARY.md) for t
 GNU AGPLv3 (see LICENSE)
 
 ## Copyright
-Copyright (C) 2026 ys_lee@norma.co.kr
+Copyright (C) 2026 rnd@norma.co.kr
 
 This program is licensed under the GNU Affero General Public License v3.0.
 
