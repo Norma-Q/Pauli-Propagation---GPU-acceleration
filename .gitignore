@@ -1,0 +1,39 @@
+.venv/
+.env/
+
+# Python bytecode / caches
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.pytype/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Packaging / build outputs
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Torch C++ extension artifacts
+src_tensor/_pps_tensor_backend*.pyd
+src_tensor/_pps_tensor_backend*.dll
+
+# Option 2: backend sources are not public
+src_tensor/cpp_backend/
+
+# Dev-only code (excluded from distribution)
+dev_backend/
+
+# Local/large experiment outputs (keep data out of git)
+test/surrogate_eval_sweeps*/
+test/surrogate_runs*/
+
+# If you vendor the Julia subrepo locally, keep it out of git here.
+PauliPropagation.jl/
+src_tensor/cpp_backend
