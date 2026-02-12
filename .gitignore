@@ -1,0 +1,36 @@
+.venv/
+.env/
+
+# Python bytecode / caches
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.pytype/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Packaging / build outputs
+build/
+dist/
+*.egg-info/
+.eggs/
+
+
+
+
+
+
+##### files to be ignored for specific projects #####
+cudaq_sampling/
+test_qaoa/
+
+batch.ipynb
+embedding.ipynb
+
+batch_implementation_from_embedding.md
+embedding_implementation_from_scratch.md

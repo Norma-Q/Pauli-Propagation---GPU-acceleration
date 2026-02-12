@@ -1,0 +1,15 @@
+--index-url https://pypi.org/simple
+--extra-index-url https://download.pytorch.org/whl/cu121
+
+# GPU PyTorch (matches the repo's local compiled backend expectation)
+torch==2.2.0+cu121
+
+# Core scientific stack used in Tutorial notebooks
+numpy==1.26.4
+matplotlib==3.8.4
+tqdm==4.67.2
+pennylane==0.44.0
+
+# Notebook runtime
+jupyterlab>=4
+ipykernel
