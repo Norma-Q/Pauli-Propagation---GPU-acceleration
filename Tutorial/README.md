@@ -27,6 +27,13 @@ English tutorial notebooks for the high-level tensor API and GPU memory-first wo
 7. `07_advanced_maxcut_qaoa.ipynb`
    - Advanced MaxCut-QAOA example: surrogate optimization + classical optimum comparison + sampling analysis.
 
+8. `08_embedding_batched_priors_basics.ipynb`
+   - Embedding + batched priors tutorial in three steps:
+     1) 1D sin-regression,
+     2) 2D linear binary classification,
+     3) XOR classification.
+   - Demonstrates training only on `thetas` while feeding input data through `priors` batches.
+
 ## Recommended order
 
 Run notebooks in numeric order.
