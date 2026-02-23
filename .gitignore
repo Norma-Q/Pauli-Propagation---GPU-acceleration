@@ -31,6 +31,8 @@ test_qaoa/artifacts/
 
 batch.ipynb
 embedding.ipynb
+QGAN_adaptability.ipynb
+
 
 batch_implementation_from_embedding.md
 embedding_implementation_from_scratch.md
