@@ -104,14 +104,11 @@ class TensorSparseEvaluator:
         else:
             priors_t = None
 
-        def _mm_coalesce_once(mat: Tensor, vec: Tensor) -> Tensor:
-            if mat._nnz() == 0:
-                return torch.zeros((mat.shape[0], vec.shape[1]), dtype=vec.dtype, device=vec.device)
+        def _safe_sparse_mm(mat: Tensor, vec: Tensor) -> Tensor:
             try:
                 return torch.sparse.mm(mat, vec)
-            except Exception:
-                mat2 = mat.coalesce()
-                return torch.sparse.mm(mat2, vec)
+            except RuntimeError:
+                return torch.sparse.mm(mat.coalesce(), vec)
 
         for i, step in enumerate(psum.steps):
             if step.mat_const.device != v.device:
@@ -133,10 +130,16 @@ class TensorSparseEvaluator:
                 cos_t = torch.ones((), dtype=v.dtype, device=v.device)
                 sin_t = torch.zeros((), dtype=v.dtype, device=v.device)
 
-            v_const = _mm_coalesce_once(step.mat_const, v)
-            v_cos = _mm_coalesce_once(step.mat_cos, v)
-            v_sin = _mm_coalesce_once(step.mat_sin, v)
-            v = v_const + cos_t * v_cos + sin_t * v_sin
+            if step.mat_const._nnz() > 0:
+                v_next = _safe_sparse_mm(step.mat_const, v)
+            else:
+                v_next = torch.zeros((step.shape[0], v.shape[1]), dtype=v.dtype, device=v.device)
+
+            if step.mat_cos._nnz() > 0:
+                v_next = v_next + cos_t * _safe_sparse_mm(step.mat_cos, v)
+            if step.mat_sin._nnz() > 0:
+                v_next = v_next + sin_t * _safe_sparse_mm(step.mat_sin, v)
+            v = v_next
 
             if self.stream_device is not None and self.offload_back:
                 psum.steps[i] = _step_to_device(step, "cpu")
@@ -167,14 +170,11 @@ class TensorSparseEvaluator:
         else:
             priors_t = None
 
-        def _mmT_coalesce_once(mat: Tensor, vec: Tensor) -> Tensor:
-            if mat._nnz() == 0:
-                return torch.zeros((mat.shape[1], vec.shape[1]), dtype=vec.dtype, device=vec.device)
+        def _safe_sparse_mm_T(mat: Tensor, vec: Tensor) -> Tensor:
             try:
                 return torch.sparse.mm(mat.transpose(0, 1), vec)
-            except Exception:
-                mat2 = mat.coalesce()
-                return torch.sparse.mm(mat2.transpose(0, 1), vec)
+            except RuntimeError:
+                return torch.sparse.mm(mat.coalesce().transpose(0, 1), vec)
 
         # 2. 역순 전파 루프
         for rev_i, step in enumerate(reversed(psum.steps)):
@@ -194,15 +194,16 @@ class TensorSparseEvaluator:
                 cos_t = torch.ones(batch_size, dtype=w.dtype, device=w.device)
                 sin_t = torch.zeros(batch_size, dtype=w.dtype, device=w.device)
 
-            w_const = _mmT_coalesce_once(step.mat_const, w)
-            w_cos = _mmT_coalesce_once(step.mat_cos, w)
-            w_sin = _mmT_coalesce_once(step.mat_sin, w)
+            if step.mat_const._nnz() > 0:
+                w_next = _safe_sparse_mm_T(step.mat_const, w)
+            else:
+                w_next = torch.zeros((step.shape[1], w.shape[1]), dtype=w.dtype, device=w.device)
 
-            # [핵심] Element-wise Multiplication 차원 명시
-            # w_cos: (Num_Paulis, Batch) * cos_t: (Batch,)
-            # 파이토치 브로드캐스팅은 뒤에서부터 맞추므로 (Num_Paulis, Batch) * (Batch,) 가 
-            # 올바르게 동작하려면 cos_t를 (1, Batch)로 만들어야 합니다.
-            w = w_const + cos_t.view(1, -1) * w_cos + sin_t.view(1, -1) * w_sin
+            if step.mat_cos._nnz() > 0:
+                w_next = w_next + cos_t.view(1, -1) * _safe_sparse_mm_T(step.mat_cos, w)
+            if step.mat_sin._nnz() > 0:
+                w_next = w_next + sin_t.view(1, -1) * _safe_sparse_mm_T(step.mat_sin, w)
+            w = w_next
 
             if self.stream_device is not None and self.offload_back:
                 orig_i = len(psum.steps) - 1 - rev_i

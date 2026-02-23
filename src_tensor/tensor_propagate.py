@@ -423,8 +423,10 @@ def zero_filter_tensor_backprop_with_keep_mask(
         n_cols = int(step.shape[1])
         row_mask_device = row_mask.to(step.mat_const.device)
         col_mask = _sparse_used_cols(step.mat_const, row_mask_device, n_cols)
-        col_mask |= _sparse_used_cols(step.mat_cos, row_mask_device, n_cols)
-        col_mask |= _sparse_used_cols(step.mat_sin, row_mask_device, n_cols)
+        if step.mat_cos._nnz() > 0:
+            col_mask |= _sparse_used_cols(step.mat_cos, row_mask_device, n_cols)
+        if step.mat_sin._nnz() > 0:
+            col_mask |= _sparse_used_cols(step.mat_sin, row_mask_device, n_cols)
 
         steps[i] = _filter_step_rows_cols(step, row_mask_device, col_mask)
         row_mask = col_mask.to(out_mask.device)
