@@ -105,6 +105,8 @@ def propagate_union_basis_psum(
     thetas=None,
     min_abs: Optional[float] = None,
     min_mat_abs: Optional[float] = None,
+    chunk_size: int = 1_000_000,
+    mask_device: str = "cpu",
 ) -> Tuple[TensorPauliSum, UnionBasis]:
     """Build a TensorPauliSum using the ordered union of observable terms.
 
@@ -126,6 +128,8 @@ def propagate_union_basis_psum(
         offload_steps=offload_steps,
         offload_keep=offload_keep,
         step_device=step_device,
+        chunk_size=chunk_size,
+        mask_device=mask_device,
     )
     return psum, basis
 

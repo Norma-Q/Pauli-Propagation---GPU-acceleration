@@ -62,9 +62,9 @@ def _compile_program_for_eval(
     circuit, _ = build_qaoa_circuit(n_qubits=n_qubits, edges=edge_pairs, p_layers=p_layers)
     zz_obj = build_maxcut_observable(n_qubits=n_qubits, edges=edge_pairs)
 
-    preset = "gpu_full" if run_device.startswith("cuda") else "gpu_min"
+    preset = "gpu" if run_device.startswith("cuda") else "cpu"
     preset_overrides = None
-    if run_device == "cpu" and preset == "gpu_min":
+    if run_device == "cpu" and preset == "cpu":
         preset_overrides = _cpu_exact_overrides()
 
     program = compile_expval_program(

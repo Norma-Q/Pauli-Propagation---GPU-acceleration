@@ -66,9 +66,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--chord-shift", type=int, default=7, help="Used only when --edges-json is not set.")
 
     p.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "cuda"])
-    p.add_argument("--preset", type=str, default="auto", choices=["auto", "gpu_min", "gpu_full"])
-    p.add_argument("--build-min-abs", type=float, default=1e-4)
-    p.add_argument("--build-min-mat-abs", type=float, default=None)
+    p.add_argument("--preset", type=str, default="auto", choices=["auto", "cpu", "gpu"])
     p.add_argument("--log-every", type=int, default=25)
 
     p.add_argument("--output", type=str, default="test/artifacts/qaoa_train.pt")
@@ -325,17 +323,16 @@ def main() -> None:
         raise RuntimeError("CUDA device requested but torch.cuda.is_available() is False.")
 
     if str(args.preset) == "auto":
-        preset = "gpu_full" if run_device.startswith("cuda") else "gpu_min"
+        preset = "gpu" if run_device.startswith("cuda") else "cpu"
     else:
         preset = str(args.preset)
 
     preset_overrides: Optional[Dict[str, object]] = None
-    if run_device == "cpu" and preset == "gpu_min":
+    if run_device == "cpu" and preset == "cpu":
         # Keep parity with Tutorial/07 CPU fallback.
         preset_overrides = _default_cpu_exact_overrides()
 
     out_path = Path(args.output)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
     if str(args.output_json).lower() == "auto":
         out_json_path = out_path.with_suffix(".json")
     elif str(args.output_json).strip() == "":

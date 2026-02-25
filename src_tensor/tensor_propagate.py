@@ -11,6 +11,7 @@ then walks steps backwards to remove any input columns that cannot reach them.
 from __future__ import annotations
 
 from typing import Any, List, Optional, TYPE_CHECKING, Tuple, cast
+import math
 
 torch: Any
 try:
@@ -221,6 +222,127 @@ def _prune_step_by_abs(step: TensorSparseStep, min_mat_abs: float) -> TensorSpar
     )
 
 
+def _step_to_device(step: TensorSparseStep, device: str) -> TensorSparseStep:
+    return TensorSparseStep(
+        mat_const=step.mat_const.to(device),
+        mat_cos=step.mat_cos.to(device),
+        mat_sin=step.mat_sin.to(device),
+        param_idx=step.param_idx,
+        emb_idx=step.emb_idx,
+        shape=step.shape,
+    )
+
+
+def _process_step_chunked(
+    builder_fn,
+    x_mask_in: Tensor,
+    z_mask_in: Tensor,
+    chunk_size: int,
+    device: str,
+    step_device: str,
+    output_device: str = "cpu",
+    **kwargs
+) -> Tuple[Tensor, Tensor, TensorSparseStep, Optional[Tensor]]:
+    """
+    Process a propagation step in chunks to avoid GPU OOM.
+    Keeps the main masks on CPU, moves chunks to GPU for processing,
+    then assembles the result back on CPU (or step_device).
+    """
+    n_terms = x_mask_in.shape[0]
+    
+    # Fast path: if small enough, run directly
+    if n_terms <= chunk_size:
+        x_gpu = x_mask_in.to(device)
+        z_gpu = z_mask_in.to(device)
+        # Handle coeffs_cache if present
+        if 'coeffs_cache' in kwargs and kwargs['coeffs_cache'] is not None:
+            kwargs['coeffs_cache'] = kwargs['coeffs_cache'].to(device)
+            
+        new_x, new_z, step, cache = builder_fn(x_mask=x_gpu, z_mask=z_gpu, device=device, step_device=step_device, **kwargs)
+        return new_x.to(output_device), new_z.to(output_device), step, (cache.to(output_device) if cache is not None else None)
+
+    # Chunked processing
+    new_x_parts = []
+    new_z_parts = []
+    cache_parts = []
+    
+    # Accumulators for sparse indices
+    const_indices, const_values = [], []
+    cos_indices, cos_values = [], []
+    sin_indices, sin_values = [], []
+    
+    row_offset = 0
+    col_offset = 0
+    
+    n_chunks = math.ceil(n_terms / chunk_size)
+    
+    # Helper to offset and append sparse parts
+    def _append_sparse(mat, indices_list, values_list, r_off, c_off):
+        if mat._nnz() > 0:
+            # Ensure we have indices (coalesce if needed)
+            if not mat.is_coalesced():
+                mat = mat.coalesce()
+            idx = mat.indices().to("cpu")
+            val = mat.values().to("cpu")
+            # Apply offsets
+            idx[0] += r_off
+            idx[1] += c_off
+            indices_list.append(idx)
+            values_list.append(val)
+
+    for i in range(n_chunks):
+        start = i * chunk_size
+        end = min(start + chunk_size, n_terms)
+        
+        # 1. Move chunk to GPU
+        x_chunk = x_mask_in[start:end].to(device)
+        z_chunk = z_mask_in[start:end].to(device)
+        
+        chunk_kwargs = kwargs.copy()
+        if 'coeffs_cache' in chunk_kwargs and chunk_kwargs['coeffs_cache'] is not None:
+            chunk_kwargs['coeffs_cache'] = chunk_kwargs['coeffs_cache'][start:end].to(device)
+            
+        nx, nz, step, cache = builder_fn(x_mask=x_chunk, z_mask=z_chunk, device=device, step_device=device, **chunk_kwargs)
+        
+        # 2. Collect Results (Move back to CPU immediately)
+        new_x_parts.append(nx.to(output_device))
+        new_z_parts.append(nz.to(output_device))
+        if cache is not None:
+            cache_parts.append(cache.to(output_device))
+        
+        # 3. Accumulate Sparse Matrices
+        _append_sparse(step.mat_const, const_indices, const_values, row_offset, col_offset)
+        _append_sparse(step.mat_cos, cos_indices, cos_values, row_offset, col_offset)
+        _append_sparse(step.mat_sin, sin_indices, sin_values, row_offset, col_offset)
+        
+        row_offset += nx.shape[0]
+        col_offset += (end - start)
+
+    # 4. Assemble Final Tensors
+    full_new_x = torch.cat(new_x_parts, dim=0)
+    full_new_z = torch.cat(new_z_parts, dim=0)
+    full_cache = torch.cat(cache_parts, dim=0) if cache_parts else None
+    
+    def _concat_sparse(indices_list, values_list, shape):
+        if not indices_list:
+            return _make_sparse(torch.tensor([], dtype=torch.int64), torch.tensor([], dtype=torch.int64), torch.tensor([], dtype=kwargs['t_dtype']), shape, step_device, kwargs['t_dtype'])
+        all_indices = torch.cat(indices_list, dim=1).to(step_device)
+        all_values = torch.cat(values_list, dim=0).to(step_device)
+        return torch.sparse_coo_tensor(all_indices, all_values, size=shape, device=step_device)
+
+    full_shape = (row_offset, col_offset)
+    full_step = TensorSparseStep(
+        mat_const=_concat_sparse(const_indices, const_values, full_shape),
+        mat_cos=_concat_sparse(cos_indices, cos_values, full_shape),
+        mat_sin=_concat_sparse(sin_indices, sin_values, full_shape),
+        param_idx=step.param_idx,
+        emb_idx=step.emb_idx,
+        shape=full_shape
+    )
+    
+    return full_new_x, full_new_z, full_step, full_cache
+
+
 def propagate_surrogate_tensor(
     circuit,
     observable,
@@ -236,6 +358,8 @@ def propagate_surrogate_tensor(
     step_device: str = "cpu",
     debug_cuda_mem: bool = False,
     debug_every: int = 25,
+    chunk_size: int = 1_000_000,
+    mask_device: str = "cpu",
 ) -> TensorPauliSum:
     """Tensor-native propagation to a tensor PauliSum.
 
@@ -261,18 +385,19 @@ def propagate_surrogate_tensor(
         word_mask = (1 << 63) - 1
         return [int((mask_int >> (63 * i)) & word_mask) for i in range(n_words)]
 
+    # [Optimization] Initialize masks on CPU to support huge numbers of terms
     if n_qubits <= 63:
-        x_mask = torch.as_tensor([p.x_mask for p in pstrs], dtype=torch.int64, device=device)
-        z_mask = torch.as_tensor([p.z_mask for p in pstrs], dtype=torch.int64, device=device)
+        x_mask = torch.as_tensor([p.x_mask for p in pstrs], dtype=torch.int64, device=mask_device)
+        z_mask = torch.as_tensor([p.z_mask for p in pstrs], dtype=torch.int64, device=mask_device)
     else:
         n_words = (int(n_qubits) + 62) // 63
         x_words = [_pack_masks_63(int(p.x_mask), n_words) for p in pstrs]
         z_words = [_pack_masks_63(int(p.z_mask), n_words) for p in pstrs]
-        x_mask = torch.as_tensor(x_words, dtype=torch.int64, device=device)
-        z_mask = torch.as_tensor(z_words, dtype=torch.int64, device=device)
+        x_mask = torch.as_tensor(x_words, dtype=torch.int64, device=mask_device)
+        z_mask = torch.as_tensor(z_words, dtype=torch.int64, device=mask_device)
 
     t_dtype = torch.float64 if dtype == "float64" else torch.float32
-    coeff_init = torch.as_tensor(coeffs, dtype=t_dtype, device=device)
+    coeff_init = torch.as_tensor(coeffs, dtype=t_dtype, device=mask_device)
     steps: List[TensorSparseStep] = []
 
     coeffs_cache: Optional[Tensor] = None
@@ -282,7 +407,7 @@ def propagate_surrogate_tensor(
     if min_abs is not None:
         coeff_max = float(torch.max(torch.abs(coeff_init)).detach().cpu().item()) if coeff_init.numel() > 0 else 0.0
         coeff_scale = coeff_max if coeff_max > 0.0 else 1.0
-        coeffs_cache = coeff_init / coeff_scale
+        coeffs_cache = (coeff_init / coeff_scale) # Keep on CPU
         min_abs_internal = float(min_abs) / coeff_scale
         thetas_t = torch.as_tensor(thetas, dtype=coeff_init.dtype, device=device)
         if thetas_t.numel() == 0:
@@ -293,13 +418,12 @@ def propagate_surrogate_tensor(
         gate_name = gate.__class__.__name__
 
         if gate_name == "CliffordGate":
-            new_x, new_z, step, coeffs_cache = build_clifford_step(
+            new_x, new_z, step, coeffs_cache = _process_step_chunked(
+                build_clifford_step,
+                x_mask, z_mask, chunk_size, device, step_device,
+                output_device=mask_device,
                 gate=gate,
-                x_mask=x_mask,
-                z_mask=z_mask,
                 t_dtype=t_dtype,
-                device=device,
-                step_device=step_device,
                 min_abs=min_abs_internal,
                 coeffs_cache=coeffs_cache,
                 max_weight=max_weight,
@@ -316,13 +440,12 @@ def propagate_surrogate_tensor(
             continue
 
         if gate_name == "PauliRotation":
-            new_x, new_z, step, coeffs_cache = build_pauli_rotation_step(
+            new_x, new_z, step, coeffs_cache = _process_step_chunked(
+                build_pauli_rotation_step,
+                x_mask, z_mask, chunk_size, device, step_device,
+                output_device=mask_device,
                 gate=gate,
-                x_mask=x_mask,
-                z_mask=z_mask,
                 t_dtype=t_dtype,
-                device=device,
-                step_device=step_device,
                 min_abs=min_abs_internal,
                 coeffs_cache=coeffs_cache,
                 thetas_t=thetas_t,

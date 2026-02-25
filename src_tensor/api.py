@@ -5,10 +5,10 @@ This module provides a fixed, memory-first execution path for common use:
   2) evaluate expvals for theta vectors
   3) build custom training loops with PyTorch autograd
 
-Default preset `gpu_min` prioritizes low GPU memory pressure by building and
-storing sparse steps on CPU, then streaming computation to GPU for evaluation.
-Preset `gpu_full` prioritizes exact/no-truncation workflows by keeping build,
-steps, and eval on GPU with conservative precision defaults.
+The `cpu` preset prioritizes scalability and safety by building and storing
+sparse steps on CPU, then streaming computation to GPU for evaluation.
+Preset `gpu` prioritizes maximum speed by keeping build and masks on GPU,
+with conservative precision defaults.
 """
 
 from __future__ import annotations
@@ -56,19 +56,49 @@ class TensorSurrogatePreset:
     offload_steps: bool = True
     offload_keep: int = 1
     offload_back: bool = True
+    chunk_size: int = 1_000_000
+    mask_device: str = "cpu"
 
 
 DEFAULT_PRESETS: Dict[str, TensorSurrogatePreset] = {
+    "cpu": TensorSurrogatePreset(
+        build_device="cpu",
+        step_device="cpu",
+        stream_device="cuda",
+        dtype="float32",
+        max_weight=1_000_000_000,
+        max_xy=1_000_000_000,
+        offload_steps=True,
+        offload_keep=1,
+        offload_back=True,
+        chunk_size=1_000_000,
+        mask_device="cpu",
+    ),
+    "gpu": TensorSurrogatePreset(
+        build_device="cuda",
+        step_device="cpu",
+        stream_device="cuda",
+        dtype="float64",
+        max_weight=1_000_000_000,
+        max_xy=1_000_000_000,
+        offload_steps=True,
+        offload_keep=1,
+        offload_back=True,
+        chunk_size=1_000_000_000,
+        mask_device="cuda",
+    ),
     "gpu_min": TensorSurrogatePreset(
         build_device="cuda",
         step_device="cpu",
         stream_device="cuda",
         dtype="float32",
-        max_weight=5,
+        max_weight=1_000_000_000,
         max_xy=1_000_000_000,
         offload_steps=True,
         offload_keep=1,
         offload_back=True,
+        chunk_size=1_000_000_000,
+        mask_device="cuda",
     ),
     "gpu_full": TensorSurrogatePreset(
         build_device="cuda",
@@ -80,6 +110,8 @@ DEFAULT_PRESETS: Dict[str, TensorSurrogatePreset] = {
         offload_steps=True,
         offload_keep=1,
         offload_back=True,
+        chunk_size=1_000_000_000,
+        mask_device="cuda",
     )
 }
 
@@ -466,7 +498,7 @@ def _shrink_union_basis(basis: UnionBasis, keep_mask_in: Tensor) -> UnionBasis:
     return UnionBasis(n_qubits=basis.n_qubits, pstrs=pstrs2, index=index2)
 
 
-def resolve_preset(name: str = "gpu_min", *, overrides: Optional[Mapping[str, Any]] = None) -> TensorSurrogatePreset:
+def resolve_preset(name: str = "cpu", *, overrides: Optional[Mapping[str, Any]] = None) -> TensorSurrogatePreset:
     base = DEFAULT_PRESETS.get(str(name))
     if base is None:
         allowed = ", ".join(sorted(DEFAULT_PRESETS.keys()))
@@ -487,7 +519,7 @@ def compile_expval_program(
     *,
     circuit,
     observables: Any,
-    preset: str = "gpu_min",
+    preset: str = "cpu",
     preset_overrides: Optional[Mapping[str, Any]] = None,
     build_thetas: Any = None,
     build_min_abs: Optional[float] = None,
@@ -524,6 +556,8 @@ def compile_expval_program(
         thetas=build_thetas,
         min_abs=build_min_abs,
         min_mat_abs=build_min_mat_abs,
+        chunk_size=int(cfg.chunk_size),
+        mask_device=str(cfg.mask_device),
     )
 
     from .tensor_propagate import zero_filter_tensor_backprop_with_keep_mask
@@ -553,7 +587,7 @@ def build_quasi_sampler(
     circuit,
     z_combos,
     max_order: Optional[int] = None,
-    preset: str = "gpu_min",
+    preset: str = "cpu",
     preset_overrides: Optional[Mapping[str, Any]] = None,
     build_thetas: Any = None,
     build_min_abs: Optional[float] = None,
