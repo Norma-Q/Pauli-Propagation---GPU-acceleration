@@ -97,16 +97,13 @@ def propagate_union_basis_psum(
     observables: Sequence,
     max_weight: int = 50,
     max_xy: int = 50,
-    device: str = "cuda",
+    memory_device: str = "cpu",
+    compute_device: str = "cuda",
     dtype: str = "float32",
-    offload_steps: bool = True,
-    offload_keep: int = 1,
-    step_device: str = "cpu",
     thetas=None,
     min_abs: Optional[float] = None,
     min_mat_abs: Optional[float] = None,
     chunk_size: int = 1_000_000,
-    mask_device: str = "cpu",
 ) -> Tuple[TensorPauliSum, UnionBasis]:
     """Build a TensorPauliSum using the ordered union of observable terms.
 
@@ -120,16 +117,13 @@ def propagate_union_basis_psum(
         observable=union_obs,
         max_weight=max_weight,
         max_xy=max_xy,
-        device=device,
+        memory_device=memory_device,
+        compute_device=compute_device,
         dtype=dtype,
         thetas=thetas,
         min_abs=min_abs,
         min_mat_abs=min_mat_abs,
-        offload_steps=offload_steps,
-        offload_keep=offload_keep,
-        step_device=step_device,
         chunk_size=chunk_size,
-        mask_device=mask_device,
     )
     return psum, basis
 
@@ -138,23 +132,23 @@ def adjoint_weights_on_zero(
     psum: TensorPauliSum,
     thetas,
     *,
-    priors=None,
-    stream_device: Optional[str] = None,
-    offload_back: bool = False,
+    embedding=None,
+    compute_device: str = "cuda",
+    chunk_size: int = 1_000_000,
 ) -> Tensor:
-    """Compute w = M(theta, priors)^T s for |0...0> expectation."""
+    """Compute w = M(theta, embedding)^T s for |0...0> expectation."""
 
     if not _TORCH_AVAILABLE:
         raise RuntimeError("PyTorch is required for tensor backend.")
 
     # 1. Evaluator 생성 (기존 구조 유지)
-    evaluator = TensorSparseEvaluator(psum, stream_device=stream_device, offload_back=offload_back)
+    evaluator = TensorSparseEvaluator(psum, compute_device=compute_device, chunk_size=chunk_size)
     
     n_out = int(psum.x_mask.shape[0])
     if n_out == 0:
         n_in = int(psum.coeff_init.shape[0])
         # [수정] 배치가 있을 경우 zeros도 (Batch, n_in) 형태여야 함
-        batch_size = priors.shape[0] if priors is not None else 1
+        batch_size = embedding.shape[0] if embedding is not None else 1
         return torch.zeros((batch_size, n_in), dtype=psum.coeff_init.dtype, device=psum.coeff_init.device)
 
     # 2. 초기 상태 |0...0>에 대응하는 마스크 생성
@@ -162,9 +156,9 @@ def adjoint_weights_on_zero(
     s = diag_mask.to(dtype=psum.coeff_init.dtype, device=psum.coeff_init.device)
     
     # 3. [핵심 수정] evaluate_adjoint 호출
-    # 이제 priors는 (Batch, Dim) 형태이며, evaluator 내부에서 이를 이용해 
+    # 이제 embedding은 (Batch, Dim) 형태이며, evaluator 내부에서 이를 이용해 
     # (Batch, Num_Paulis) 형태의 w를 반환하도록 로직이 확장되어야 합니다.
-    w = evaluator.evaluate_adjoint(thetas, s, priors=priors)
+    w = evaluator.evaluate_adjoint(thetas, s, embedding=embedding)
     
     return w
 

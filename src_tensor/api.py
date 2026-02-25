@@ -46,72 +46,46 @@ from .tensor_types import TensorPauliSum
 @dataclass(frozen=True)
 class TensorSurrogatePreset:
     """Execution preset for high-level API."""
-
-    build_device: str = "cpu"
-    step_device: str = "cpu"
-    stream_device: str = "cuda"
+    memory_device: str = "cpu"
+    compute_device: str = "cuda"
     dtype: str = "float32"
-    max_weight: int = 8
+    max_weight: int = 20
     max_xy: int = 1_000_000_000
-    offload_steps: bool = True
-    offload_keep: int = 1
-    offload_back: bool = True
     chunk_size: int = 1_000_000
-    mask_device: str = "cpu"
 
 
 DEFAULT_PRESETS: Dict[str, TensorSurrogatePreset] = {
     "cpu": TensorSurrogatePreset(
-        build_device="cpu",
-        step_device="cpu",
-        stream_device="cuda",
+        memory_device="cpu",
+        compute_device="cpu",
         dtype="float32",
         max_weight=1_000_000_000,
         max_xy=1_000_000_000,
-        offload_steps=True,
-        offload_keep=1,
-        offload_back=True,
         chunk_size=1_000_000,
-        mask_device="cpu",
     ),
     "gpu": TensorSurrogatePreset(
-        build_device="cuda",
-        step_device="cpu",
-        stream_device="cuda",
+        memory_device="cuda",
+        compute_device="cuda",
         dtype="float64",
         max_weight=1_000_000_000,
         max_xy=1_000_000_000,
-        offload_steps=True,
-        offload_keep=1,
-        offload_back=True,
         chunk_size=1_000_000_000,
-        mask_device="cuda",
     ),
-    "gpu_min": TensorSurrogatePreset(
-        build_device="cuda",
-        step_device="cpu",
-        stream_device="cuda",
+    "hybrid": TensorSurrogatePreset(
+        memory_device="cpu",
+        compute_device="cuda",
         dtype="float32",
         max_weight=1_000_000_000,
         max_xy=1_000_000_000,
-        offload_steps=True,
-        offload_keep=1,
-        offload_back=True,
-        chunk_size=1_000_000_000,
-        mask_device="cuda",
+        chunk_size=1_000_000,
     ),
-    "gpu_full": TensorSurrogatePreset(
-        build_device="cuda",
-        step_device="cpu",
-        stream_device="cuda",
+    "gpu_safe": TensorSurrogatePreset(
+        memory_device="cpu",
+        compute_device="cuda",
         dtype="float64",
         max_weight=1_000_000_000,
         max_xy=1_000_000_000,
-        offload_steps=True,
-        offload_keep=1,
-        offload_back=True,
-        chunk_size=1_000_000_000,
-        mask_device="cuda",
+        chunk_size=1_000_000,
     )
 }
 
@@ -145,32 +119,25 @@ class CompiledTensorSurrogate:
         self,
         thetas: Any,
         *,
-        priors: Any = None,
-        stream_device: Optional[str] = None,
-        offload_back: Optional[bool] = None,
+        embedding: Any = None,
     ) -> Tensor:
         """Evaluate expectation values with optional data priors (embedding)."""
         if not _TORCH_AVAILABLE:
             raise RuntimeError("PyTorch is required for tensor backend.")
 
-        stream = _resolve_stream_device(
-            self.preset.stream_device if stream_device is None else stream_device
-        )
-        back = self.preset.offload_back if offload_back is None else bool(offload_back)
-
-        # [수정 포인트] priors가 입력되었을 때만 배치 차원을 검사합니다.
+        # [수정 포인트] embedding이 입력되었을 때만 배치 차원을 검사합니다.
         # 기존의 1D 입력을 (1, N)으로 만들어 하부 로직이 항상 2D(Batch)를 기대하게 합니다.
-        if priors is not None:
-            if priors.ndim == 1:
-                priors = priors.unsqueeze(0)
+        if embedding is not None:
+            if embedding.ndim == 1:
+                embedding = embedding.unsqueeze(0)
         
         # adjoint_weights_on_zero는 이제 (Batch, Num_Paulis)를 반환하도록 2단계에서 수정할 것입니다.
         w = adjoint_weights_on_zero(
             self.psum_union,
             thetas,
-            priors=priors,
-            stream_device=stream,
-            offload_back=back,
+            embedding=embedding,
+            compute_device=self.preset.compute_device,
+            chunk_size=self.preset.chunk_size,
         )
         
         V0 = self._get_V0(device=str(w.device), dtype=w.dtype)
@@ -185,10 +152,8 @@ class CompiledTensorSurrogate:
         thetas: Any,
         *,
         obs_index: int = 0,
-        stream_device: Optional[str] = None,
-        offload_back: Optional[bool] = None,
     ) -> Tensor:
-        vals = self.expvals(thetas, stream_device=stream_device, offload_back=offload_back)
+        vals = self.expvals(thetas)
         if obs_index < 0 or obs_index >= int(vals.shape[0]):
             raise IndexError(f"obs_index={obs_index} is out of range for {int(vals.shape[0])} observables")
         return vals[obs_index]
@@ -202,15 +167,6 @@ class CompiledTensorSurrogate:
             n_qubits=int(self.basis.n_qubits),
             max_qubits=max_qubits,
         )
-
-
-def _resolve_stream_device(stream_device: str) -> Optional[str]:
-    dev = str(stream_device)
-    if dev.startswith("cuda"):
-        if _TORCH_AVAILABLE and bool(torch.cuda.is_available()):
-            return dev
-        return None
-    return dev
 
 
 def _require_pennylane():
@@ -546,27 +502,23 @@ def compile_expval_program(
     psum_union, basis = propagate_union_basis_psum(
         circuit=circuit,
         observables=obs_list,
+        memory_device=str(cfg.memory_device),
+        compute_device=str(cfg.compute_device),
         max_weight=int(cfg.max_weight),
         max_xy=int(cfg.max_xy),
-        device=str(cfg.build_device),
         dtype=str(cfg.dtype),
-        offload_steps=bool(cfg.offload_steps),
-        offload_keep=int(cfg.offload_keep),
-        step_device=str(cfg.step_device),
         thetas=build_thetas,
         min_abs=build_min_abs,
         min_mat_abs=build_min_mat_abs,
         chunk_size=int(cfg.chunk_size),
-        mask_device=str(cfg.mask_device),
     )
 
     from .tensor_propagate import zero_filter_tensor_backprop_with_keep_mask
 
-    stream_for_prune: Optional[str] = str(cfg.build_device) if str(cfg.build_device) != "cpu" else None
     psum_union, keep_mask_in = zero_filter_tensor_backprop_with_keep_mask(
         psum_union,
-        stream_device=stream_for_prune,
-        offload_back=(stream_for_prune is not None),
+        compute_device=str(cfg.compute_device),
+        chunk_size=int(cfg.chunk_size),
     )
     basis = _shrink_union_basis(basis, keep_mask_in)
 
@@ -601,13 +553,12 @@ def build_quasi_sampler(
         circuit=circuit,
         z_combos=z_combos,
         max_order=(None if max_order is None else int(max_order)),
-        build_device=str(cfg.build_device),
+        memory_device=str(cfg.memory_device),
+        compute_device=str(cfg.compute_device),
         dtype=str(cfg.dtype),
         max_weight=int(cfg.max_weight),
         max_xy=int(cfg.max_xy),
-        step_device=str(cfg.step_device),
-        offload_steps=bool(cfg.offload_steps),
-        offload_keep=int(cfg.offload_keep),
+        chunk_size=int(cfg.chunk_size),
         build_thetas=build_thetas,
         build_min_abs=build_min_abs,
         build_min_mat_abs=build_min_mat_abs,

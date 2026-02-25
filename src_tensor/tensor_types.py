@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import Any, List, Optional, Tuple
 
 try:
     import torch
@@ -71,20 +71,20 @@ class TensorSparseStep:
     shape: Tuple[int, int]  # [수정] 기본값이 없는 필드를 위로 올림
     emb_idx: int = -1       # [수정] 기본값이 있는 필드를 가장 아래로 배치
 
+    def to(self, device: Any) -> "TensorSparseStep":
+        return TensorSparseStep(
+            mat_const=self.mat_const.to(device),
+            mat_cos=self.mat_cos.to(device),
+            mat_sin=self.mat_sin.to(device),
+            param_idx=self.param_idx,
+            shape=self.shape,
+            emb_idx=self.emb_idx,
+        )
+
 
 def tensor_psum_to_device(psum: "TensorPauliSum", device: str) -> "TensorPauliSum":
     """Move a TensorPauliSum and its steps to a device."""
-    steps = [
-        TensorSparseStep(
-            mat_const=s.mat_const.to(device),
-            mat_cos=s.mat_cos.to(device),
-            mat_sin=s.mat_sin.to(device),
-            param_idx=s.param_idx,
-            emb_idx=s.emb_idx,  # [추가] 장치 이동 시에도 임베딩 인덱스 유지
-            shape=s.shape,
-        )
-        for s in psum.steps
-    ]
+    steps = [s.to(device) for s in psum.steps]
     return TensorPauliSum(
         n_qubits=psum.n_qubits,
         x_mask=psum.x_mask.to(device),

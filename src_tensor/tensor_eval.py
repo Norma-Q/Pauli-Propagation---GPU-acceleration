@@ -77,19 +77,20 @@ def _step_to_device(step: TensorSparseStep, device: str) -> TensorSparseStep:
 class TensorSparseEvaluator:
     """Evaluator for sparse-step tensor propagation."""
 
-    def __init__(self, psum: TensorPauliSum, stream_device: Optional[str] = None, offload_back: bool = False):
+    def __init__(self, psum: TensorPauliSum, compute_device: str = "cuda", chunk_size: Optional[int] = None):
         if not _TORCH_AVAILABLE:
             raise RuntimeError("PyTorch is required for tensor backend.")
         self.psum = psum
-        self.stream_device = stream_device
-        self.offload_back = offload_back
+        self.compute_device = compute_device
+        self.chunk_size = chunk_size if chunk_size is not None else 1_000_000
 
-    def evaluate_coeffs(self, thetas, priors=None) -> Tensor:
+    def evaluate_coeffs(self, thetas, embedding=None) -> Tensor:
         """Return coefficient vector after applying all sparse steps with gradient control."""
         psum = self.psum
         v = psum.coeff_init
-        if self.stream_device is not None:
-            v = v.to(self.stream_device)
+        
+        # 벡터는 연산 장치에 상주
+        v = v.to(self.compute_device)
         if v.dim() == 1:
             v = v.unsqueeze(1)
 
@@ -98,26 +99,45 @@ class TensorSparseEvaluator:
         if thetas_t.numel() == 0:
             thetas_t = torch.zeros(1, dtype=v.dtype, device=v.device)
         
-        # priors 처리 [추가]
-        if priors is not None:
-            priors_t = torch.as_tensor(priors, dtype=v.dtype, device=v.device)
+        # embedding 처리 [추가]
+        if embedding is not None:
+            embedding_t = torch.as_tensor(embedding, dtype=v.dtype, device=v.device)
         else:
-            priors_t = None
+            embedding_t = None
 
-        def _safe_sparse_mm(mat: Tensor, vec: Tensor) -> Tensor:
-            try:
-                return torch.sparse.mm(mat, vec)
-            except RuntimeError:
-                return torch.sparse.mm(mat.coalesce(), vec)
+        # Chunked Sparse MM Helper (y = M @ v)
+        # M is on Storage (CPU), v is on Calc (GPU)
+        def _chunked_mm(mat_storage: Tensor, vec_calc: Tensor) -> Tensor:
+            if mat_storage._nnz() == 0:
+                return torch.zeros((mat_storage.shape[0], vec_calc.shape[1]), dtype=vec_calc.dtype, device=vec_calc.device)
+            
+            # If matrix is small or already on calc device, run directly
+            if mat_storage.device.type == vec_calc.device.type or mat_storage.shape[0] <= self.chunk_size:
+                mat_calc = mat_storage.to(vec_calc.device)
+                try:
+                    return torch.sparse.mm(mat_calc, vec_calc)
+                except RuntimeError:
+                    return torch.sparse.mm(mat_calc.coalesce(), vec_calc)
+
+            # Chunking loop
+            n_rows = mat_storage.shape[0]
+            result_parts = []
+            for i in range(0, n_rows, self.chunk_size):
+                end = min(i + self.chunk_size, n_rows)
+                # Slice rows from storage tensor
+                # Note: PyTorch sparse slicing creates a view or copy of indices, relatively cheap
+                mat_chunk = mat_storage[i:end].to(vec_calc.device)
+                # Result chunk
+                res_chunk = torch.sparse.mm(mat_chunk, vec_calc)
+                result_parts.append(res_chunk)
+            
+            return torch.cat(result_parts, dim=0)
 
         for i, step in enumerate(psum.steps):
-            if step.mat_const.device != v.device:
-                step = _step_to_device(step, v.device)
-            
             # [수정] 파라미터 결정 로직: emb_idx가 우선순위를 가짐
-            if step.emb_idx >= 0 and priors_t is not None:
-                # 임베딩 층: priors에서 값을 가져오고 detach()로 기울기 차단
-                theta = priors_t[step.emb_idx].detach()
+            if step.emb_idx >= 0 and embedding_t is not None:
+                # 임베딩 층: embedding에서 값을 가져오고 detach()로 기울기 차단
+                theta = embedding_t[step.emb_idx].detach()
                 cos_t = torch.cos(theta)
                 sin_t = torch.sin(theta)
             elif step.param_idx >= 0:
@@ -130,60 +150,80 @@ class TensorSparseEvaluator:
                 cos_t = torch.ones((), dtype=v.dtype, device=v.device)
                 sin_t = torch.zeros((), dtype=v.dtype, device=v.device)
 
-            if step.mat_const._nnz() > 0:
-                v_next = _safe_sparse_mm(step.mat_const, v)
-            else:
-                v_next = torch.zeros((step.shape[0], v.shape[1]), dtype=v.dtype, device=v.device)
+            v_next = _chunked_mm(step.mat_const, v)
 
             if step.mat_cos._nnz() > 0:
-                v_next = v_next + cos_t * _safe_sparse_mm(step.mat_cos, v)
+                v_next = v_next + cos_t * _chunked_mm(step.mat_cos, v)
             if step.mat_sin._nnz() > 0:
-                v_next = v_next + sin_t * _safe_sparse_mm(step.mat_sin, v)
+                v_next = v_next + sin_t * _chunked_mm(step.mat_sin, v)
             v = v_next
-
-            if self.stream_device is not None and self.offload_back:
-                psum.steps[i] = _step_to_device(step, "cpu")
 
         return v.squeeze(1)
 
-    def evaluate_adjoint(self, thetas, out_vec: Tensor, priors=None) -> Tensor:
+    def evaluate_adjoint(self, thetas, out_vec: Tensor, embedding=None) -> Tensor:
         """Apply adjoint with explicit batch-wise scaling."""
         psum = self.psum
         
         # 1. 초기 w 설정 (Num_Paulis, Batch)
-        if priors is not None and priors.ndim > 1:
-            batch_size = priors.shape[0]
+        if embedding is not None and embedding.ndim > 1:
+            batch_size = embedding.shape[0]
             w = out_vec.unsqueeze(1).expand(-1, batch_size).clone()
         else:
             batch_size = 1
             w = out_vec.unsqueeze(1)
 
-        if self.stream_device is not None:
-            w = w.to(self.stream_device)
+        w = w.to(self.compute_device)
 
         thetas_t = torch.as_tensor(thetas, dtype=w.dtype, device=w.device)
         if thetas_t.numel() == 0:
             thetas_t = torch.zeros(1, dtype=w.dtype, device=w.device)
 
-        if priors is not None:
-            priors_t = torch.as_tensor(priors, dtype=w.dtype, device=w.device)
+        if embedding is not None:
+            embedding_t = torch.as_tensor(embedding, dtype=w.dtype, device=w.device)
         else:
-            priors_t = None
+            embedding_t = None
 
-        def _safe_sparse_mm_T(mat: Tensor, vec: Tensor) -> Tensor:
-            try:
-                return torch.sparse.mm(mat.transpose(0, 1), vec)
-            except RuntimeError:
-                return torch.sparse.mm(mat.coalesce().transpose(0, 1), vec)
+        # Chunked Adjoint MM Helper (y = M^T @ w)
+        # M is on Storage (CPU), w is on Calc (GPU)
+        # y = sum_i (M_i^T @ w_i) where M_i is row-chunk of M, w_i is row-chunk of w
+        def _chunked_mm_T(mat_storage: Tensor, vec_calc: Tensor) -> Tensor:
+            if mat_storage._nnz() == 0:
+                return torch.zeros((mat_storage.shape[1], vec_calc.shape[1]), dtype=vec_calc.dtype, device=vec_calc.device)
+
+            # Fast path
+            if mat_storage.device.type == vec_calc.device.type or mat_storage.shape[0] <= self.chunk_size:
+                mat_calc = mat_storage.to(vec_calc.device)
+                try:
+                    return torch.sparse.mm(mat_calc.transpose(0, 1), vec_calc)
+                except RuntimeError:
+                    return torch.sparse.mm(mat_calc.coalesce().transpose(0, 1), vec_calc)
+
+            # Chunking loop (Reduce Sum)
+            n_rows = mat_storage.shape[0]
+            y_acc = None
+            
+            for i in range(0, n_rows, self.chunk_size):
+                end = min(i + self.chunk_size, n_rows)
+                
+                # Slice M rows (CPU) -> GPU
+                mat_chunk = mat_storage[i:end].to(vec_calc.device)
+                # Slice w rows (GPU)
+                vec_chunk = vec_calc[i:end]
+                
+                # M_chunk^T @ vec_chunk
+                term = torch.sparse.mm(mat_chunk.transpose(0, 1), vec_chunk)
+                
+                if y_acc is None:
+                    y_acc = term
+                else:
+                    y_acc += term
+            return y_acc
 
         # 2. 역순 전파 루프
         for rev_i, step in enumerate(reversed(psum.steps)):
-            if step.mat_const.device != w.device:
-                step = _step_to_device(step, str(w.device))
-
             # 배치별 각도 계산 (Batch,)
-            if step.emb_idx >= 0 and priors_t is not None:
-                theta = priors_t[:, step.emb_idx].detach()
+            if step.emb_idx >= 0 and embedding_t is not None:
+                theta = embedding_t[:, step.emb_idx].detach()
                 cos_t = torch.cos(theta) # (Batch,)
                 sin_t = torch.sin(theta) # (Batch,)
             elif step.param_idx >= 0:
@@ -194,20 +234,13 @@ class TensorSparseEvaluator:
                 cos_t = torch.ones(batch_size, dtype=w.dtype, device=w.device)
                 sin_t = torch.zeros(batch_size, dtype=w.dtype, device=w.device)
 
-            if step.mat_const._nnz() > 0:
-                w_next = _safe_sparse_mm_T(step.mat_const, w)
-            else:
-                w_next = torch.zeros((step.shape[1], w.shape[1]), dtype=w.dtype, device=w.device)
+            w_next = _chunked_mm_T(step.mat_const, w)
 
             if step.mat_cos._nnz() > 0:
-                w_next = w_next + cos_t.view(1, -1) * _safe_sparse_mm_T(step.mat_cos, w)
+                w_next = w_next + cos_t.view(1, -1) * _chunked_mm_T(step.mat_cos, w)
             if step.mat_sin._nnz() > 0:
-                w_next = w_next + sin_t.view(1, -1) * _safe_sparse_mm_T(step.mat_sin, w)
+                w_next = w_next + sin_t.view(1, -1) * _chunked_mm_T(step.mat_sin, w)
             w = w_next
-
-            if self.stream_device is not None and self.offload_back:
-                orig_i = len(psum.steps) - 1 - rev_i
-                psum.steps[orig_i] = _step_to_device(step, "cpu")
 
         # 3. 결과 반환 (Batch, Num_Paulis)
         res = w.transpose(0, 1)

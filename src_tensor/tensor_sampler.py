@@ -219,13 +219,12 @@ class TensorSparseSampler:
         circuit: Sequence,
         z_combos: ZCombosInput,
         max_order: Optional[int] = None,
-        build_device: str = "cpu",
+        memory_device: str = "cpu",
+        compute_device: str = "cuda",
         dtype: str = "float64",
         max_weight: int = 8,
         max_xy: int = 1_000_000_000,
-        step_device: str = "cpu",
-        offload_steps: bool = False,
-        offload_keep: int = 1,
+        chunk_size: int = 1_000_000,
         build_thetas: Any = None,
         build_min_abs: Optional[float] = None,
         build_min_mat_abs: Optional[float] = None,
@@ -237,6 +236,9 @@ class TensorSparseSampler:
         self.circuit = list(circuit)
         self.dtype_str = str(dtype).lower()
         self.max_order = int(max_order) if max_order is not None else None
+        self.memory_device = memory_device
+        self.compute_device = compute_device
+        self.chunk_size = chunk_size
 
         self.z_spec = normalize_z_combos(z_combos, max_order=self.max_order)
         if self.z_spec.n_obs == 0:
@@ -250,13 +252,12 @@ class TensorSparseSampler:
         self.psum_union, self.basis = propagate_union_basis_psum(
             circuit=self.circuit,
             observables=self._obs,
-            device=build_device,
+            memory_device=memory_device,
+            compute_device=compute_device,
             dtype=self.dtype_str,
             max_weight=int(max_weight),
             max_xy=int(max_xy),
-            offload_steps=bool(offload_steps),
-            offload_keep=int(offload_keep),
-            step_device=str(step_device),
+            chunk_size=chunk_size,
             thetas=build_thetas,
             min_abs=build_min_abs,
             min_mat_abs=build_min_mat_abs,
@@ -271,8 +272,8 @@ class TensorSparseSampler:
         t_z0 = time.perf_counter()
         self.psum_union, keep_mask_in = zero_filter_tensor_backprop_with_keep_mask(
             self.psum_union,
-            stream_device=str(build_device) if str(build_device) != "cpu" else None,
-            offload_back=(str(build_device) != "cpu"),
+            compute_device=compute_device,
+            chunk_size=chunk_size,
         )
         t_z1 = time.perf_counter()
         self.basis = _shrink_union_basis(self.basis, keep_mask_in)
@@ -337,9 +338,6 @@ class TensorSparseSampler:
     def compute_moments(
         self,
         thetas: Any,
-        *,
-        stream_device: Optional[str] = None,
-        offload_back: bool = True,
     ) -> Tensor:
         """Return moments vector aligned with the normalized combo order.
 
@@ -347,7 +345,7 @@ class TensorSparseSampler:
         each subset-size group.
         """
 
-        w = adjoint_weights_on_zero(self.psum_union, thetas, stream_device=stream_device, offload_back=offload_back)
+        w = adjoint_weights_on_zero(self.psum_union, thetas, compute_device=self.compute_device, chunk_size=self.chunk_size)
         V0 = self._get_V0(device=str(w.device), dtype=w.dtype)
         return expvals_from_w_and_coeff_matrix(w, V0)
 
@@ -400,12 +398,10 @@ class TensorSparseSampler:
         thetas: Any,
         *,
         order: int = 3,
-        stream_device: Optional[str] = None,
-        offload_back: bool = True,
     ) -> Tensor:
         """Convenience: compute moments then return q^(order)(x_batch)."""
 
-        moments = self.compute_moments(thetas, stream_device=stream_device, offload_back=offload_back)
+        moments = self.compute_moments(thetas)
         return self.quasi_prob_from_moments(x_batch, moments, order=order)
 
 

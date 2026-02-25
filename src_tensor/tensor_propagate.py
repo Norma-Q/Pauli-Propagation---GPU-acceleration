@@ -222,17 +222,6 @@ def _prune_step_by_abs(step: TensorSparseStep, min_mat_abs: float) -> TensorSpar
     )
 
 
-def _step_to_device(step: TensorSparseStep, device: str) -> TensorSparseStep:
-    return TensorSparseStep(
-        mat_const=step.mat_const.to(device),
-        mat_cos=step.mat_cos.to(device),
-        mat_sin=step.mat_sin.to(device),
-        param_idx=step.param_idx,
-        emb_idx=step.emb_idx,
-        shape=step.shape,
-    )
-
-
 def _process_step_chunked(
     builder_fn,
     x_mask_in: Tensor,
@@ -320,21 +309,40 @@ def _process_step_chunked(
 
     # 4. Assemble Final Tensors
     full_new_x = torch.cat(new_x_parts, dim=0)
+    new_x_parts = None
     full_new_z = torch.cat(new_z_parts, dim=0)
+    new_z_parts = None
     full_cache = torch.cat(cache_parts, dim=0) if cache_parts else None
+    cache_parts = None
     
     def _concat_sparse(indices_list, values_list, shape):
         if not indices_list:
             return _make_sparse(torch.tensor([], dtype=torch.int64), torch.tensor([], dtype=torch.int64), torch.tensor([], dtype=kwargs['t_dtype']), shape, step_device, kwargs['t_dtype'])
+        
+        # [Memory Optimization] Clear lists immediately after cat to reduce peak memory
         all_indices = torch.cat(indices_list, dim=1).to(step_device)
+        indices_list.clear()
+        
         all_values = torch.cat(values_list, dim=0).to(step_device)
+        values_list.clear()
+        
         return torch.sparse_coo_tensor(all_indices, all_values, size=shape, device=step_device)
 
     full_shape = (row_offset, col_offset)
+
+    mat_const = _concat_sparse(const_indices, const_values, full_shape)
+    const_indices, const_values = None, None
+
+    mat_cos = _concat_sparse(cos_indices, cos_values, full_shape)
+    cos_indices, cos_values = None, None
+
+    mat_sin = _concat_sparse(sin_indices, sin_values, full_shape)
+    sin_indices, sin_values = None, None
+
     full_step = TensorSparseStep(
-        mat_const=_concat_sparse(const_indices, const_values, full_shape),
-        mat_cos=_concat_sparse(cos_indices, cos_values, full_shape),
-        mat_sin=_concat_sparse(sin_indices, sin_values, full_shape),
+        mat_const=mat_const,
+        mat_cos=mat_cos,
+        mat_sin=mat_sin,
         param_idx=step.param_idx,
         emb_idx=step.emb_idx,
         shape=full_shape
@@ -348,18 +356,13 @@ def propagate_surrogate_tensor(
     observable,
     max_weight: int = 50,
     max_xy: int = 50,
-    device: str = "cuda",
+    memory_device: str = "cpu",
+    compute_device: str = "cuda",
     dtype: str = "float32",
     thetas: Optional[Tensor] = None,
     min_abs: Optional[float] = None,
     min_mat_abs: Optional[float] = None,
-    offload_steps: bool = True,
-    offload_keep: int = 1,
-    step_device: str = "cpu",
-    debug_cuda_mem: bool = False,
-    debug_every: int = 25,
     chunk_size: int = 1_000_000,
-    mask_device: str = "cpu",
 ) -> TensorPauliSum:
     """Tensor-native propagation to a tensor PauliSum.
 
@@ -371,9 +374,6 @@ def propagate_surrogate_tensor(
         raise ValueError("min_abs requires thetas to be provided.")
     if min_mat_abs is not None and float(min_mat_abs) < 0.0:
         raise ValueError("min_mat_abs must be >= 0")
-
-    # Debug flags are intentionally ignored in the memory-first default.
-    _ = (debug_cuda_mem, debug_every)
 
     n_qubits = observable.n_qubits
 
@@ -387,17 +387,17 @@ def propagate_surrogate_tensor(
 
     # [Optimization] Initialize masks on CPU to support huge numbers of terms
     if n_qubits <= 63:
-        x_mask = torch.as_tensor([p.x_mask for p in pstrs], dtype=torch.int64, device=mask_device)
-        z_mask = torch.as_tensor([p.z_mask for p in pstrs], dtype=torch.int64, device=mask_device)
+        x_mask = torch.as_tensor([p.x_mask for p in pstrs], dtype=torch.int64, device=memory_device)
+        z_mask = torch.as_tensor([p.z_mask for p in pstrs], dtype=torch.int64, device=memory_device)
     else:
         n_words = (int(n_qubits) + 62) // 63
         x_words = [_pack_masks_63(int(p.x_mask), n_words) for p in pstrs]
         z_words = [_pack_masks_63(int(p.z_mask), n_words) for p in pstrs]
-        x_mask = torch.as_tensor(x_words, dtype=torch.int64, device=mask_device)
-        z_mask = torch.as_tensor(z_words, dtype=torch.int64, device=mask_device)
+        x_mask = torch.as_tensor(x_words, dtype=torch.int64, device=memory_device)
+        z_mask = torch.as_tensor(z_words, dtype=torch.int64, device=memory_device)
 
     t_dtype = torch.float64 if dtype == "float64" else torch.float32
-    coeff_init = torch.as_tensor(coeffs, dtype=t_dtype, device=mask_device)
+    coeff_init = torch.as_tensor(coeffs, dtype=t_dtype, device=memory_device)
     steps: List[TensorSparseStep] = []
 
     coeffs_cache: Optional[Tensor] = None
@@ -409,9 +409,9 @@ def propagate_surrogate_tensor(
         coeff_scale = coeff_max if coeff_max > 0.0 else 1.0
         coeffs_cache = (coeff_init / coeff_scale) # Keep on CPU
         min_abs_internal = float(min_abs) / coeff_scale
-        thetas_t = torch.as_tensor(thetas, dtype=coeff_init.dtype, device=device)
+        thetas_t = torch.as_tensor(thetas, dtype=coeff_init.dtype, device=compute_device)
         if thetas_t.numel() == 0:
-            thetas_t = torch.zeros(1, dtype=coeff_init.dtype, device=device)
+            thetas_t = torch.zeros(1, dtype=coeff_init.dtype, device=compute_device)
 
     total_gates = len(circuit)
     for gate in tqdm(reversed(circuit), total=total_gates, desc="propagate", dynamic_ncols=True):
@@ -420,8 +420,8 @@ def propagate_surrogate_tensor(
         if gate_name == "CliffordGate":
             new_x, new_z, step, coeffs_cache = _process_step_chunked(
                 build_clifford_step,
-                x_mask, z_mask, chunk_size, device, step_device,
-                output_device=mask_device,
+                x_mask, z_mask, chunk_size, compute_device, memory_device,
+                output_device=memory_device,
                 gate=gate,
                 t_dtype=t_dtype,
                 min_abs=min_abs_internal,
@@ -432,18 +432,14 @@ def propagate_surrogate_tensor(
             if min_mat_abs is not None and float(min_mat_abs) > 0.0:
                 step = _prune_step_by_abs(step, float(min_mat_abs))
             steps.append(step)
-            if offload_steps and device != "cpu" and len(steps) > offload_keep:
-                idx = len(steps) - offload_keep - 1
-                if steps[idx].mat_const.device.type != "cpu":
-                    steps[idx] = _step_to_device(steps[idx], "cpu")
             x_mask, z_mask = new_x, new_z
             continue
 
         if gate_name == "PauliRotation":
             new_x, new_z, step, coeffs_cache = _process_step_chunked(
                 build_pauli_rotation_step,
-                x_mask, z_mask, chunk_size, device, step_device,
-                output_device=mask_device,
+                x_mask, z_mask, chunk_size, compute_device, memory_device,
+                output_device=memory_device,
                 gate=gate,
                 t_dtype=t_dtype,
                 min_abs=min_abs_internal,
@@ -455,10 +451,6 @@ def propagate_surrogate_tensor(
             if min_mat_abs is not None and float(min_mat_abs) > 0.0:
                 step = _prune_step_by_abs(step, float(min_mat_abs))
             steps.append(step)
-            if offload_steps and device != "cpu" and len(steps) > offload_keep:
-                idx = len(steps) - offload_keep - 1
-                if steps[idx].mat_const.device.type != "cpu":
-                    steps[idx] = _step_to_device(steps[idx], "cpu")
             x_mask, z_mask = new_x, new_z
             continue
 
@@ -505,8 +497,8 @@ def zero_filter_tensor(psum: TensorPauliSum) -> TensorPauliSum:
 
 def zero_filter_tensor_backprop_with_keep_mask(
     psum: TensorPauliSum,
-    stream_device: Optional[str] = None,
-    offload_back: Optional[bool] = None,
+    compute_device: str = "cuda",
+    chunk_size: int = 1_000_000,
 ) -> Tuple[TensorPauliSum, Tensor]:
     """Back-propagating zero-filter.
 
@@ -532,30 +524,43 @@ def zero_filter_tensor_backprop_with_keep_mask(
     out_mask = _xmask_is_zero_rows(psum.x_mask)
     steps = list(psum.steps)
 
-    if stream_device is None:
-        stream_device = psum.x_mask.device.type if psum.x_mask.device.type != "cpu" else None
-    if offload_back is None:
-        offload_back = stream_device is not None
-
     row_mask = out_mask
     for i in reversed(range(len(steps))):
-        step = steps[i]
-        if stream_device is not None and step.mat_const.device.type != stream_device:
-            step = _step_to_device(step, stream_device)
-
-        n_cols = int(step.shape[1])
-        row_mask_device = row_mask.to(step.mat_const.device)
-        col_mask = _sparse_used_cols(step.mat_const, row_mask_device, n_cols)
-        if step.mat_cos._nnz() > 0:
-            col_mask |= _sparse_used_cols(step.mat_cos, row_mask_device, n_cols)
-        if step.mat_sin._nnz() > 0:
-            col_mask |= _sparse_used_cols(step.mat_sin, row_mask_device, n_cols)
-
-        steps[i] = _filter_step_rows_cols(step, row_mask_device, col_mask)
-        row_mask = col_mask.to(out_mask.device)
-
-        if stream_device is not None and offload_back:
-            steps[i] = _step_to_device(steps[i], "cpu")
+        # [Memory Optimization] Decompose step to release old tensors immediately after filtering
+        old_step = steps[i]
+        steps[i] = None  # Clear reference from list to allow GC
+        
+        mat_const = old_step.mat_const
+        mat_cos = old_step.mat_cos
+        mat_sin = old_step.mat_sin
+        n_cols = int(old_step.shape[1])
+        
+        # 1. Calculate used columns (on memory_device/CPU to avoid GPU OOM)
+        # row_mask is already on memory_device.
+        col_mask = _sparse_used_cols(mat_const, row_mask, n_cols)
+        if mat_cos._nnz() > 0:
+            col_mask |= _sparse_used_cols(mat_cos, row_mask, n_cols)
+        if mat_sin._nnz() > 0:
+            col_mask |= _sparse_used_cols(mat_sin, row_mask, n_cols)
+            
+        # 2. Filter matrices and release old ones sequentially
+        new_const = _filter_sparse_rows_cols(mat_const, row_mask, col_mask)
+        del mat_const
+        new_cos = _filter_sparse_rows_cols(mat_cos, row_mask, col_mask)
+        del mat_cos
+        
+        new_sin = _filter_sparse_rows_cols(mat_sin, row_mask, col_mask)
+        del mat_sin
+        
+        steps[i] = TensorSparseStep(
+            mat_const=new_const,
+            mat_cos=new_cos,
+            mat_sin=new_sin,
+            param_idx=old_step.param_idx,
+            emb_idx=old_step.emb_idx,
+            shape=(int(row_mask.sum().item()), int(col_mask.sum().item())),
+        )
+        row_mask = col_mask
 
     coeff_init = psum.coeff_init[row_mask]
 
@@ -571,15 +576,15 @@ def zero_filter_tensor_backprop_with_keep_mask(
 
 def zero_filter_tensor_backprop(
     psum: TensorPauliSum,
-    stream_device: Optional[str] = None,
-    offload_back: Optional[bool] = None,
+    compute_device: str = "cuda",
+    chunk_size: int = 1_000_000,
 ) -> TensorPauliSum:
     """Back-propagating zero-filter (prune rows/cols through sparse steps)."""
 
     filtered, _keep = zero_filter_tensor_backprop_with_keep_mask(
         psum,
-        stream_device=stream_device,
-        offload_back=offload_back,
+        compute_device=compute_device,
+        chunk_size=chunk_size,
     )
     return filtered
 
