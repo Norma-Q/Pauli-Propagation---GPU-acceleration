@@ -35,6 +35,7 @@ from tqdm import tqdm
 from .tensor_propagate_impl import (
     build_clifford_step,
     build_pauli_rotation_step,
+    compact_sparse_step_chunked,
 )
 
 
@@ -109,6 +110,31 @@ def _sparse_used_cols(mat: Tensor, row_mask: Tensor, n_cols: int) -> Tensor:
     used = torch.zeros((int(n_cols),), dtype=torch.bool, device=mat.device)
     used[col_idx[keep]] = True
     return used
+
+
+def _accumulate_used_cols_chunked(mat: Tensor, row_mask_d: Tensor, col_mask_d: Tensor, chunk_size: int) -> None:
+    """Accumulate used columns from a CPU sparse matrix into a GPU mask using chunks."""
+    if mat._nnz() == 0:
+        return
+    
+    # Coalesce the tensor to ensure indices are accessible and unique.
+    # This is required before calling .indices() on a sparse tensor that may
+    # have been constructed from non-unique/unsorted indices.
+    if not mat.is_coalesced():
+        mat = mat.coalesce()
+    # Access indices on CPU (Storage Device)
+    indices = mat.indices()
+    nnz = indices.shape[1]
+    device = row_mask_d.device
+
+    for start in range(0, nnz, chunk_size):
+        end = min(start + chunk_size, nnz)
+        # Move only indices to GPU (Compute Device)
+        idx_chunk = indices[:, start:end].to(device)
+        
+        # Update mask on GPU
+        keep = row_mask_d[idx_chunk[0]]
+        col_mask_d[idx_chunk[1][keep]] = True
 
 
 def _filter_sparse_rows_cols(mat: Tensor, row_mask: Tensor, col_mask: Tensor) -> Tensor:
@@ -222,6 +248,44 @@ def _prune_step_by_abs(step: TensorSparseStep, min_mat_abs: float) -> TensorSpar
     )
 
 
+def _destructive_cat(tensor_list: List[Tensor], dim: int = 0) -> Tensor:
+    """Concatenate tensors while freeing original tensors immediately to reduce peak memory.
+    
+    Equivalent to torch.cat(tensor_list, dim=dim) but avoids holding both input list
+    and output tensor in memory simultaneously.
+    """
+    if not tensor_list:
+        raise ValueError("Empty tensor list")
+    
+    # Calculate total size
+    total_size = sum(t.shape[dim] for t in tensor_list)
+    out_shape = list(tensor_list[0].shape)
+    out_shape[dim] = total_size
+    
+    # Pre-allocate output tensor
+    out = torch.empty(out_shape, dtype=tensor_list[0].dtype, device=tensor_list[0].device)
+    
+    offset = 0
+    for i in range(len(tensor_list)):
+        t = tensor_list[i]
+        size = t.shape[dim]
+        # Slice assignment
+        if dim == 0:
+            out[offset:offset+size] = t
+        elif dim == 1:
+            out[:, offset:offset+size] = t
+        else:
+            # Fallback for other dims (rarely used here)
+            idx = [slice(None)] * out.ndim
+            idx[dim] = slice(offset, offset+size)
+            out[tuple(idx)] = t
+            
+        offset += size
+        tensor_list[i] = None  # Release reference immediately
+        
+    return out
+
+
 def _process_step_chunked(
     builder_fn,
     x_mask_in: Tensor,
@@ -308,11 +372,11 @@ def _process_step_chunked(
         col_offset += (end - start)
 
     # 4. Assemble Final Tensors
-    full_new_x = torch.cat(new_x_parts, dim=0)
+    full_new_x = _destructive_cat(new_x_parts, dim=0)
     new_x_parts = None
-    full_new_z = torch.cat(new_z_parts, dim=0)
+    full_new_z = _destructive_cat(new_z_parts, dim=0)
     new_z_parts = None
-    full_cache = torch.cat(cache_parts, dim=0) if cache_parts else None
+    full_cache = _destructive_cat(cache_parts, dim=0) if cache_parts else None
     cache_parts = None
     
     def _concat_sparse(indices_list, values_list, shape):
@@ -320,10 +384,10 @@ def _process_step_chunked(
             return _make_sparse(torch.tensor([], dtype=torch.int64), torch.tensor([], dtype=torch.int64), torch.tensor([], dtype=kwargs['t_dtype']), shape, step_device, kwargs['t_dtype'])
         
         # [Memory Optimization] Clear lists immediately after cat to reduce peak memory
-        all_indices = torch.cat(indices_list, dim=1).to(step_device)
+        all_indices = _destructive_cat(indices_list, dim=1).to(step_device)
         indices_list.clear()
         
-        all_values = torch.cat(values_list, dim=0).to(step_device)
+        all_values = _destructive_cat(values_list, dim=0).to(step_device)
         values_list.clear()
         
         return torch.sparse_coo_tensor(all_indices, all_values, size=shape, device=step_device)
@@ -507,6 +571,7 @@ def zero_filter_tensor_backprop_with_keep_mask(
     where keep_mask_in is a boolean mask over the *input coefficient dimension*
     after pruning.
     """
+    print(f"Starting zero-filtering on {compute_device}...")
 
     if not _TORCH_AVAILABLE:
         raise RuntimeError("PyTorch is required for tensor backend.")
@@ -524,42 +589,51 @@ def zero_filter_tensor_backprop_with_keep_mask(
     out_mask = _xmask_is_zero_rows(psum.x_mask)
     steps = list(psum.steps)
 
+    # [Memory Optimization] Clear GPU cache from forward pass to free up VRAM for filtering
+    if torch.cuda.is_available() and "cuda" in compute_device:
+        torch.cuda.empty_cache()
+
     row_mask = out_mask
     for i in reversed(range(len(steps))):
         # [Memory Optimization] Decompose step to release old tensors immediately after filtering
         old_step = steps[i]
         steps[i] = None  # Clear reference from list to allow GC
         
-        mat_const = old_step.mat_const
-        mat_cos = old_step.mat_cos
-        mat_sin = old_step.mat_sin
         n_cols = int(old_step.shape[1])
         
-        # 1. Calculate used columns (on memory_device/CPU to avoid GPU OOM)
-        # row_mask is already on memory_device.
-        col_mask = _sparse_used_cols(mat_const, row_mask, n_cols)
-        if mat_cos._nnz() > 0:
-            col_mask |= _sparse_used_cols(mat_cos, row_mask, n_cols)
-        if mat_sin._nnz() > 0:
-            col_mask |= _sparse_used_cols(mat_sin, row_mask, n_cols)
+        # 1. Calculate used columns (Chunked GPU acceleration)
+        # Move masks to GPU, stream indices in chunks
+        try:
+            row_mask_d = row_mask.to(compute_device)
+            col_mask_d = torch.zeros((n_cols,), dtype=torch.bool, device=compute_device)
             
-        # 2. Filter matrices and release old ones sequentially
-        new_const = _filter_sparse_rows_cols(mat_const, row_mask, col_mask)
-        del mat_const
-        new_cos = _filter_sparse_rows_cols(mat_cos, row_mask, col_mask)
-        del mat_cos
-        
-        new_sin = _filter_sparse_rows_cols(mat_sin, row_mask, col_mask)
-        del mat_sin
-        
-        steps[i] = TensorSparseStep(
-            mat_const=new_const,
-            mat_cos=new_cos,
-            mat_sin=new_sin,
-            param_idx=old_step.param_idx,
-            emb_idx=old_step.emb_idx,
-            shape=(int(row_mask.sum().item()), int(col_mask.sum().item())),
+            _accumulate_used_cols_chunked(old_step.mat_const, row_mask_d, col_mask_d, chunk_size)
+            _accumulate_used_cols_chunked(old_step.mat_cos, row_mask_d, col_mask_d, chunk_size)
+            _accumulate_used_cols_chunked(old_step.mat_sin, row_mask_d, col_mask_d, chunk_size)
+            
+            col_mask = col_mask_d.to(row_mask.device) # Back to CPU
+        except RuntimeError as e: # Fallback to CPU if GPU OOM (e.g. masks too big)
+            print(f"Warning: GPU acceleration failed in zero-filter, falling back to CPU. Error: {e}")
+            col_mask = _sparse_used_cols(old_step.mat_const, row_mask, n_cols)
+            if old_step.mat_cos._nnz() > 0:
+                col_mask |= _sparse_used_cols(old_step.mat_cos, row_mask, n_cols)
+            if old_step.mat_sin._nnz() > 0:
+                col_mask |= _sparse_used_cols(old_step.mat_sin, row_mask, n_cols)
+            
+        # 2. Filter matrices using optimized chunked kernel
+        # This replaces the old sequential _filter_sparse_rows_cols calls
+        # and handles GPU streaming + memory cleanup internally.
+        steps[i] = compact_sparse_step_chunked(
+            old_step,
+            keep_row_mask=row_mask,
+            keep_col_mask=col_mask,
+            device=compute_device,
+            chunk_size=chunk_size
         )
+        
+        # Release old step explicitly (though GC should handle it as steps[i] was cleared)
+        del old_step
+        
         row_mask = col_mask
 
     coeff_init = psum.coeff_init[row_mask]

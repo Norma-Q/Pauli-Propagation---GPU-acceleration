@@ -301,8 +301,171 @@ def build_pauli_rotation_step(
     return new_x, new_z, step, out_cache
 
 
+def compact_sparse_step_chunked(
+    step: TensorSparseStep,
+    keep_row_mask: Tensor,
+    keep_col_mask: Optional[Tensor],
+    device: str,
+    chunk_size: int = 1_000_000,
+) -> TensorSparseStep:
+    """Filter and remap a TensorSparseStep using GPU acceleration with minimal memory footprint.
+
+    This function solves the OOM issue when filtering large sparse matrices by:
+    1. Creating a remapping table (cumsum) on GPU (or CPU if too large, but usually GPU fits).
+    2. Streaming indices of the sparse matrices in chunks to the GPU.
+    3. Applying the mask and remapping indices on the GPU.
+    4. Assembling the result back on the CPU.
+
+    Args:
+        step: The original step with potentially large sparse matrices (on CPU).
+        keep_row_mask: Boolean tensor indicating which rows to keep (size: n_old_rows).
+        keep_col_mask: Optional boolean tensor indicating which cols to keep (size: n_old_cols).
+        device: Compute device (e.g., "cuda") for acceleration.
+        chunk_size: Number of NNZ to process at a time.
+
+    Returns:
+        A new TensorSparseStep with filtered rows and remapped indices.
+    """
+    # 1. Prepare Remap Table
+    # Calculate new row indices: cumsum of the mask gives the new index for kept rows.
+    # We use -1 to indicate dropped rows.
+    n_old_rows = keep_row_mask.shape[0]
+    n_new_rows = int(keep_row_mask.sum().item())
+    n_new_cols = int(keep_col_mask.sum().item()) if keep_col_mask is not None else int(step.shape[1])
+
+    # Move mask to GPU for fast cumsum and lookup
+    # Boolean mask for 100M rows is ~100MB, fits easily in VRAM.
+    mask_gpu = keep_row_mask.to(device=device, dtype=torch.bool)
+    
+    # new_idx_map[old_idx] = new_idx (if kept)
+    # We calculate cumsum on the mask (treated as int).
+    # cumsum starts at 1 for the first kept element, so we subtract 1.
+    # We only care about indices where mask is True.
+    cumsum_gpu = torch.cumsum(mask_gpu.to(torch.int64), dim=0) - 1
+
+    # Prepare col map if exists
+    col_mask_gpu = None
+    col_cumsum_gpu = None
+    if keep_col_mask is not None:
+        col_mask_gpu = keep_col_mask.to(device=device, dtype=torch.bool)
+        col_cumsum_gpu = torch.cumsum(col_mask_gpu.to(torch.int64), dim=0) - 1
+    
+    # 2. Helper to process one matrix
+    def _process_matrix(mat: Tensor) -> Tensor:
+        if mat._nnz() == 0:
+            return torch.sparse_coo_tensor(
+                torch.zeros((2, 0), dtype=torch.int64, device=mat.device),
+                torch.zeros((0,), dtype=mat.dtype, device=mat.device),
+                size=(n_new_rows, n_new_cols),
+                device=mat.device,
+                dtype=mat.dtype
+            )
+
+        # We iterate over the coalesced indices (assuming mat is coalesced or we coalesce it)
+        # Since we are just reading, we can work with the underlying indices/values directly.
+        if not mat.is_coalesced():
+            mat = mat.coalesce()
+        
+        indices = mat.indices() # (2, NNZ)
+        values = mat.values()   # (NNZ,)
+        nnz = mat._nnz()
+
+        new_indices_list = []
+        new_values_list = []
+        
+        # Chunked processing
+        for start in range(0, nnz, chunk_size):
+            end = min(start + chunk_size, nnz)
+            
+            # Move chunk to GPU
+            # indices_chunk: (2, chunk_len)
+            indices_chunk = indices[:, start:end].to(device, non_blocking=True)
+            values_chunk = values[start:end].to(device, non_blocking=True)
+            
+            row_indices = indices_chunk[0]
+            col_indices = indices_chunk[1]
+            
+            # Check which elements to keep based on row index
+            # mask_gpu is (N_rows,), row_indices are in [0, N_rows)
+            keep_chunk = mask_gpu[row_indices]
+
+            # Check cols if needed
+            if col_mask_gpu is not None:
+                keep_col_chunk = col_mask_gpu[col_indices]
+                keep_chunk = keep_chunk & keep_col_chunk
+            
+            # Filter
+            if not keep_chunk.any():
+                continue
+                
+            valid_indices = indices_chunk[:, keep_chunk]
+            valid_values = values_chunk[keep_chunk]
+            
+            # Remap row indices
+            # valid_indices[0] contains old row indices.
+            # We replace them with new indices from cumsum_gpu.
+            old_rows = valid_indices[0]
+            new_rows = cumsum_gpu[old_rows]
+            valid_indices[0] = new_rows
+            
+            # Remap col indices if needed
+            if col_cumsum_gpu is not None:
+                old_cols = valid_indices[1]
+                new_cols = col_cumsum_gpu[old_cols]
+                valid_indices[1] = new_cols
+
+            # Move back to CPU to save VRAM
+            new_indices_list.append(valid_indices.cpu())
+            new_values_list.append(valid_values.cpu())
+            
+            # Explicit delete to free GPU memory immediately
+            del indices_chunk, values_chunk, keep_chunk, valid_indices, valid_values, old_rows, new_rows
+
+        # Assemble result on CPU
+        if not new_indices_list:
+            return torch.sparse_coo_tensor(
+                torch.zeros((2, 0), dtype=torch.int64, device=mat.device),
+                torch.zeros((0,), dtype=mat.dtype, device=mat.device),
+                size=(n_new_rows, n_new_cols),
+                device=mat.device,
+                dtype=mat.dtype
+            )
+            
+        final_indices = torch.cat(new_indices_list, dim=1)
+        final_values = torch.cat(new_values_list, dim=0)
+        
+        return torch.sparse_coo_tensor(
+            final_indices,
+            final_values,
+            size=(n_new_rows, n_new_cols),
+            device=mat.device,
+            dtype=mat.dtype
+        )
+
+    # 3. Process all matrices sequentially to minimize peak memory
+    new_const = _process_matrix(step.mat_const)
+    # Explicitly delete intermediate GPU tensors if any remain (handled in loop)
+    
+    new_cos = _process_matrix(step.mat_cos)
+    new_sin = _process_matrix(step.mat_sin)
+
+    # Clean up GPU map
+    del mask_gpu, cumsum_gpu, col_mask_gpu, col_cumsum_gpu
+    # torch.cuda.empty_cache() # Optional, depending on how tight memory is
+
+    return TensorSparseStep(
+        mat_const=new_const,
+        mat_cos=new_cos,
+        mat_sin=new_sin,
+        param_idx=step.param_idx,
+        emb_idx=step.emb_idx,
+        shape=(n_new_rows, n_new_cols)
+    )
+
+
 __all__ = [
     "CPPBackendUnavailableError",
     "build_clifford_step",
     "build_pauli_rotation_step",
+    "compact_sparse_step_chunked",
 ]
