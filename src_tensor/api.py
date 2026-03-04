@@ -56,8 +56,8 @@ class TensorSurrogatePreset:
 
 DEFAULT_PRESETS: Dict[str, TensorSurrogatePreset] = {
     "cpu": TensorSurrogatePreset(
-        memory_device="cpu",
-        compute_device="cpu",
+        memory_device="cpu",  # where pauli sums and masks are built/stored
+        compute_device="cpu", # where the main matrix computation happens; can be "cuda" for GPU eval with CPU storage
         dtype="float32",
         max_weight=1_000_000_000,
         max_xy=1_000_000_000,
@@ -512,6 +512,12 @@ def compile_expval_program(
         min_mat_abs=build_min_mat_abs,
         chunk_size=int(cfg.chunk_size),
     )
+
+
+    # [Correction] Check x_mask size for propagated terms, not coeff_init (which is just the observable terms)
+    n_terms_prop = int(psum_union.x_mask.shape[0])
+    print(f"[PPS Info] Propagation complete. Terms generated: {n_terms_prop:,}")
+
 
     from .tensor_propagate import zero_filter_tensor_backprop_with_keep_mask
 

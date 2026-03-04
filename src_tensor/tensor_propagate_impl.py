@@ -370,17 +370,41 @@ def compact_sparse_step_chunked(
         values = mat.values()   # (NNZ,)
         nnz = mat._nnz()
 
+        # [Optimization] Pin memory for faster H2D transfer
+        # Only pin if tensor is large enough (> 1MB approx) to justify allocation overhead.
+        if device.startswith("cuda") and not indices.is_pinned() and indices.numel() > 100_000:
+            try:
+                indices = indices.pin_memory()
+            except Exception:
+                pass # Fallback to pageable memory if RAM is full
+
+        # [Optimization] Dynamic Chunking based on available VRAM
+        current_chunk_size = chunk_size
+        if device.startswith("cuda"):
+            try:
+                free_mem, _ = torch.cuda.mem_get_info(device)
+                # Heuristic: ~128 bytes per NNZ for indices(16B) + remapped(16B) + masks + overhead
+                # Reserve 500MB buffer for safety.
+                safe_mem = max(0, free_mem - 500 * 1024 * 1024)
+                estimated_capacity = int(safe_mem // 128)
+                
+                # Use the larger of user-specified chunk or calculated capacity
+                current_chunk_size = max(chunk_size, estimated_capacity)
+            except Exception:
+                pass # Fallback to default if mem_get_info fails
+        
         new_indices_list = []
         new_values_list = []
         
         # Chunked processing
-        for start in range(0, nnz, chunk_size):
-            end = min(start + chunk_size, nnz)
+        for start in range(0, nnz, current_chunk_size):
+            end = min(start + current_chunk_size, nnz)
             
             # Move chunk to GPU
             # indices_chunk: (2, chunk_len)
             indices_chunk = indices[:, start:end].to(device, non_blocking=True)
-            values_chunk = values[start:end].to(device, non_blocking=True)
+            # [Optimization] Do not move values to GPU. We filter them on CPU.
+            # values_chunk = values[start:end].to(device, non_blocking=True)
             
             row_indices = indices_chunk[0]
             col_indices = indices_chunk[1]
@@ -394,12 +418,16 @@ def compact_sparse_step_chunked(
                 keep_col_chunk = col_mask_gpu[col_indices]
                 keep_chunk = keep_chunk & keep_col_chunk
             
+                        
             # Filter
             if not keep_chunk.any():
+                del indices_chunk, keep_chunk, row_indices, col_indices
                 continue
                 
             valid_indices = indices_chunk[:, keep_chunk]
-            valid_values = values_chunk[keep_chunk]
+            
+            # Remap row indices
+            # valid_indices[0] contains old row indices.
             
             # Remap row indices
             # valid_indices[0] contains old row indices.
@@ -414,12 +442,19 @@ def compact_sparse_step_chunked(
                 new_cols = col_cumsum_gpu[old_cols]
                 valid_indices[1] = new_cols
 
+            
             # Move back to CPU to save VRAM
             new_indices_list.append(valid_indices.cpu())
-            new_values_list.append(valid_values.cpu())
+            
+            # [Optimization] Filter values on CPU using the mask
+            keep_chunk_cpu = keep_chunk.cpu()
+            # Slice from original values tensor (CPU)
+            values_slice = values[start:end]
+            new_values_list.append(values_slice[keep_chunk_cpu])
             
             # Explicit delete to free GPU memory immediately
-            del indices_chunk, values_chunk, keep_chunk, valid_indices, valid_values, old_rows, new_rows
+            del indices_chunk, keep_chunk, valid_indices, old_rows, new_rows, keep_chunk_cpu
+
 
         # Assemble result on CPU
         if not new_indices_list:

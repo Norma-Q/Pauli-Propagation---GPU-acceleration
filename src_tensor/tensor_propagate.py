@@ -126,11 +126,34 @@ def _accumulate_used_cols_chunked(mat: Tensor, row_mask_d: Tensor, col_mask_d: T
     indices = mat.indices()
     nnz = indices.shape[1]
     device = row_mask_d.device
+    
+    # [Optimization] Pin memory for faster H2D transfer
+    # This enables direct DMA transfer and better PCIe saturation.
+    # Only pin if tensor is large enough (> 1MB approx) to justify allocation overhead.
+    # 1MB ~ 128k int64 elements.
+    if str(device).startswith("cuda") and not indices.is_pinned() and indices.numel() > 100_000:
+        try:
+            indices = indices.pin_memory()
+        except Exception:
+            pass # Fallback to pageable memory if RAM is full
+    
+    # [Optimization] Dynamic Chunking for mask accumulation
+    current_chunk_size = chunk_size
+    if str(device).startswith("cuda"):
+        try:
+            free_mem, _ = torch.cuda.mem_get_info(device)
+            # Heuristic: indices (16B) + overhead.
+            # Reserve 500MB buffer.
+            safe_mem = max(0, free_mem - 500 * 1024 * 1024)
+            estimated_capacity = int(safe_mem // 64)
+            current_chunk_size = max(chunk_size, estimated_capacity)
+        except Exception:
+            pass
 
-    for start in range(0, nnz, chunk_size):
-        end = min(start + chunk_size, nnz)
+    for start in range(0, nnz, current_chunk_size):
+        end = min(start + current_chunk_size, nnz)
         # Move only indices to GPU (Compute Device)
-        idx_chunk = indices[:, start:end].to(device)
+        idx_chunk = indices[:, start:end].to(device, non_blocking=True)
         
         # Update mask on GPU
         keep = row_mask_d[idx_chunk[0]]
@@ -576,6 +599,7 @@ def zero_filter_tensor_backprop_with_keep_mask(
     if not _TORCH_AVAILABLE:
         raise RuntimeError("PyTorch is required for tensor backend.")
     if psum.x_mask.numel() == 0:
+        print("[ZeroFilter] No terms generated (empty mask). Skipping back-propagation.")
         keep_mask = torch.zeros((int(psum.coeff_init.shape[0]),), dtype=torch.bool, device=psum.coeff_init.device)
         filtered = TensorPauliSum(
             n_qubits=psum.n_qubits,
@@ -587,6 +611,14 @@ def zero_filter_tensor_backprop_with_keep_mask(
         return filtered, keep_mask
 
     out_mask = _xmask_is_zero_rows(psum.x_mask)
+    
+    # [Log] Show initial reduction from total propagated terms to diagonal terms
+    n_total = psum.x_mask.shape[0]
+    n_diag = int(out_mask.sum().item())
+    pct = 100.0 * n_diag / n_total if n_total > 0 else 0.0
+    print(f"[ZeroFilter] Initial pruning (diagonal terms only): {n_total:,} -> {n_diag:,} terms kept ({pct:.8f}%)")
+    print(f"[ZeroFilter] Zero-filtering done. Starting back-propagation of keep mask through {len(psum.steps)} steps...")
+
     steps = list(psum.steps)
 
     # [Memory Optimization] Clear GPU cache from forward pass to free up VRAM for filtering
@@ -620,6 +652,12 @@ def zero_filter_tensor_backprop_with_keep_mask(
             if old_step.mat_sin._nnz() > 0:
                 col_mask |= _sparse_used_cols(old_step.mat_sin, row_mask, n_cols)
             
+        # [Log] Print reduction stats
+        if (i % 10) == 0 or (i == len(steps) - 1):
+            # Note: cols can be > rows because a single output term (row) may depend on
+            # multiple input terms (cols) due to rotation mixing (branching).
+            print(f"[ZeroFilter] Step {i}: {int(row_mask.sum().item())} rows -> {int(col_mask.sum().item())} cols kept")
+
         # 2. Filter matrices using optimized chunked kernel
         # This replaces the old sequential _filter_sparse_rows_cols calls
         # and handles GPU streaming + memory cleanup internally.
