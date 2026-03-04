@@ -1,6 +1,7 @@
 """Tensor DAG evaluator (GPU-first)."""
 
 from __future__ import annotations
+import math
 
 from typing import Optional, TYPE_CHECKING, Any, cast
 
@@ -9,6 +10,7 @@ try:
     import torch as _torch
     torch = _torch
     _TORCH_AVAILABLE = True
+    import torch.utils.checkpoint
 except Exception:  # pragma: no cover - optional dependency
     torch = cast(Any, None)
     _TORCH_AVAILABLE = False
@@ -219,28 +221,49 @@ class TensorSparseEvaluator:
                     y_acc += term
             return y_acc
 
-        # 2. 역순 전파 루프
-        for rev_i, step in enumerate(reversed(psum.steps)):
-            # 배치별 각도 계산 (Batch,)
-            if step.emb_idx >= 0 and embedding_t is not None:
-                theta = embedding_t[:, step.emb_idx].detach()
-                cos_t = torch.cos(theta) # (Batch,)
-                sin_t = torch.sin(theta) # (Batch,)
-            elif step.param_idx >= 0:
-                theta = thetas_t[step.param_idx]
-                cos_t = torch.cos(theta).expand(batch_size) # 모든 배치에 동일 적용
-                sin_t = torch.sin(theta).expand(batch_size)
+        # 2. 역순 전파 루프 (Gradient Checkpointing 적용)
+        def _run_adjoint_segment(w_in, t_thetas, t_embedding, start_idx, end_idx):
+            w_curr = w_in
+            # 루프는 역순으로 진행됩니다.
+            for i in range(int(start_idx), int(end_idx)):
+                step = psum.steps[len(psum.steps) - 1 - i]
+
+                if step.emb_idx >= 0 and t_embedding is not None:
+                    theta = t_embedding[:, step.emb_idx].detach()
+                    cos_t = torch.cos(theta)
+                    sin_t = torch.sin(theta)
+                elif step.param_idx >= 0:
+                    theta = t_thetas[step.param_idx]
+                    cos_t = torch.cos(theta).expand(batch_size)
+                    sin_t = torch.sin(theta).expand(batch_size)
+                else:
+                    cos_t = torch.ones(batch_size, dtype=w_curr.dtype, device=w_curr.device)
+                    sin_t = torch.zeros(batch_size, dtype=w_curr.dtype, device=w_curr.device)
+
+                w_next = _chunked_mm_T(step.mat_const, w_curr)
+
+                if step.mat_cos._nnz() > 0:
+                    w_next = w_next + cos_t.view(1, -1) * _chunked_mm_T(step.mat_cos, w_curr)
+                if step.mat_sin._nnz() > 0:
+                    w_next = w_next + sin_t.view(1, -1) * _chunked_mm_T(step.mat_sin, w_curr)
+                w_curr = w_next
+            return w_curr
+
+        n_steps = len(psum.steps)
+        if n_steps > 0:
+            segment_size = int(math.sqrt(n_steps))
+            if segment_size < 10: segment_size = 10
+        else:
+            segment_size = 1
+
+        for start in range(0, n_steps, segment_size):
+            end = min(start + segment_size, n_steps)
+            if torch.is_grad_enabled() and thetas_t.requires_grad:
+                w = torch.utils.checkpoint.checkpoint(
+                    _run_adjoint_segment, w, thetas_t, embedding_t, start, end, use_reentrant=False
+                )
             else:
-                cos_t = torch.ones(batch_size, dtype=w.dtype, device=w.device)
-                sin_t = torch.zeros(batch_size, dtype=w.dtype, device=w.device)
-
-            w_next = _chunked_mm_T(step.mat_const, w)
-
-            if step.mat_cos._nnz() > 0:
-                w_next = w_next + cos_t.view(1, -1) * _chunked_mm_T(step.mat_cos, w)
-            if step.mat_sin._nnz() > 0:
-                w_next = w_next + sin_t.view(1, -1) * _chunked_mm_T(step.mat_sin, w)
-            w = w_next
+                w = _run_adjoint_segment(w, thetas_t, embedding_t, start, end)
 
         # 3. 결과 반환 (Batch, Num_Paulis)
         res = w.transpose(0, 1)

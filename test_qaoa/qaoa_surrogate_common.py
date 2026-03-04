@@ -7,6 +7,7 @@ import json
 import sys
 
 import numpy as np
+import torch
 
 _THIS_DIR = Path(__file__).resolve().parent
 _REPO_ROOT = _THIS_DIR.parent
@@ -17,6 +18,25 @@ from src.pauli_surrogate_python import CliffordGate, PauliRotation, PauliSum
 
 
 Edge = Tuple[int, int]
+
+
+def choose_device(raw: str) -> str:
+    if raw == "auto":
+        return "cuda" if torch.cuda.is_available() else "cpu"
+    return str(raw)
+
+
+def default_cpu_exact_overrides() -> Dict[str, object]:
+    return {
+        "build_device": "cpu",
+        "step_device": "cpu",
+        "stream_device": "cpu",
+        "dtype": "float64",
+        "max_weight": 1_000_000_000,
+        "max_xy": 1_000_000_000,
+        "offload_steps": False,
+        "offload_back": False,
+    }
 
 
 @dataclass(frozen=True)
@@ -158,12 +178,17 @@ def build_qaoa_circuit(n_qubits: int, edges: Sequence[Edge], p_layers: int):
 
     param_idx = 0
     for _ in range(p):
+        # Standard QAOA: Share gamma for all edges in this layer
+        gamma_idx = param_idx
+        param_idx += 1
         for (u, v) in edges:
-            circuit.append(PauliRotation("ZZ", [int(u), int(v)], param_idx=param_idx))
-            param_idx += 1
+            circuit.append(PauliRotation("ZZ", [int(u), int(v)], param_idx=gamma_idx))
+        
+        # Standard QAOA: Share beta for all qubits in this layer
+        beta_idx = param_idx
+        param_idx += 1
         for q in range(n):
-            circuit.append(PauliRotation("X", [q], param_idx=param_idx))
-            param_idx += 1
+            circuit.append(PauliRotation("X", [q], param_idx=beta_idx))
     return circuit, param_idx
 
 
@@ -189,8 +214,8 @@ def build_qaoa_theta_init_tqa(
     params = tqa_init_qaoa_params(p=int(p_layers), delta_t=float(delta_t), dtype=dtype)
     thetas: List[float] = []
     for l in range(int(p_layers)):
-        thetas.extend([float(params.gammas[l])] * int(n_edges))
-        thetas.extend([float(params.betas[l])] * int(n_qubits))
+        thetas.append(float(params.gammas[l]))
+        thetas.append(float(params.betas[l]))
     return np.asarray(thetas, dtype=dtype)
 
 

@@ -653,10 +653,16 @@ def zero_filter_tensor_backprop_with_keep_mask(
                 col_mask |= _sparse_used_cols(old_step.mat_sin, row_mask, n_cols)
             
         # [Log] Print reduction stats
-        if (i % 10) == 0 or (i == len(steps) - 1):
-            # Note: cols can be > rows because a single output term (row) may depend on
-            # multiple input terms (cols) due to rotation mixing (branching).
-            print(f"[ZeroFilter] Step {i}: {int(row_mask.sum().item())} rows -> {int(col_mask.sum().item())} cols kept")
+        if len(str(len(steps))) < 3:
+            if (i % 10) == 0 or (i == len(steps) - 1):
+                # Note: cols can be > rows because a single output term (row) may depend on
+                # multiple input terms (cols) due to rotation mixing (branching).
+                print(f"[ZeroFilter] Step {i}: {int(row_mask.sum().item())} rows -> {int(col_mask.sum().item())} cols kept")
+        else:
+            if (i % 100) == 0 or (i == len(steps) - 1):
+                # Note: cols can be > rows because a single output term (row) may depend on
+                # multiple input terms (cols) due to rotation mixing (branching).
+                print(f"[ZeroFilter] Step {i}: {int(row_mask.sum().item())} rows -> {int(col_mask.sum().item())} cols kept")
 
         # 2. Filter matrices using optimized chunked kernel
         # This replaces the old sequential _filter_sparse_rows_cols calls
