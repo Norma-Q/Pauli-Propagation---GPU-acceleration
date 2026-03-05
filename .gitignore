@@ -28,6 +28,10 @@ dist/
 ##### files to be ignored for specific projects #####
 cudaq_sampling/
 test_qaoa/artifacts/
+test_qaoa/results/
+test_qaoa/graph/
+test_qaoa/config/
+test_qaoa/config_quantinuum.yaml
 
 batch.ipynb
 embedding.ipynb
@@ -37,3 +41,7 @@ benchmark_cpu_vs_gpu_storage.ipynb
 
 batch_implementation_from_embedding.md
 embedding_implementation_from_scratch.md
+
+
+generating_configfiles.py
+generating_shfiles.py
