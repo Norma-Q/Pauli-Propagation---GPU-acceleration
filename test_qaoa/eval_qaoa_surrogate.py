@@ -31,6 +31,27 @@ from qaoa_surrogate_common import (
 )
 
 
+def _choose_device(raw: str) -> str:
+    if raw == "auto":
+        return "cuda" if torch.cuda.is_available() else "cpu"
+    return str(raw)
+
+
+def _cpu_exact_overrides() -> Dict[str, object]:
+    return {
+        "build_device": "cpu",
+        "step_device": "cpu",
+        "stream_device": "cpu",
+        "dtype": "float64",
+        "max_weight": 1_000_000_000,
+        "weight_x": 1.0,
+        "weight_y": 1.0,
+        "weight_z": 1.0,
+        "offload_steps": False,
+        "offload_back": False,
+    }
+
+
 def _compile_program_for_eval(
     *,
     n_qubits: int,

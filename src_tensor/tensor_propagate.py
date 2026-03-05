@@ -35,6 +35,8 @@ from tqdm import tqdm
 from .tensor_propagate_impl import (
     build_clifford_step,
     build_pauli_rotation_step,
+    build_depolarizing_step,
+    build_amplitude_damping_step,
     compact_sparse_step_chunked,
 )
 
@@ -442,7 +444,9 @@ def propagate_surrogate_tensor(
     circuit,
     observable,
     max_weight: int = 50,
-    max_xy: int = 50,
+    weight_x: float = 1.0,
+    weight_y: float = 1.0,
+    weight_z: float = 1.0,
     memory_device: str = "cpu",
     compute_device: str = "cuda",
     dtype: str = "float32",
@@ -514,7 +518,9 @@ def propagate_surrogate_tensor(
                 min_abs=min_abs_internal,
                 coeffs_cache=coeffs_cache,
                 max_weight=max_weight,
-                max_xy=max_xy,
+                weight_x=weight_x,
+                weight_y=weight_y,
+                weight_z=weight_z,
             )
             if min_mat_abs is not None and float(min_mat_abs) > 0.0:
                 step = _prune_step_by_abs(step, float(min_mat_abs))
@@ -533,7 +539,49 @@ def propagate_surrogate_tensor(
                 coeffs_cache=coeffs_cache,
                 thetas_t=thetas_t,
                 max_weight=max_weight,
-                max_xy=max_xy,
+                weight_x=weight_x,
+                weight_y=weight_y,
+                weight_z=weight_z,
+            )
+            if min_mat_abs is not None and float(min_mat_abs) > 0.0:
+                step = _prune_step_by_abs(step, float(min_mat_abs))
+            steps.append(step)
+            x_mask, z_mask = new_x, new_z
+            continue
+
+        if gate_name == "DepolarizingNoise":
+            new_x, new_z, step, coeffs_cache = _process_step_chunked(
+                build_depolarizing_step,
+                x_mask, z_mask, chunk_size, compute_device, memory_device,
+                output_device=memory_device,
+                gate=gate,
+                t_dtype=t_dtype,
+                min_abs=min_abs_internal,
+                coeffs_cache=coeffs_cache,
+                max_weight=max_weight,
+                weight_x=weight_x,
+                weight_y=weight_y,
+                weight_z=weight_z,
+            )
+            if min_mat_abs is not None and float(min_mat_abs) > 0.0:
+                step = _prune_step_by_abs(step, float(min_mat_abs))
+            steps.append(step)
+            x_mask, z_mask = new_x, new_z
+            continue
+
+        if gate_name == "AmplitudeDampingNoise":
+            new_x, new_z, step, coeffs_cache = _process_step_chunked(
+                build_amplitude_damping_step,
+                x_mask, z_mask, chunk_size, compute_device, memory_device,
+                output_device=memory_device,
+                gate=gate,
+                t_dtype=t_dtype,
+                min_abs=min_abs_internal,
+                coeffs_cache=coeffs_cache,
+                max_weight=max_weight,
+                weight_x=weight_x,
+                weight_y=weight_y,
+                weight_z=weight_z,
             )
             if min_mat_abs is not None and float(min_mat_abs) > 0.0:
                 step = _prune_step_by_abs(step, float(min_mat_abs))
@@ -543,7 +591,7 @@ def propagate_surrogate_tensor(
 
         raise TypeError(
             f"Unsupported gate type in propagate_surrogate_tensor: {gate_name}. "
-            "Expected CliffordGate or PauliRotation."
+            "Expected CliffordGate, PauliRotation, DepolarizingNoise, or AmplitudeDampingNoise."
         )
 
     psum = TensorPauliSum(
@@ -626,7 +674,8 @@ def zero_filter_tensor_backprop_with_keep_mask(
         torch.cuda.empty_cache()
 
     row_mask = out_mask
-    for i in reversed(range(len(steps))):
+    pbar = tqdm(reversed(range(len(steps))), total=len(steps), desc="zero-filter", dynamic_ncols=True)
+    for i in pbar:
         # [Memory Optimization] Decompose step to release old tensors immediately after filtering
         old_step = steps[i]
         steps[i] = None  # Clear reference from list to allow GC
@@ -639,9 +688,9 @@ def zero_filter_tensor_backprop_with_keep_mask(
             row_mask_d = row_mask.to(compute_device)
             col_mask_d = torch.zeros((n_cols,), dtype=torch.bool, device=compute_device)
             
-            _accumulate_used_cols_chunked(old_step.mat_const, row_mask_d, col_mask_d, chunk_size)
-            _accumulate_used_cols_chunked(old_step.mat_cos, row_mask_d, col_mask_d, chunk_size)
-            _accumulate_used_cols_chunked(old_step.mat_sin, row_mask_d, col_mask_d, chunk_size)
+            _accumulate_used_cols_chunked(old_step.mat_const, row_mask_d, col_mask_d, chunk_size*5000)
+            _accumulate_used_cols_chunked(old_step.mat_cos, row_mask_d, col_mask_d, chunk_size*5000)
+            _accumulate_used_cols_chunked(old_step.mat_sin, row_mask_d, col_mask_d, chunk_size*5000)
             
             col_mask = col_mask_d.to(row_mask.device) # Back to CPU
         except RuntimeError as e: # Fallback to CPU if GPU OOM (e.g. masks too big)
@@ -652,17 +701,11 @@ def zero_filter_tensor_backprop_with_keep_mask(
             if old_step.mat_sin._nnz() > 0:
                 col_mask |= _sparse_used_cols(old_step.mat_sin, row_mask, n_cols)
             
-        # [Log] Print reduction stats
-        if len(str(len(steps))) < 3:
-            if (i % 10) == 0 or (i == len(steps) - 1):
-                # Note: cols can be > rows because a single output term (row) may depend on
-                # multiple input terms (cols) due to rotation mixing (branching).
-                print(f"[ZeroFilter] Step {i}: {int(row_mask.sum().item())} rows -> {int(col_mask.sum().item())} cols kept")
-        else:
-            if (i % 100) == 0 or (i == len(steps) - 1):
-                # Note: cols can be > rows because a single output term (row) may depend on
-                # multiple input terms (cols) due to rotation mixing (branching).
-                print(f"[ZeroFilter] Step {i}: {int(row_mask.sum().item())} rows -> {int(col_mask.sum().item())} cols kept")
+        # [Log] Print reduction stats inside tqdm
+        pbar.set_postfix_str(
+            f"step={i} rows={int(row_mask.sum().item())} cols={int(col_mask.sum().item())}",
+            refresh=False,
+        )
 
         # 2. Filter matrices using optimized chunked kernel
         # This replaces the old sequential _filter_sparse_rows_cols calls

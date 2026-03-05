@@ -19,11 +19,9 @@ build/
 dist/
 *.egg-info/
 .eggs/
-
-
-
-
-
+QAOA/
+.vscode
+.build
 
 ##### files to be ignored for specific projects #####
 cudaq_sampling/

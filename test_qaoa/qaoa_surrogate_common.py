@@ -178,17 +178,13 @@ def build_qaoa_circuit(n_qubits: int, edges: Sequence[Edge], p_layers: int):
 
     param_idx = 0
     for _ in range(p):
-        # Standard QAOA: Share gamma for all edges in this layer
         gamma_idx = param_idx
-        param_idx += 1
+        beta_idx = param_idx + 1
         for (u, v) in edges:
             circuit.append(PauliRotation("ZZ", [int(u), int(v)], param_idx=gamma_idx))
-        
-        # Standard QAOA: Share beta for all qubits in this layer
-        beta_idx = param_idx
-        param_idx += 1
         for q in range(n):
             circuit.append(PauliRotation("X", [q], param_idx=beta_idx))
+        param_idx += 2
     return circuit, param_idx
 
 

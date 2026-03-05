@@ -50,7 +50,9 @@ class TensorSurrogatePreset:
     compute_device: str = "cuda"
     dtype: str = "float32"
     max_weight: int = 20
-    max_xy: int = 1_000_000_000
+    weight_x: float = 1.0
+    weight_y: float = 1.0
+    weight_z: float = 1.0
     chunk_size: int = 1_000_000
 
 
@@ -60,7 +62,9 @@ DEFAULT_PRESETS: Dict[str, TensorSurrogatePreset] = {
         compute_device="cpu", # where the main matrix computation happens; can be "cuda" for GPU eval with CPU storage
         dtype="float32",
         max_weight=1_000_000_000,
-        max_xy=1_000_000_000,
+        weight_x=1.0,
+        weight_y=1.0,
+        weight_z=1.0,
         chunk_size=1_000_000,
     ),
     "gpu": TensorSurrogatePreset(
@@ -68,7 +72,9 @@ DEFAULT_PRESETS: Dict[str, TensorSurrogatePreset] = {
         compute_device="cuda",
         dtype="float64",
         max_weight=1_000_000_000,
-        max_xy=1_000_000_000,
+        weight_x=1.0,
+        weight_y=1.0,
+        weight_z=1.0,
         chunk_size=1_000_000_000,
     ),
     "hybrid": TensorSurrogatePreset(
@@ -76,7 +82,9 @@ DEFAULT_PRESETS: Dict[str, TensorSurrogatePreset] = {
         compute_device="cuda",
         dtype="float32",
         max_weight=1_000_000_000,
-        max_xy=1_000_000_000,
+        weight_x=1.0,
+        weight_y=1.0,
+        weight_z=1.0,
         chunk_size=1_000_000,
     ),
     "gpu_safe": TensorSurrogatePreset(
@@ -84,7 +92,9 @@ DEFAULT_PRESETS: Dict[str, TensorSurrogatePreset] = {
         compute_device="cuda",
         dtype="float64",
         max_weight=1_000_000_000,
-        max_xy=1_000_000_000,
+        weight_x=1.0,
+        weight_y=1.0,
+        weight_z=1.0,
         chunk_size=1_000_000,
     )
 }
@@ -505,7 +515,9 @@ def compile_expval_program(
         memory_device=str(cfg.memory_device),
         compute_device=str(cfg.compute_device),
         max_weight=int(cfg.max_weight),
-        max_xy=int(cfg.max_xy),
+        weight_x=float(cfg.weight_x),
+        weight_y=float(cfg.weight_y),
+        weight_z=float(cfg.weight_z),
         dtype=str(cfg.dtype),
         thetas=build_thetas,
         min_abs=build_min_abs,
@@ -563,7 +575,9 @@ def build_quasi_sampler(
         compute_device=str(cfg.compute_device),
         dtype=str(cfg.dtype),
         max_weight=int(cfg.max_weight),
-        max_xy=int(cfg.max_xy),
+        weight_x=float(cfg.weight_x),
+        weight_y=float(cfg.weight_y),
+        weight_z=float(cfg.weight_z),
         chunk_size=int(cfg.chunk_size),
         build_thetas=build_thetas,
         build_min_abs=build_min_abs,
