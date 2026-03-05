@@ -22,9 +22,7 @@ dist/
 QAOA/
 .vscode
 .build
-src_tensor/pps_tensor_backend.cpp
-src_tensor/_pps_tensor_backend_candidate.so
-src_tensor/_pps_tensor_backend_local.so.bak
+
 ##### files to be ignored for specific projects #####
 cudaq_sampling/
 test_qaoa/artifacts/
