@@ -674,7 +674,8 @@ def zero_filter_tensor_backprop_with_keep_mask(
         torch.cuda.empty_cache()
 
     row_mask = out_mask
-    for i in tqdm(reversed(range(len(steps))), total=len(steps), desc="zero-filter", dynamic_ncols=True):
+    pbar = tqdm(reversed(range(len(steps))), total=len(steps), desc="zero-filter", dynamic_ncols=True)
+    for i in pbar:
         # [Memory Optimization] Decompose step to release old tensors immediately after filtering
         old_step = steps[i]
         steps[i] = None  # Clear reference from list to allow GC
@@ -700,11 +701,14 @@ def zero_filter_tensor_backprop_with_keep_mask(
             if old_step.mat_sin._nnz() > 0:
                 col_mask |= _sparse_used_cols(old_step.mat_sin, row_mask, n_cols)
             
-        # [Log] Print reduction stats
+        # [Log] Print reduction stats inside tqdm
         if (i % 10) == 0 or (i == len(steps) - 1):
             # Note: cols can be > rows because a single output term (row) may depend on
             # multiple input terms (cols) due to rotation mixing (branching).
-            print(f"[ZeroFilter] Step {i}: {int(row_mask.sum().item())} rows -> {int(col_mask.sum().item())} cols kept")
+            pbar.set_postfix_str(
+                f"step={i} rows={int(row_mask.sum().item())} cols={int(col_mask.sum().item())}",
+                refresh=False,
+            )
 
         # 2. Filter matrices using optimized chunked kernel
         # This replaces the old sequential _filter_sparse_rows_cols calls
