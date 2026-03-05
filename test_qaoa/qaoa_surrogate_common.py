@@ -158,12 +158,13 @@ def build_qaoa_circuit(n_qubits: int, edges: Sequence[Edge], p_layers: int):
 
     param_idx = 0
     for _ in range(p):
+        gamma_idx = param_idx
+        beta_idx = param_idx + 1
         for (u, v) in edges:
-            circuit.append(PauliRotation("ZZ", [int(u), int(v)], param_idx=param_idx))
-            param_idx += 1
+            circuit.append(PauliRotation("ZZ", [int(u), int(v)], param_idx=gamma_idx))
         for q in range(n):
-            circuit.append(PauliRotation("X", [q], param_idx=param_idx))
-            param_idx += 1
+            circuit.append(PauliRotation("X", [q], param_idx=beta_idx))
+        param_idx += 2
     return circuit, param_idx
 
 
@@ -189,8 +190,8 @@ def build_qaoa_theta_init_tqa(
     params = tqa_init_qaoa_params(p=int(p_layers), delta_t=float(delta_t), dtype=dtype)
     thetas: List[float] = []
     for l in range(int(p_layers)):
-        thetas.extend([float(params.gammas[l])] * int(n_edges))
-        thetas.extend([float(params.betas[l])] * int(n_qubits))
+        thetas.append(float(params.gammas[l]))
+        thetas.append(float(params.betas[l]))
     return np.asarray(thetas, dtype=dtype)
 
 

@@ -42,7 +42,9 @@ def _cpu_exact_overrides() -> Dict[str, object]:
         "stream_device": "cpu",
         "dtype": "float64",
         "max_weight": 1_000_000_000,
-        "max_xy": 1_000_000_000,
+        "weight_x": 1.0,
+        "weight_y": 1.0,
+        "weight_z": 1.0,
         "offload_steps": False,
         "offload_back": False,
     }

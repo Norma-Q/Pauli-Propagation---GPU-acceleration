@@ -436,6 +436,35 @@ class PauliRotation(Gate):
         return PauliString(x_mask, z_mask)
 
 
+@dataclass
+class DepolarizingNoise(Gate):
+        """Single-qubit inhomogeneous depolarizing noise.
+
+        Channel parameters are probabilities of X/Y/Z errors:
+            E(rho) = pI*rho + px*X rho X + py*Y rho Y + pz*Z rho Z
+            pI = 1 - (px + py + pz)
+        """
+
+        qubit: int
+        px: float
+        py: float
+        pz: float
+
+        def __repr__(self):
+                return f"Depol(q={self.qubit}, px={self.px:.4g}, py={self.py:.4g}, pz={self.pz:.4g})"
+
+
+@dataclass
+class AmplitudeDampingNoise(Gate):
+        """Single-qubit amplitude damping noise with damping rate gamma in [0,1]."""
+
+        qubit: int
+        gamma: float
+
+        def __repr__(self):
+                return f"AmpDamp(q={self.qubit}, gamma={self.gamma:.4g})"
+
+
 # ============================================================================
 # 4. Clifford Gate Maps (Pre-computed lookup tables)
 # ============================================================================

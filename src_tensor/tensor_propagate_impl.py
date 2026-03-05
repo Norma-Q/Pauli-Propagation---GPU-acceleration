@@ -125,7 +125,9 @@ def build_clifford_step(
     min_abs: Optional[float],
     coeffs_cache: Optional[Tensor],
     max_weight: int,
-    max_xy: int,
+    weight_x: float,
+    weight_y: float,
+    weight_z: float,
 ) -> Tuple[Tensor, Tensor, TensorSparseStep, Optional[Tensor]]:
     _require_backend()
 
@@ -148,7 +150,9 @@ def build_clifford_step(
             min_abs,
             coeffs_cache,
             int(max_weight),
-            int(max_xy),
+            float(weight_x),
+            float(weight_y),
+            float(weight_z),
         )
     else:
         new_x, new_z, row, col, val, coeffs_cache_out = _CPP_BACKEND.build_clifford_step_cpp(
@@ -160,7 +164,9 @@ def build_clifford_step(
             min_abs,
             coeffs_cache,
             int(max_weight),
-            int(max_xy),
+            float(weight_x),
+            float(weight_y),
+            float(weight_z),
         )
 
     if step_device is None:
@@ -205,7 +211,9 @@ def build_pauli_rotation_step(
     coeffs_cache: Optional[Tensor],
     thetas_t: Optional[Tensor],
     max_weight: int,
-    max_xy: int,
+    weight_x: float,
+    weight_y: float,
+    weight_z: float,
 ) -> Tuple[Tensor, Tensor, TensorSparseStep, Optional[Tensor]]:
     _require_backend()
 
@@ -249,7 +257,9 @@ def build_pauli_rotation_step(
             coeffs_cache,
             thetas_t,
             int(max_weight),
-            int(max_xy),
+            float(weight_x),
+            float(weight_y),
+            float(weight_z),
         )
     else:
         gx, gz = _gate_masks(gate)
@@ -271,7 +281,9 @@ def build_pauli_rotation_step(
             coeffs_cache,
             thetas_t,
             int(max_weight),
-            int(max_xy),
+            float(weight_x),
+            float(weight_y),
+            float(weight_z),
         )
 
     if step_device is None:
@@ -292,6 +304,180 @@ def build_pauli_rotation_step(
         param_idx=p_idx,
         shape=(n_out, n_in),
         emb_idx=e_idx  # 새로 추가된 인덱스 저장
+    )
+
+    out_cache: Optional[Tensor] = None
+    if min_abs is not None and coeffs_cache_out is not None:
+        out_cache = cast(Tensor, coeffs_cache_out)
+
+    return new_x, new_z, step, out_cache
+
+
+def build_depolarizing_step(
+    *,
+    gate,
+    x_mask: Tensor,
+    z_mask: Tensor,
+    t_dtype,
+    device: str,
+    step_device: Optional[str] = None,
+    min_abs: Optional[float],
+    coeffs_cache: Optional[Tensor],
+    max_weight: int,
+    weight_x: float,
+    weight_y: float,
+    weight_z: float,
+) -> Tuple[Tensor, Tensor, TensorSparseStep, Optional[Tensor]]:
+    _require_backend()
+
+    qubit = int(gate.qubit)
+    px = float(gate.px)
+    py = float(gate.py)
+    pz = float(gate.pz)
+
+    is_multiword = x_mask.dim() == 2
+    if is_multiword:
+        if not hasattr(_CPP_BACKEND, "build_depolarizing_step_mw_cpp"):
+            raise CPPBackendUnavailableError(
+                "Compiled backend does not expose multiword depolarizing API."
+            )
+        new_x, new_z, row, col, val, coeffs_cache_out = _CPP_BACKEND.build_depolarizing_step_mw_cpp(
+            qubit,
+            px,
+            py,
+            pz,
+            x_mask,
+            z_mask,
+            t_dtype,
+            min_abs,
+            coeffs_cache,
+            int(max_weight),
+            float(weight_x),
+            float(weight_y),
+            float(weight_z),
+        )
+    else:
+        new_x, new_z, row, col, val, coeffs_cache_out = _CPP_BACKEND.build_depolarizing_step_cpp(
+            qubit,
+            px,
+            py,
+            pz,
+            x_mask,
+            z_mask,
+            t_dtype,
+            min_abs,
+            coeffs_cache,
+            int(max_weight),
+            float(weight_x),
+            float(weight_y),
+            float(weight_z),
+        )
+
+    if step_device is None:
+        step_device = "cpu" if device != "cpu" else device
+
+    n_out = int(new_x.shape[0])
+    n_in = int(x_mask.shape[0])
+    mat_const = _make_sparse(row, col, val, (n_out, n_in), step_device, t_dtype)
+    mat_empty = _make_sparse(
+        torch.zeros(0, dtype=torch.int64, device=step_device),
+        torch.zeros(0, dtype=torch.int64, device=step_device),
+        torch.zeros(0, dtype=t_dtype, device=step_device),
+        (n_out, n_in),
+        step_device,
+        t_dtype,
+    )
+
+    step = TensorSparseStep(
+        mat_const=mat_const,
+        mat_cos=mat_empty,
+        mat_sin=mat_empty,
+        param_idx=-1,
+        shape=(n_out, n_in),
+    )
+
+    out_cache: Optional[Tensor] = None
+    if min_abs is not None and coeffs_cache_out is not None:
+        out_cache = cast(Tensor, coeffs_cache_out)
+
+    return new_x, new_z, step, out_cache
+
+
+def build_amplitude_damping_step(
+    *,
+    gate,
+    x_mask: Tensor,
+    z_mask: Tensor,
+    t_dtype,
+    device: str,
+    step_device: Optional[str] = None,
+    min_abs: Optional[float],
+    coeffs_cache: Optional[Tensor],
+    max_weight: int,
+    weight_x: float,
+    weight_y: float,
+    weight_z: float,
+) -> Tuple[Tensor, Tensor, TensorSparseStep, Optional[Tensor]]:
+    _require_backend()
+
+    qubit = int(gate.qubit)
+    gamma = float(gate.gamma)
+
+    is_multiword = x_mask.dim() == 2
+    if is_multiword:
+        if not hasattr(_CPP_BACKEND, "build_amplitude_damping_step_mw_cpp"):
+            raise CPPBackendUnavailableError(
+                "Compiled backend does not expose multiword amplitude-damping API."
+            )
+        new_x, new_z, row, col, val, coeffs_cache_out = _CPP_BACKEND.build_amplitude_damping_step_mw_cpp(
+            qubit,
+            gamma,
+            x_mask,
+            z_mask,
+            t_dtype,
+            min_abs,
+            coeffs_cache,
+            int(max_weight),
+            float(weight_x),
+            float(weight_y),
+            float(weight_z),
+        )
+    else:
+        new_x, new_z, row, col, val, coeffs_cache_out = _CPP_BACKEND.build_amplitude_damping_step_cpp(
+            qubit,
+            gamma,
+            x_mask,
+            z_mask,
+            t_dtype,
+            min_abs,
+            coeffs_cache,
+            int(max_weight),
+            float(weight_x),
+            float(weight_y),
+            float(weight_z),
+        )
+
+    if step_device is None:
+        step_device = "cpu" if device != "cpu" else device
+
+    n_out = int(new_x.shape[0])
+    n_in = int(x_mask.shape[0])
+    mat_const = _make_sparse(row, col, val, (n_out, n_in), step_device, t_dtype)
+    mat_empty = _make_sparse(
+        torch.zeros(0, dtype=torch.int64, device=step_device),
+        torch.zeros(0, dtype=torch.int64, device=step_device),
+        torch.zeros(0, dtype=t_dtype, device=step_device),
+        (n_out, n_in),
+        step_device,
+        t_dtype,
+    )
+
+    step = TensorSparseStep(
+        mat_const=mat_const,
+        mat_cos=mat_empty,
+        mat_sin=mat_empty,
+        param_idx=-1,
+        shape=(n_out, n_in),
     )
 
     out_cache: Optional[Tensor] = None
