@@ -330,6 +330,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max-tries", type=int, default=3000)
     p.add_argument("--output-dir", type=str, default="QAOA/artifacts/weight_sweep")
     p.add_argument("--run-prefix", type=str, default="qaoa_pps")
+    p.add_argument(
+        "--python-exe",
+        type=str,
+        default="",
+        help="Python executable used for spawned train jobs. Defaults to current interpreter.",
+    )
     p.add_argument("--skip-training", action="store_true", help="Only generate graphs + plot + annealing report.")
     p.add_argument("--title-prefix", type=str, default="MaxCut Graph")
     p.add_argument("--anneal-steps", type=int, default=50_000)
@@ -377,6 +383,7 @@ def main() -> None:
     train_script = Path(__file__).resolve().parent / "train_qaoa_pps_cudaq.py"
     if not train_script.exists():
         raise FileNotFoundError(f"Training script not found: {train_script}")
+    train_python_exe = str(args.python_exe).strip() or str(sys.executable)
 
     print(f"Base graph: n={base_n_qubits}, |E|={base_n_edges}, density={base_density:.6f}")
     print(f"Sweep n_qubits={n_qubits_list}")
@@ -492,7 +499,7 @@ def main() -> None:
                         run_seed = int(args.seed) + int(n_qubits) * 10_000 + g_idx * 1_000 + int(p_layers) * 10 + int(max_weight)
 
                         cmd = _build_train_cmd(
-                            python_exe=sys.executable,
+                            python_exe=train_python_exe,
                             train_script=train_script,
                             edges_json=g_path,
                             n_qubits=int(n_qubits),

@@ -1,0 +1,2 @@
+[log] writing realtime log to: /home/quantum/ys_lee/Pauli-Propagation---GPU-acceleration/QAOA/artifacts/sweep_q45_q50_q55_minabs_oddneg/q45/runs/qaoa_pps_q45_g01_p07_wmyz_mw1000000000.log
+step=0000 sum<ZZ>=-63.50254059 E[cut]=205.751270

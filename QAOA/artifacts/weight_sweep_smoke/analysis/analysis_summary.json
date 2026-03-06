@@ -1,8 +1,0 @@
-{
-  "sweep_dir": "/home/quantum/ys_lee/Pauli-Propagation---GPU-acceleration/QAOA/artifacts/weight_sweep_smoke",
-  "summary_json": "/home/quantum/ys_lee/Pauli-Propagation---GPU-acceleration/QAOA/artifacts/weight_sweep_smoke/summary.json",
-  "steps": [
-    0
-  ],
-  "records": []
-}

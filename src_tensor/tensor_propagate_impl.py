@@ -564,7 +564,7 @@ def compact_sparse_step_chunked(
             except Exception:
                 pass # Fallback to pageable memory if RAM is full
 
-        # [Optimization] Dynamic Chunking based on available VRAM
+        # [Optimization] Dynamic chunking based on available VRAM (bounded).
         current_chunk_size = chunk_size
         if device.startswith("cuda"):
             try:
@@ -573,9 +573,9 @@ def compact_sparse_step_chunked(
                 # Reserve 500MB buffer for safety.
                 safe_mem = max(0, free_mem - 500 * 1024 * 1024)
                 estimated_capacity = int(safe_mem // 128)
-                
-                # Use the larger of user-specified chunk or calculated capacity
-                current_chunk_size = max(chunk_size, estimated_capacity)
+
+                # Keep chunk size bounded: do not exceed user-configured chunk_size.
+                current_chunk_size = max(100_000, min(int(chunk_size), max(1, estimated_capacity)))
             except Exception:
                 pass # Fallback to default if mem_get_info fails
         

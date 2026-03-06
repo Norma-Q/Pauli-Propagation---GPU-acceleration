@@ -291,6 +291,7 @@ def _discover_runs(
                     "graph_anneal_best_cut": float(anneal_best_raw) if anneal_best_raw is not None else None,
                     "edges_json": edges_json,
                     "step_dir": step_dir,
+                    "checkpoint": (None if checkpoint_raw is None else str(Path(str(checkpoint_raw)).resolve())),
                     "report": rec.get("report"),
                 }
             )
@@ -328,6 +329,7 @@ def _discover_runs(
                 "graph_anneal_best_cut": gm.get("anneal_best_cut") if isinstance(gm, dict) else None,
                 "edges_json": edges_json,
                 "step_dir": child,
+                "checkpoint": str((runs_dir / f"{run_name}.pt").resolve()),
                 "report": None,
             }
         )
@@ -347,6 +349,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--bit-order", type=str, default="le", choices=["le", "be"])
     parser.add_argument("--run-name-filter", type=str, default="", help="Optional substring filter for run_name.")
+    parser.add_argument(
+        "--include-final",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Also analyze each run-level final checkpoint (.pt) in addition to step_* checkpoints.",
+    )
     parser.add_argument("--dry-run", action="store_true", help="Only print targets; do not run cudaq sampling.")
     parser.add_argument("--continue-on-error", action="store_true")
     return parser.parse_args()
@@ -392,6 +400,7 @@ def main() -> None:
         run_graph_index = run.get("graph_index")
         run_anneal_best = run.get("graph_anneal_best_cut")
         run_report = run.get("report")
+        run_checkpoint = run.get("checkpoint")
         edges_json = Path(str(run["edges_json"])).resolve()
         step_dir = Path(run["step_dir"]).resolve()
 
@@ -399,12 +408,11 @@ def main() -> None:
         n_qubits = _infer_n_qubits(edges)
 
         ckpts = _collect_step_checkpoints(step_dir, target_steps)
-        if len(ckpts) == 0:
-            print(f"[skip] no checkpoints: run={run_name}, step_dir={step_dir}")
-            continue
-
         run_out_dir = analysis_root / run_name
         run_out_dir.mkdir(parents=True, exist_ok=True)
+
+        if len(ckpts) == 0:
+            print(f"[skip] no step checkpoints: run={run_name}, step_dir={step_dir}")
 
         print(f"\n=== analyze run={run_name} p={p_layers} n_ckpts={len(ckpts)} ===")
         for step_id, ckpt_path in ckpts:
@@ -524,6 +532,134 @@ def main() -> None:
                         encoding="utf-8",
                     )
                     raise
+
+        # Analyze run-level final checkpoint (.pt), if requested.
+        if bool(args.include_final):
+            final_ckpt_path: Optional[Path] = None
+            if run_checkpoint is not None and str(run_checkpoint).strip() != "":
+                final_ckpt_path = Path(str(run_checkpoint)).resolve()
+            else:
+                candidate = step_dir.parent / f"{run_name}.pt"
+                if candidate.exists():
+                    final_ckpt_path = candidate.resolve()
+
+            if final_ckpt_path is None or not final_ckpt_path.exists():
+                print(f"[skip] no final checkpoint: run={run_name}")
+            else:
+                out_json = run_out_dir / "final_sampling.json"
+                out_plot = run_out_dir / "final_hist.png"
+
+                if bool(args.dry_run):
+                    rec = {
+                        "run_name": run_name,
+                        "p_layers": int(p_layers),
+                        "n_qubits": int(n_qubits),
+                        "step": "final",
+                        "checkpoint": str(final_ckpt_path),
+                        "output_json": str(out_json),
+                        "output_plot": str(out_plot),
+                        "status": "dry_run",
+                    }
+                    global_records.append(rec)
+                    print(f"[dry-run] {run_name} final -> {out_json.name}")
+                else:
+                    try:
+                        thetas = _load_thetas_from_checkpoint(final_ckpt_path)
+                        counts = _try_cudaq_sample(
+                            n_qubits=int(n_qubits),
+                            edges=edges,
+                            p_layers=int(p_layers),
+                            thetas=thetas,
+                            shots=int(args.shots),
+                            seed=int(args.seed) + 999_999,
+                        )
+                        analysis = _analyze_counts(
+                            counts=counts,
+                            n_qubits=int(n_qubits),
+                            edges=edges,
+                            bit_order=str(args.bit_order),
+                        )
+                        _save_histogram(
+                            values=analysis["cut_values"],
+                            out_path=out_plot,
+                            title=f"{run_name} / final (shots={int(args.shots)})",
+                        )
+
+                        payload = {
+                            "run_name": run_name,
+                            "step": "final",
+                            "checkpoint": str(final_ckpt_path),
+                            "edges_json": str(edges_json),
+                            "n_qubits": int(n_qubits),
+                            "p_layers": int(p_layers),
+                            "run_n_qubits": (None if run_n_qubits is None else int(run_n_qubits)),
+                            "weight_mode": (None if run_weight_mode is None else str(run_weight_mode)),
+                            "max_weight": (None if run_max_weight is None else int(run_max_weight)),
+                            "graph_index": (None if run_graph_index is None else int(run_graph_index)),
+                            "graph_anneal_best_cut": (
+                                None if run_anneal_best is None else float(run_anneal_best)
+                            ),
+                            "run_report": (None if run_report is None else str(run_report)),
+                            "shots": int(args.shots),
+                            "bit_order": str(args.bit_order),
+                            "mean_cut": float(analysis["mean_cut"]),
+                            "best": analysis["best"],
+                            "counts": counts,
+                            "hist_plot": str(out_plot),
+                        }
+                        out_json.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+                        rec = {
+                            "run_name": run_name,
+                            "step": "final",
+                            "n_qubits": int(n_qubits),
+                            "p_layers": int(p_layers),
+                            "weight_mode": (None if run_weight_mode is None else str(run_weight_mode)),
+                            "max_weight": (None if run_max_weight is None else int(run_max_weight)),
+                            "graph_index": (None if run_graph_index is None else int(run_graph_index)),
+                            "graph_anneal_best_cut": (
+                                None if run_anneal_best is None else float(run_anneal_best)
+                            ),
+                            "run_report": (None if run_report is None else str(run_report)),
+                            "checkpoint": str(final_ckpt_path),
+                            "output_json": str(out_json),
+                            "output_plot": str(out_plot),
+                            "mean_cut": float(analysis["mean_cut"]),
+                            "best_cut": int(analysis["best"]["cut"]),
+                            "status": "ok",
+                        }
+                        global_records.append(rec)
+                        print(
+                            f"[ok] {run_name} final mean_cut={float(analysis['mean_cut']):.4f} "
+                            f"best_cut={int(analysis['best']['cut'])}"
+                        )
+
+                    except Exception as e:
+                        failed = True
+                        rec = {
+                            "run_name": run_name,
+                            "step": "final",
+                            "checkpoint": str(final_ckpt_path),
+                            "status": "failed",
+                            "error": str(e),
+                        }
+                        global_records.append(rec)
+                        print(f"[failed] {run_name} final: {e}")
+                        if not bool(args.continue_on_error):
+                            summary_out = analysis_root / "analysis_summary.json"
+                            summary_out.write_text(
+                                json.dumps(
+                                    {
+                                        "sweep_dir": str(sweep_dir),
+                                        "summary_json": str(summary_path),
+                                        "steps": target_steps,
+                                        "records": global_records,
+                                    },
+                                    indent=2,
+                                ),
+                                encoding="utf-8",
+                            )
+                            raise
 
     summary_out = analysis_root / "analysis_summary.json"
     summary_out.write_text(

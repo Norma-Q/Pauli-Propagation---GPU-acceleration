@@ -5,7 +5,7 @@ import json
 from pathlib import Path
 import sys
 import os
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, TextIO
 
 # Ensure allocator handles fragmentation better (must be set before torch import)
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
@@ -214,6 +214,38 @@ def _try_cudaq_sample(
     }
 
 
+class _TeeStream:
+    def __init__(self, streams: List[TextIO]) -> None:
+        self._streams = [s for s in streams if s is not None]
+
+    def write(self, data: str) -> int:
+        for stream in self._streams:
+            stream.write(data)
+            stream.flush()
+        return len(data)
+
+    def flush(self) -> None:
+        for stream in self._streams:
+            stream.flush()
+
+    def isatty(self) -> bool:
+        return any(getattr(stream, "isatty", lambda: False)() for stream in self._streams)
+
+
+def _setup_realtime_log(log_path: Path, append: bool, mirror_terminal: bool) -> TextIO:
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    mode = "a" if bool(append) else "w"
+    log_fp = log_path.open(mode, encoding="utf-8", buffering=1)
+    if bool(mirror_terminal):
+        sys.stdout = _TeeStream([sys.stdout, log_fp])
+        sys.stderr = _TeeStream([sys.stderr, log_fp])
+    else:
+        sys.stdout = _TeeStream([log_fp])
+        sys.stderr = _TeeStream([log_fp])
+    print(f"[log] writing realtime log to: {log_path}")
+    return log_fp
+
+
 def _compile_with_retry(
     circuit,
     obs,
@@ -327,6 +359,22 @@ def parse_args() -> argparse.Namespace:
 
     p.add_argument("--output-dir", type=str, default="QAOA/artifacts")
     p.add_argument("--run-name", type=str, default="qaoa_maxcut_30q")
+    p.add_argument(
+        "--log-file",
+        type=str,
+        default="",
+        help="Realtime log file path. If empty, defaults to <output-dir>/<run-name>.log",
+    )
+    p.add_argument(
+        "--log-append",
+        action="store_true",
+        help="Append to log file instead of overwriting.",
+    )
+    p.add_argument(
+        "--log-to-terminal",
+        action="store_true",
+        help="Also mirror logs to terminal. Default writes only to log file.",
+    )
     p.add_argument(
         "--resume",
         type=str,
@@ -458,6 +506,16 @@ def main() -> None:
 
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+    log_path = (
+        Path(str(args.log_file)).resolve()
+        if str(args.log_file).strip()
+        else (out_dir / f"{args.run_name}.log").resolve()
+    )
+    log_fp = _setup_realtime_log(
+        log_path=log_path,
+        append=bool(args.log_append),
+        mirror_terminal=bool(args.log_to_terminal),
+    )
     step_dir = out_dir / f"{args.run_name}_steps"
     if int(args.save_every) > 0:
         step_dir.mkdir(parents=True, exist_ok=True)
@@ -531,6 +589,9 @@ def main() -> None:
             "weight_x": float(weight_tuple["weight_x"]),
             "weight_y": float(weight_tuple["weight_y"]),
             "weight_z": float(weight_tuple["weight_z"]),
+            "log_file": str(log_path),
+            "log_append": bool(args.log_append),
+            "log_to_terminal": bool(args.log_to_terminal),
         },
         "graph": {
             "source": graph_source,
@@ -576,6 +637,7 @@ def main() -> None:
 
     print(f"saved checkpoint: {ckpt_path}")
     print(f"saved report: {report_path}")
+    log_fp.flush()
 
 
 if __name__ == "__main__":

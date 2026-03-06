@@ -118,46 +118,35 @@ def _accumulate_used_cols_chunked(mat: Tensor, row_mask_d: Tensor, col_mask_d: T
     """Accumulate used columns from a CPU sparse matrix into a GPU mask using chunks."""
     if mat._nnz() == 0:
         return
-    
-    # Coalesce the tensor to ensure indices are accessible and unique.
-    # This is required before calling .indices() on a sparse tensor that may
-    # have been constructed from non-unique/unsorted indices.
-    if not mat.is_coalesced():
+
+    try:
+        indices = mat.indices()
+    except Exception:
         mat = mat.coalesce()
-    # Access indices on CPU (Storage Device)
-    indices = mat.indices()
+        indices = mat.indices()
     nnz = indices.shape[1]
     device = row_mask_d.device
-    
-    # [Optimization] Pin memory for faster H2D transfer
-    # This enables direct DMA transfer and better PCIe saturation.
-    # Only pin if tensor is large enough (> 1MB approx) to justify allocation overhead.
-    # 1MB ~ 128k int64 elements.
+
     if str(device).startswith("cuda") and not indices.is_pinned() and indices.numel() > 100_000:
         try:
             indices = indices.pin_memory()
         except Exception:
-            pass # Fallback to pageable memory if RAM is full
-    
-    # [Optimization] Dynamic Chunking for mask accumulation
-    current_chunk_size = chunk_size
+            pass
+
+    current_chunk_size = int(chunk_size)
     if str(device).startswith("cuda"):
         try:
             free_mem, _ = torch.cuda.mem_get_info(device)
-            # Heuristic: indices (16B) + overhead.
-            # Reserve 500MB buffer.
             safe_mem = max(0, free_mem - 500 * 1024 * 1024)
-            estimated_capacity = int(safe_mem // 64)
-            current_chunk_size = max(chunk_size, estimated_capacity)
+            estimated_capacity = int(max(1, safe_mem // 64))
+            # NOTE: keep chunk bounded (old max() could overshoot badly)
+            current_chunk_size = max(100_000, min(int(chunk_size), estimated_capacity))
         except Exception:
             pass
 
     for start in range(0, nnz, current_chunk_size):
         end = min(start + current_chunk_size, nnz)
-        # Move only indices to GPU (Compute Device)
         idx_chunk = indices[:, start:end].to(device, non_blocking=True)
-        
-        # Update mask on GPU
         keep = row_mask_d[idx_chunk[0]]
         col_mask_d[idx_chunk[1][keep]] = True
 
@@ -693,50 +682,83 @@ def zero_filter_tensor_backprop_with_keep_mask(
 
     row_mask = out_mask
     pbar = tqdm(reversed(range(len(steps))), total=len(steps), desc="zero-filter", dynamic_ncols=True)
-    for i in pbar:
+
+    # heuristic: small sparse workload is faster on CPU
+    cpu_nnz_threshold = 2_000_000
+    used_cols_chunk_size = 5_000_000
+
+    for loop_idx, i in enumerate(pbar):
         old_step = steps[i]
-        
         n_cols = int(old_step.shape[1])
-        
-        # 1. Calculate used columns (Chunked GPU acceleration)
-        # Move masks to GPU, stream indices in chunks
-        try:
-            row_mask_d = row_mask.to(compute_device)
-            col_mask_d = torch.zeros((n_cols,), dtype=torch.bool, device=compute_device)
-            
-            _accumulate_used_cols_chunked(old_step.mat_const, row_mask_d, col_mask_d, chunk_size * 5000)
-            _accumulate_used_cols_chunked(old_step.mat_cos, row_mask_d, col_mask_d, chunk_size * 5000)
-            _accumulate_used_cols_chunked(old_step.mat_sin, row_mask_d, col_mask_d, chunk_size * 5000)
-            
-            col_mask = col_mask_d.to(row_mask.device)  # Back to CPU
-        except RuntimeError as e: # Fallback to CPU if GPU OOM (e.g. masks too big)
-            print(f"Warning: GPU acceleration failed in zero-filter, falling back to CPU. Error: {e}")
-            col_mask = _sparse_used_cols(old_step.mat_const, row_mask, n_cols)
-            if old_step.mat_cos._nnz() > 0:
-                col_mask |= _sparse_used_cols(old_step.mat_cos, row_mask, n_cols)
-            if old_step.mat_sin._nnz() > 0:
-                col_mask |= _sparse_used_cols(old_step.mat_sin, row_mask, n_cols)
-            
-        # [Log] Print reduction stats inside tqdm
-        pbar.set_postfix_str(
-            f"step={i} rows={int(row_mask.sum().item())} cols={int(col_mask.sum().item())}",
-            refresh=False,
+
+        # Coalesce each sparse matrix at most once per step and reuse.
+        mat_const = old_step.mat_const if old_step.mat_const.is_coalesced() else old_step.mat_const.coalesce()
+        mat_cos = old_step.mat_cos if old_step.mat_cos.is_coalesced() else old_step.mat_cos.coalesce()
+        mat_sin = old_step.mat_sin if old_step.mat_sin.is_coalesced() else old_step.mat_sin.coalesce()
+
+        nnz_const = int(mat_const._nnz())
+        nnz_cos = int(mat_cos._nnz())
+        nnz_sin = int(mat_sin._nnz())
+        nnz_total = nnz_const + nnz_cos + nnz_sin
+
+        if nnz_total == 0 or int(row_mask.sum().item()) == 0:
+            col_mask = torch.zeros((n_cols,), dtype=torch.bool, device=row_mask.device)
+        else:
+            use_gpu = (
+                ("cuda" in str(compute_device))
+                and torch.cuda.is_available()
+                and (nnz_total > cpu_nnz_threshold)
+            )
+            if use_gpu:
+                try:
+                    row_mask_d = row_mask.to(compute_device, non_blocking=True)
+                    col_mask_d = torch.zeros((n_cols,), dtype=torch.bool, device=compute_device)
+
+                    if nnz_const > 0:
+                        _accumulate_used_cols_chunked(mat_const, row_mask_d, col_mask_d, used_cols_chunk_size)
+                    if nnz_cos > 0:
+                        _accumulate_used_cols_chunked(mat_cos, row_mask_d, col_mask_d, used_cols_chunk_size)
+                    if nnz_sin > 0:
+                        _accumulate_used_cols_chunked(mat_sin, row_mask_d, col_mask_d, used_cols_chunk_size)
+
+                    col_mask = col_mask_d.to(row_mask.device, non_blocking=True)
+                except RuntimeError as e:
+                    print(f"Warning: GPU used-cols failed, fallback to CPU. Error: {e}")
+                    col_mask = _sparse_used_cols(mat_const, row_mask, n_cols)
+                    if nnz_cos > 0:
+                        col_mask |= _sparse_used_cols(mat_cos, row_mask, n_cols)
+                    if nnz_sin > 0:
+                        col_mask |= _sparse_used_cols(mat_sin, row_mask, n_cols)
+            else:
+                col_mask = _sparse_used_cols(mat_const, row_mask, n_cols)
+                if nnz_cos > 0:
+                    col_mask |= _sparse_used_cols(mat_cos, row_mask, n_cols)
+                if nnz_sin > 0:
+                    col_mask |= _sparse_used_cols(mat_sin, row_mask, n_cols)
+
+        if (loop_idx % 8 == 0) or (i == 0):
+            pbar.set_postfix_str(
+                f"step={i} rows={int(row_mask.sum().item())} cols={int(col_mask.sum().item())} nnz={nnz_total}",
+                refresh=False,
+            )
+
+        step_for_compact = TensorSparseStep(
+            mat_const=mat_const,
+            mat_cos=mat_cos,
+            mat_sin=mat_sin,
+            param_idx=old_step.param_idx,
+            emb_idx=old_step.emb_idx,
+            shape=old_step.shape,
         )
 
-        # 2. Filter matrices using optimized chunked kernel
-        # This replaces the old sequential _filter_sparse_rows_cols calls
-        # and handles GPU streaming + memory cleanup internally.
         steps[i] = compact_sparse_step_chunked(
-            old_step,
+            step_for_compact,
             keep_row_mask=row_mask,
             keep_col_mask=col_mask,
             device=compute_device,
             chunk_size=chunk_size,
         )
-        
-        # Release old step explicitly (though GC should handle it as steps[i] was cleared)
-        del old_step
-        
+        del old_step, step_for_compact
         row_mask = col_mask
 
     coeff_init = coeff_init_src[row_mask]
