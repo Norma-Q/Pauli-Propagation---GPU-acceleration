@@ -1,0 +1,30 @@
+{
+  "run_name": "qaoa_pps_q12_g01_p03_wmyz_mw02",
+  "n_qubits": 12,
+  "p_layers": 3,
+  "weight_mode": "yz",
+  "max_weight": 2,
+  "match_tol": 0.001,
+  "steps": [
+    0
+  ],
+  "expval_comparison": [
+    {
+      "step": 0,
+      "checkpoint": "/home/quantum/ys_lee/Pauli-Propagation---GPU-acceleration/QAOA/artifacts/weight_sweep_yz_xyz_no_minabs/q12/runs/qaoa_pps_q12_g01_p03_wmyz_mw02_steps/step_000000.pt",
+      "approx_sum_zz": 6.533597946166992,
+      "exact_sum_zz": 6.54523999339859,
+      "abs_error_sum_zz": 0.011642047231597452,
+      "rel_error_sum_zz": 0.0017787044085991362,
+      "approx_expected_cut": 8.233201026916504,
+      "exact_expected_cut": 8.227380003300706,
+      "match_within_tol": false
+    }
+  ],
+  "summary": {
+    "mean_abs_error_sum_zz": 0.011642047231597452,
+    "max_abs_error_sum_zz": 0.011642047231597452,
+    "n_match_within_tol": 0,
+    "n_total": 1
+  }
+}

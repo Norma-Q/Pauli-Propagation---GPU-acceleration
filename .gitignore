@@ -19,7 +19,6 @@ build/
 dist/
 *.egg-info/
 .eggs/
-QAOA/
 .vscode
 .build
 src_tensor/pps_tensor_backend.cpp

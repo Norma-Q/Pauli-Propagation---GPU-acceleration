@@ -1,0 +1,353 @@
+{
+  "config": {
+    "n_qubits": 20,
+    "p_layers": 3,
+    "delta_t": 0.8,
+    "steps": 10,
+    "lr": 0.05,
+    "seed": 201032,
+    "device": "cuda",
+    "preset": "hybrid",
+    "build_min_abs": null,
+    "no_build_min_abs": true,
+    "build_min_mat_abs": null,
+    "rebuild_every": 10,
+    "chunk_size": 1000000,
+    "max_weight": 2,
+    "weight_mode": "yz",
+    "weight_x": 0.0,
+    "weight_y": 1.0,
+    "weight_z": 1.0
+  },
+  "graph": {
+    "source": "edges_json",
+    "params": {
+      "edges_json": "/home/quantum/ys_lee/Pauli-Propagation---GPU-acceleration/QAOA/artifacts/weight_sweep_yz_xyz_no_minabs_q16q20_p3_full/q20/graphs/edges_graph_01.json"
+    },
+    "edges": [
+      [
+        0,
+        2
+      ],
+      [
+        0,
+        6
+      ],
+      [
+        0,
+        12
+      ],
+      [
+        0,
+        13
+      ],
+      [
+        0,
+        14
+      ],
+      [
+        1,
+        3
+      ],
+      [
+        1,
+        8
+      ],
+      [
+        1,
+        9
+      ],
+      [
+        1,
+        12
+      ],
+      [
+        1,
+        18
+      ],
+      [
+        2,
+        6
+      ],
+      [
+        2,
+        12
+      ],
+      [
+        2,
+        13
+      ],
+      [
+        2,
+        16
+      ],
+      [
+        3,
+        5
+      ],
+      [
+        3,
+        8
+      ],
+      [
+        3,
+        15
+      ],
+      [
+        3,
+        17
+      ],
+      [
+        4,
+        6
+      ],
+      [
+        4,
+        7
+      ],
+      [
+        4,
+        8
+      ],
+      [
+        4,
+        14
+      ],
+      [
+        4,
+        18
+      ],
+      [
+        4,
+        19
+      ],
+      [
+        5,
+        7
+      ],
+      [
+        5,
+        8
+      ],
+      [
+        5,
+        9
+      ],
+      [
+        5,
+        13
+      ],
+      [
+        5,
+        14
+      ],
+      [
+        5,
+        15
+      ],
+      [
+        6,
+        7
+      ],
+      [
+        6,
+        8
+      ],
+      [
+        6,
+        9
+      ],
+      [
+        6,
+        10
+      ],
+      [
+        6,
+        15
+      ],
+      [
+        6,
+        16
+      ],
+      [
+        6,
+        17
+      ],
+      [
+        7,
+        9
+      ],
+      [
+        7,
+        14
+      ],
+      [
+        7,
+        16
+      ],
+      [
+        7,
+        18
+      ],
+      [
+        8,
+        9
+      ],
+      [
+        8,
+        15
+      ],
+      [
+        8,
+        16
+      ],
+      [
+        9,
+        12
+      ],
+      [
+        9,
+        14
+      ],
+      [
+        9,
+        15
+      ],
+      [
+        9,
+        16
+      ],
+      [
+        9,
+        17
+      ],
+      [
+        9,
+        18
+      ],
+      [
+        9,
+        19
+      ],
+      [
+        10,
+        15
+      ],
+      [
+        10,
+        16
+      ],
+      [
+        10,
+        19
+      ],
+      [
+        11,
+        15
+      ],
+      [
+        11,
+        16
+      ],
+      [
+        11,
+        17
+      ],
+      [
+        11,
+        19
+      ],
+      [
+        12,
+        13
+      ],
+      [
+        12,
+        16
+      ],
+      [
+        12,
+        19
+      ],
+      [
+        13,
+        15
+      ],
+      [
+        13,
+        16
+      ],
+      [
+        13,
+        18
+      ],
+      [
+        14,
+        15
+      ],
+      [
+        15,
+        19
+      ],
+      [
+        17,
+        19
+      ]
+    ]
+  },
+  "training": {
+    "history_sum_zz": [
+      18.046512603759766,
+      14.306278228759766,
+      10.350772857666016,
+      6.432333946228027,
+      2.749542236328125,
+      -0.5230225920677185,
+      -3.2325055599212646,
+      -5.27352237701416,
+      -6.613185882568359,
+      -7.352054595947266
+    ],
+    "history_expected_cut": [
+      24.476743698120117,
+      26.346860885620117,
+      28.324613571166992,
+      30.283833026885986,
+      32.12522888183594,
+      33.76151129603386,
+      35.11625277996063,
+      36.13676118850708,
+      36.80659294128418,
+      37.17602729797363
+    ],
+    "best_sum_zz": -7.352054595947266,
+    "best_expected_cut": 37.17602729797363
+  },
+  "resources": {
+    "compile_events": [
+      {
+        "step": -1,
+        "chunk_size": 1000000,
+        "terms_after_zero_filter": 27277,
+        "n_steps": 281,
+        "nnz_const_total": 24646431,
+        "nnz_cos_total": 11556015,
+        "nnz_sin_total": 3385485,
+        "nnz_total": 39587931,
+        "gpu_work_proxy_nnz_total": 39587931,
+        "max_step_rows": 597443,
+        "max_step_cols": 597443,
+        "max_step_nnz_total": 655747,
+        "nnz_density_proxy": 3.946967320922685e-07
+      }
+    ],
+    "terms_after_zero_filter_last": 27277,
+    "nnz_total_last": 39587931,
+    "gpu_work_proxy_nnz_total_last": 39587931,
+    "terms_after_zero_filter_mean": 27277.0,
+    "nnz_total_mean": 39587931.0,
+    "nnz_total_std": 0.0,
+    "rebuild_count": 0
+  },
+  "checkpoint": "/home/quantum/ys_lee/Pauli-Propagation---GPU-acceleration/QAOA/artifacts/weight_sweep_yz_xyz_no_minabs_q16q20_p3_full/q20/runs/qaoa_pps_q20_g01_p03_wmyz_mw02.pt"
+}

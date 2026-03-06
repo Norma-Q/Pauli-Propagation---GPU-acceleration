@@ -1,0 +1,111 @@
+{
+  "graph_index": 1,
+  "n_qubits": 12,
+  "n_edges": 23,
+  "graph_source": "sampled_like_base_density",
+  "edges": [
+    [
+      0,
+      4
+    ],
+    [
+      0,
+      6
+    ],
+    [
+      1,
+      3
+    ],
+    [
+      1,
+      5
+    ],
+    [
+      1,
+      6
+    ],
+    [
+      1,
+      10
+    ],
+    [
+      2,
+      3
+    ],
+    [
+      2,
+      5
+    ],
+    [
+      2,
+      10
+    ],
+    [
+      3,
+      5
+    ],
+    [
+      3,
+      7
+    ],
+    [
+      4,
+      5
+    ],
+    [
+      4,
+      8
+    ],
+    [
+      4,
+      10
+    ],
+    [
+      5,
+      7
+    ],
+    [
+      5,
+      9
+    ],
+    [
+      5,
+      10
+    ],
+    [
+      6,
+      7
+    ],
+    [
+      6,
+      8
+    ],
+    [
+      6,
+      9
+    ],
+    [
+      6,
+      11
+    ],
+    [
+      7,
+      9
+    ],
+    [
+      9,
+      11
+    ]
+  ],
+  "annealing": {
+    "best_cut": 18.0,
+    "best_mask": 2471,
+    "best_bitstring_leftmost_q0": "111001011001",
+    "steps": 50000,
+    "restarts": 8,
+    "t0": 2.5,
+    "tf": 0.001,
+    "seed": 32001
+  },
+  "plot": "/home/quantum/ys_lee/Pauli-Propagation---GPU-acceleration/QAOA/artifacts/weight_sweep_yz_xyz_cmp/q12/plots/graph_01.png"
+}
