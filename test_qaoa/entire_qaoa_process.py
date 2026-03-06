@@ -176,7 +176,8 @@ def main():
     program = compile_expval_program(
         circuit=circuit, observables=[zz_obj], preset="hybrid",
         preset_overrides={'max_weight': MAX_WEIGHT,                    
-                          'chunk_size' : 10_000_000})
+                          'chunk_size' : 20_000_000},
+                          parallel_compile=True)
     print("Program compiled successfully.")
 
 

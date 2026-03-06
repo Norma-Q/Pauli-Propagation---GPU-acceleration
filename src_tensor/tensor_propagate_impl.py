@@ -12,7 +12,7 @@ Public API entrypoints remain in `src_tensor/tensor_propagate.py`.
 
 from __future__ import annotations
 
-from typing import Any, Optional, Tuple, TYPE_CHECKING, cast
+from typing import Any, Optional, Tuple, TYPE_CHECKING, cast, List
 
 torch: Any
 try:
@@ -59,6 +59,44 @@ def _require_backend() -> None:
             "Compiled backend is not available. Install an official wheel/binary that includes "
             "`src_tensor._pps_tensor_backend` for your Python/PyTorch version."
         )
+
+
+def _destructive_cat(tensor_list: List[Tensor], dim: int = 0) -> Tensor:
+    """Concatenate tensors while freeing original tensors immediately to reduce peak memory.
+    
+    Equivalent to torch.cat(tensor_list, dim=dim) but avoids holding both input list
+    and output tensor in memory simultaneously.
+    """
+    if not tensor_list:
+        raise ValueError("Empty tensor list")
+    
+    # Calculate total size
+    total_size = sum(t.shape[dim] for t in tensor_list)
+    out_shape = list(tensor_list[0].shape)
+    out_shape[dim] = total_size
+    
+    # Pre-allocate output tensor
+    out = torch.empty(out_shape, dtype=tensor_list[0].dtype, device=tensor_list[0].device)
+    
+    offset = 0
+    for i in range(len(tensor_list)):
+        t = tensor_list[i]
+        size = t.shape[dim]
+        # Slice assignment
+        if dim == 0:
+            out[offset:offset+size] = t
+        elif dim == 1:
+            out[:, offset:offset+size] = t
+        else:
+            # Fallback for other dims (rarely used here)
+            idx = [slice(None)] * out.ndim
+            idx[dim] = slice(offset, offset+size)
+            out[tuple(idx)] = t
+            
+        offset += size
+        tensor_list[i] = None  # Release reference immediately
+        
+    return out
 
 
 def _make_sparse(row_idx, col_idx, values, shape, device, dtype):
@@ -128,6 +166,7 @@ def build_clifford_step(
     weight_x: float,
     weight_y: float,
     weight_z: float,
+    **kwargs,
 ) -> Tuple[Tensor, Tensor, TensorSparseStep, Optional[Tensor]]:
     _require_backend()
 
@@ -214,6 +253,7 @@ def build_pauli_rotation_step(
     weight_x: float,
     weight_y: float,
     weight_z: float,
+    **kwargs,
 ) -> Tuple[Tensor, Tensor, TensorSparseStep, Optional[Tensor]]:
     _require_backend()
 
@@ -327,6 +367,7 @@ def build_depolarizing_step(
     weight_x: float,
     weight_y: float,
     weight_z: float,
+    **kwargs,
 ) -> Tuple[Tensor, Tensor, TensorSparseStep, Optional[Tensor]]:
     _require_backend()
 
@@ -493,6 +534,7 @@ def compact_sparse_step_chunked(
     keep_col_mask: Optional[Tensor],
     device: str,
     chunk_size: int = 1_000_000,
+    direct_threshold: int = 20_000_000,
 ) -> TensorSparseStep:
     """Filter and remap a TensorSparseStep using GPU acceleration with minimal memory footprint.
 
@@ -508,6 +550,7 @@ def compact_sparse_step_chunked(
         keep_col_mask: Optional boolean tensor indicating which cols to keep (size: n_old_cols).
         device: Compute device (e.g., "cuda") for acceleration.
         chunk_size: Number of NNZ to process at a time.
+        direct_threshold: If nnz < direct_threshold, process entirely on GPU for speed.
 
     Returns:
         A new TensorSparseStep with filtered rows and remapped indices.
@@ -538,7 +581,8 @@ def compact_sparse_step_chunked(
     
     # 2. Helper to process one matrix
     def _process_matrix(mat: Tensor) -> Tensor:
-        if mat._nnz() == 0:
+        nnz = mat._nnz()
+        if nnz == 0:
             return torch.sparse_coo_tensor(
                 torch.zeros((2, 0), dtype=torch.int64, device=mat.device),
                 torch.zeros((0,), dtype=mat.dtype, device=mat.device),
@@ -548,13 +592,43 @@ def compact_sparse_step_chunked(
             )
 
         # We iterate over the coalesced indices (assuming mat is coalesced or we coalesce it)
-        # Since we are just reading, we can work with the underlying indices/values directly.
         if not mat.is_coalesced():
             mat = mat.coalesce()
         
+        # [Strategy 1] Fast Path: Small enough to fit in GPU memory entirely
+        # T4 16GB can comfortably handle ~20M-30M terms with full overhead.
+        if nnz < direct_threshold:
+            # Move everything to GPU
+            mat_gpu = mat.to(device)
+            indices = mat_gpu.indices()
+            values = mat_gpu.values()
+            
+            row_indices = indices[0]
+            keep = mask_gpu[row_indices]
+            
+            if col_mask_gpu is not None:
+                keep = keep & col_mask_gpu[indices[1]]
+            
+            valid_indices = indices[:, keep]
+            valid_values = values[keep]
+            
+            # Remap
+            valid_indices[0] = cumsum_gpu[valid_indices[0]]
+            if col_cumsum_gpu is not None:
+                valid_indices[1] = col_cumsum_gpu[valid_indices[1]]
+            
+            return torch.sparse_coo_tensor(
+                valid_indices.cpu(), # Move result back to storage device (CPU)
+                valid_values.cpu(),
+                size=(n_new_rows, n_new_cols),
+                device=mat.device,
+                dtype=mat.dtype
+            )
+
+        # [Strategy 2] Hybrid Path: Large matrix, process in chunks to avoid OOM
+        # Indices -> GPU, Values -> CPU (Slicing)
         indices = mat.indices() # (2, NNZ)
         values = mat.values()   # (NNZ,)
-        nnz = mat._nnz()
 
         # [Optimization] Pin memory for faster H2D transfer
         # Only pin if tensor is large enough (> 1MB approx) to justify allocation overhead.
@@ -589,8 +663,8 @@ def compact_sparse_step_chunked(
             # Move chunk to GPU
             # indices_chunk: (2, chunk_len)
             indices_chunk = indices[:, start:end].to(device, non_blocking=True)
-            # [Optimization] Do not move values to GPU. We filter them on CPU.
-            # values_chunk = values[start:end].to(device, non_blocking=True)
+            # [Optimization] Values are NOT moved to GPU. 
+            # We only need indices on GPU to decide what to keep.
             
             row_indices = indices_chunk[0]
             col_indices = indices_chunk[1]
@@ -632,9 +706,9 @@ def compact_sparse_step_chunked(
             # Move back to CPU to save VRAM
             new_indices_list.append(valid_indices.cpu())
             
-            # [Optimization] Filter values on CPU using the mask
+            # [Optimization] Filter values on CPU using the mask computed on GPU
+            # keep_chunk is on GPU, move to CPU to slice the CPU tensor 'values'
             keep_chunk_cpu = keep_chunk.cpu()
-            # Slice from original values tensor (CPU)
             values_slice = values[start:end]
             new_values_list.append(values_slice[keep_chunk_cpu])
             
@@ -652,8 +726,8 @@ def compact_sparse_step_chunked(
                 dtype=mat.dtype
             )
             
-        final_indices = torch.cat(new_indices_list, dim=1)
-        final_values = torch.cat(new_values_list, dim=0)
+        final_indices = _destructive_cat(new_indices_list, dim=1)
+        final_values = _destructive_cat(new_values_list, dim=0)
         
         return torch.sparse_coo_tensor(
             final_indices,

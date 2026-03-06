@@ -85,7 +85,7 @@ DEFAULT_PRESETS: Dict[str, TensorSurrogatePreset] = {
         weight_x=1.0,
         weight_y=1.0,
         weight_z=1.0,
-        chunk_size=1_000_000,
+        chunk_size=10_000_000,
     ),
     "gpu_safe": TensorSurrogatePreset(
         memory_device="cpu",
@@ -95,7 +95,7 @@ DEFAULT_PRESETS: Dict[str, TensorSurrogatePreset] = {
         weight_x=1.0,
         weight_y=1.0,
         weight_z=1.0,
-        chunk_size=1_000_000,
+        chunk_size=10_000_000,
     )
 }
 
@@ -490,6 +490,7 @@ def compile_expval_program(
     build_thetas: Any = None,
     build_min_abs: Optional[float] = None,
     build_min_mat_abs: Optional[float] = None,
+    parallel_compile: bool = False,
 ) -> CompiledTensorSurrogate:
     """Compile a reusable expval program with fixed memory-first flow.
 
@@ -523,6 +524,7 @@ def compile_expval_program(
         min_abs=build_min_abs,
         min_mat_abs=build_min_mat_abs,
         chunk_size=int(cfg.chunk_size),
+        parallel_compile=parallel_compile,
     )
 
 

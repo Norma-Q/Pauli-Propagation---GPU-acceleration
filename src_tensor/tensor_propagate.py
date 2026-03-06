@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from typing import Any, List, Optional, TYPE_CHECKING, Tuple, cast
 import math
+import torch.multiprocessing as mp
 
 torch: Any
 try:
@@ -54,6 +55,29 @@ def _make_sparse(row_idx, col_idx, values, shape, device, dtype):
     sp = torch.sparse_coo_tensor(indices, values, size=shape, device=device, dtype=dtype)
     # Memory-first default: avoid coalesce() (it can allocate large temporary buffers).
     return sp
+
+
+def _parallel_propagate_worker(args: Tuple) -> Tuple[Tensor, Tensor, TensorSparseStep, Optional[Tensor]]:
+    """Worker function for multiprocessing compilation. MUST be a top-level function."""
+    (
+        rank, devices, builder_fn, x_mask_chunk, z_mask_chunk,
+        chunk_size, step_device, output_device, kwargs
+    ) = args
+
+    device = devices[rank]
+    # The input masks are on CPU. _process_step_chunked will move chunks to `device`.
+    # The resulting step and masks will be moved back to `step_device` and `output_device` (both "cpu").
+    new_x, new_z, step, cache = _process_step_chunked(
+        builder_fn,
+        x_mask_chunk,
+        z_mask_chunk,
+        chunk_size,
+        device,  # compute_device for this worker
+        step_device,  # where to store the resulting sparse matrix (e.g., "cpu")
+        output_device,  # where to store the resulting masks (e.g., "cpu")
+        **kwargs
+    )
+    return new_x, new_z, step, cache
 
 
 def _xmask_is_zero_rows(x_mask: Tensor) -> Tensor:
@@ -114,8 +138,8 @@ def _sparse_used_cols(mat: Tensor, row_mask: Tensor, n_cols: int) -> Tensor:
     return used
 
 
-def _accumulate_used_cols_chunked(mat: Tensor, row_mask_d: Tensor, col_mask_d: Tensor, chunk_size: int) -> None:
-    """Accumulate used columns from a CPU sparse matrix into a GPU mask using chunks."""
+def _accumulate_used_cols_chunked(mat: Tensor, row_mask: Tensor, col_mask_d: Tensor, chunk_size: int) -> None:
+    """Accumulate used columns. row_mask is on CPU, col_mask_d is on GPU."""
     if mat._nnz() == 0:
         return
     
@@ -125,41 +149,38 @@ def _accumulate_used_cols_chunked(mat: Tensor, row_mask_d: Tensor, col_mask_d: T
     if not mat.is_coalesced():
         mat = mat.coalesce()
     # Access indices on CPU (Storage Device)
-    indices = mat.indices()
+    indices = mat.indices() # CPU
     nnz = indices.shape[1]
-    device = row_mask_d.device
+    device = col_mask_d.device
     
     # [Optimization] Pin memory for faster H2D transfer
-    # This enables direct DMA transfer and better PCIe saturation.
-    # Only pin if tensor is large enough (> 1MB approx) to justify allocation overhead.
-    # 1MB ~ 128k int64 elements.
     if str(device).startswith("cuda") and not indices.is_pinned() and indices.numel() > 100_000:
         try:
             indices = indices.pin_memory()
         except Exception:
             pass # Fallback to pageable memory if RAM is full
     
-    # [Optimization] Dynamic Chunking for mask accumulation
-    current_chunk_size = chunk_size
-    if str(device).startswith("cuda"):
-        try:
-            free_mem, _ = torch.cuda.mem_get_info(device)
-            # Heuristic: indices (16B) + overhead.
-            # Reserve 500MB buffer.
-            safe_mem = max(0, free_mem - 500 * 1024 * 1024)
-            estimated_capacity = int(safe_mem // 64)
-            current_chunk_size = max(chunk_size, estimated_capacity)
-        except Exception:
-            pass
-
-    for start in range(0, nnz, current_chunk_size):
-        end = min(start + current_chunk_size, nnz)
-        # Move only indices to GPU (Compute Device)
-        idx_chunk = indices[:, start:end].to(device, non_blocking=True)
+    for start in range(0, nnz, chunk_size):
+        end = min(start + chunk_size, nnz)
         
-        # Update mask on GPU
-        keep = row_mask_d[idx_chunk[0]]
-        col_mask_d[idx_chunk[1][keep]] = True
+        # 1. Get chunk indices on CPU
+        idx_chunk = indices[:, start:end]
+        row_idx = idx_chunk[0]
+        col_idx = idx_chunk[1]
+
+        # 2. Filter on CPU using row_mask (CPU)
+        # This avoids moving the huge row_mask to GPU
+        keep = row_mask[row_idx]
+        
+        if not keep.any():
+            continue
+
+        # 3. Identify columns to mark
+        valid_cols = col_idx[keep]
+        
+        # 4. Move only valid columns to GPU to update mask
+        valid_cols_gpu = valid_cols.to(device, non_blocking=True)
+        col_mask_d[valid_cols_gpu] = True
 
 
 def _filter_sparse_rows_cols(mat: Tensor, row_mask: Tensor, col_mask: Tensor) -> Tensor:
@@ -440,6 +461,119 @@ def _process_step_chunked(
     return full_new_x, full_new_z, full_step, full_cache
 
 
+def _process_step_parallel(
+    builder_fn,
+    x_mask_in: Tensor,
+    z_mask_in: Tensor,
+    chunk_size: int,
+    devices: List[str],
+    step_device: str,
+    output_device: str = "cpu",
+    parallel_threshold: int = 1_000_000,
+    **kwargs
+) -> Tuple[Tensor, Tensor, TensorSparseStep, Optional[Tensor]]:
+    """Process a propagation step in parallel across multiple GPUs."""
+    n_terms = x_mask_in.shape[0]
+    n_gpus = len(devices)
+
+    # Fallback to single GPU for small workloads where overhead > benefit
+    if n_terms < parallel_threshold:
+        return _process_step_chunked(
+            builder_fn, x_mask_in, z_mask_in, chunk_size, devices[0], step_device, output_device, **kwargs
+        )
+
+    # [Optimization] Clear main process GPU cache before spawning workers.
+    # The main process accumulates GPU cache from previous single-GPU steps (on device[0]).
+    # Since workers are separate processes (spawn), they allocate their own GPU memory.
+    # Clearing cache here prevents device[0] from holding double memory 
+    # (main process cache + worker 0 allocation).
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    # 1. Split input terms across GPUs
+    input_indices_chunks = torch.chunk(torch.arange(n_terms), n_gpus)
+
+    # 2. Prepare arguments for each worker process
+    worker_args = []
+    for i in range(n_gpus):
+        worker_kwargs = kwargs.copy()
+        if 'coeffs_cache' in kwargs and kwargs['coeffs_cache'] is not None:
+            worker_kwargs['coeffs_cache'] = kwargs['coeffs_cache'][input_indices_chunks[i]]
+
+        arg_tuple = (
+            i, devices, builder_fn, x_mask_in[input_indices_chunks[i]], z_mask_in[input_indices_chunks[i]],
+            chunk_size, step_device, output_device, worker_kwargs
+        )
+        worker_args.append(arg_tuple)
+
+    # 3. Run in parallel using "spawn" context for CUDA safety
+    ctx = mp.get_context("spawn")
+    with ctx.Pool(processes=n_gpus) as pool:
+        results = pool.map(_parallel_propagate_worker, worker_args)
+
+    # 4. Assemble Final Tensors from results
+    new_x_parts = [r[0] for r in results]
+    new_z_parts = [r[1] for r in results]
+    step_parts = [r[2] for r in results]
+    cache_parts = [r[3] for r in results if r[3] is not None]
+    results = None  # Free memory
+
+    full_new_x = _destructive_cat(new_x_parts, dim=0)
+    full_new_z = _destructive_cat(new_z_parts, dim=0)
+    full_cache = _destructive_cat(cache_parts, dim=0) if cache_parts else None
+
+    # 5. Merge sparse steps from all workers
+    const_indices, const_values = [], []
+    cos_indices, cos_values = [], []
+    sin_indices, sin_values = [], []
+    row_offset = 0
+    col_offset = 0
+
+    def _append_sparse(mat, indices_list, values_list, r_off, c_off):
+        if mat._nnz() > 0:
+            if not mat.is_coalesced():
+                mat = mat.coalesce()
+            # Results from workers should be on CPU (`step_device`)
+            idx = mat.indices()
+            val = mat.values()
+            idx[0] += r_off
+            idx[1] += c_off
+            indices_list.append(idx)
+            values_list.append(val)
+
+    ref_step = step_parts[0]
+    for step in step_parts:
+        _append_sparse(step.mat_const, const_indices, const_values, row_offset, col_offset)
+        _append_sparse(step.mat_cos, cos_indices, cos_values, row_offset, col_offset)
+        _append_sparse(step.mat_sin, sin_indices, sin_values, row_offset, col_offset)
+        row_offset += step.shape[0]
+        col_offset += step.shape[1]
+
+    def _concat_sparse(indices_list, values_list, shape, t_dtype):
+        if not indices_list:
+            return _make_sparse(torch.tensor([], dtype=torch.int64), torch.tensor([], dtype=torch.int64), torch.tensor([], dtype=t_dtype), shape, step_device, t_dtype)
+        all_indices = _destructive_cat(indices_list, dim=1).to(step_device)
+        all_values = _destructive_cat(values_list, dim=0).to(step_device)
+        return torch.sparse_coo_tensor(all_indices, all_values, size=shape, device=step_device)
+
+    full_shape = (row_offset, col_offset)
+    t_dtype = kwargs['t_dtype']
+    mat_const = _concat_sparse(const_indices, const_values, full_shape, t_dtype)
+    mat_cos = _concat_sparse(cos_indices, cos_values, full_shape, t_dtype)
+    mat_sin = _concat_sparse(sin_indices, sin_values, full_shape, t_dtype)
+
+    full_step = TensorSparseStep(
+        mat_const=mat_const,
+        mat_cos=mat_cos,
+        mat_sin=mat_sin,
+        param_idx=ref_step.param_idx,
+        emb_idx=ref_step.emb_idx,
+        shape=full_shape
+    )
+
+    return full_new_x, full_new_z, full_step, full_cache
+
+
 def propagate_surrogate_tensor(
     circuit,
     observable,
@@ -454,6 +588,8 @@ def propagate_surrogate_tensor(
     min_abs: Optional[float] = None,
     min_mat_abs: Optional[float] = None,
     chunk_size: int = 1_000_000,
+    parallel_compile: bool = False,
+    parallel_threshold: int = -1,
 ) -> TensorPauliSum:
     """Tensor-native propagation to a tensor PauliSum.
 
@@ -504,35 +640,74 @@ def propagate_surrogate_tensor(
         if thetas_t.numel() == 0:
             thetas_t = torch.zeros(1, dtype=coeff_init.dtype, device=compute_device)
 
+    # [New] Parallel compilation logic
+    num_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
+    use_parallel = parallel_compile and num_gpus > 1
+
+    # Determine the final threshold for parallel processing
+    final_parallel_threshold = parallel_threshold
+    if use_parallel and final_parallel_threshold == -1:
+        try:
+            # Auto-configure based on primary GPU memory
+            primary_gpu_idx = 0
+            if "cuda" in compute_device and ":" in compute_device:
+                primary_gpu_idx = int(compute_device.split(':')[-1])
+
+            props = torch.cuda.get_device_properties(primary_gpu_idx)
+            total_mem_gb = props.total_memory / (1024**3)
+            
+            # Use 65% of VRAM as a safe limit for the *input* size to a single-GPU step,
+            # leaving room for the output and computational overhead.
+            safety_factor = 0.5
+            # Conservative estimate of memory per term, including all related data structures.
+            bytes_per_term = 128
+            
+            calculated_threshold = int((props.total_memory * safety_factor) / bytes_per_term)
+            
+            # Set a reasonable floor (to justify overhead) and ceiling (as a safety net).
+            final_parallel_threshold = max(1_000_000, min(calculated_threshold, 150_000_000))
+            print(f"[PPS Info] Auto-configuring parallel threshold for {total_mem_gb:.1f}GB GPU: {final_parallel_threshold:,} terms.")
+        except Exception as e:
+            print(f"[PPS Warning] Failed to auto-configure parallel threshold, falling back to 1M. Error: {e}")
+            final_parallel_threshold = 1_000_000
+    elif final_parallel_threshold < 0: # If not parallel or invalid, use a sane default.
+        final_parallel_threshold = 1_000_000
+
+    if use_parallel:
+        devices = [f"cuda:{i}" for i in range(num_gpus)]
+        print(f"[PPS Info] Compiling in parallel across {num_gpus} GPUs ({devices}).")
+        
+        def process_step_fn(builder_fn, x_mask, z_mask, chunk_size, **kwargs):
+            return _process_step_parallel(
+                builder_fn, x_mask, z_mask, chunk_size, devices, memory_device, memory_device,
+                parallel_threshold=final_parallel_threshold, **kwargs
+            )
+    else:
+        def process_step_fn(builder_fn, x_mask, z_mask, chunk_size, **kwargs):
+            return _process_step_chunked(
+                builder_fn, x_mask, z_mask, chunk_size, compute_device, memory_device, memory_device, **kwargs
+            )
+
     total_gates = len(circuit)
     for gate in tqdm(reversed(circuit), total=total_gates, desc="propagate", dynamic_ncols=True):
         gate_name = gate.__class__.__name__
 
+        builder_fn = None
         if gate_name == "CliffordGate":
-            new_x, new_z, step, coeffs_cache = _process_step_chunked(
-                build_clifford_step,
-                x_mask, z_mask, chunk_size, compute_device, memory_device,
-                output_device=memory_device,
-                gate=gate,
-                t_dtype=t_dtype,
-                min_abs=min_abs_internal,
-                coeffs_cache=coeffs_cache,
-                max_weight=max_weight,
-                weight_x=weight_x,
-                weight_y=weight_y,
-                weight_z=weight_z,
-            )
-            if min_mat_abs is not None and float(min_mat_abs) > 0.0:
-                step = _prune_step_by_abs(step, float(min_mat_abs))
-            steps.append(step)
-            x_mask, z_mask = new_x, new_z
-            continue
+            builder_fn = build_clifford_step
+        elif gate_name == "PauliRotation":
+            builder_fn = build_pauli_rotation_step
+        elif gate_name == "DepolarizingNoise":
+            builder_fn = build_depolarizing_step
+        elif gate_name == "AmplitudeDampingNoise":
+            builder_fn = build_amplitude_damping_step
 
-        if gate_name == "PauliRotation":
-            new_x, new_z, step, coeffs_cache = _process_step_chunked(
-                build_pauli_rotation_step,
-                x_mask, z_mask, chunk_size, compute_device, memory_device,
-                output_device=memory_device,
+        if builder_fn:
+            new_x, new_z, step, new_coeffs_cache = process_step_fn(
+                builder_fn,
+                x_mask,
+                z_mask,
+                chunk_size,
                 gate=gate,
                 t_dtype=t_dtype,
                 min_abs=min_abs_internal,
@@ -543,56 +718,17 @@ def propagate_surrogate_tensor(
                 weight_y=weight_y,
                 weight_z=weight_z,
             )
+            coeffs_cache = new_coeffs_cache
+
             if min_mat_abs is not None and float(min_mat_abs) > 0.0:
                 step = _prune_step_by_abs(step, float(min_mat_abs))
             steps.append(step)
             x_mask, z_mask = new_x, new_z
-            continue
-
-        if gate_name == "DepolarizingNoise":
-            new_x, new_z, step, coeffs_cache = _process_step_chunked(
-                build_depolarizing_step,
-                x_mask, z_mask, chunk_size, compute_device, memory_device,
-                output_device=memory_device,
-                gate=gate,
-                t_dtype=t_dtype,
-                min_abs=min_abs_internal,
-                coeffs_cache=coeffs_cache,
-                max_weight=max_weight,
-                weight_x=weight_x,
-                weight_y=weight_y,
-                weight_z=weight_z,
+        else:
+            raise TypeError(
+                f"Unsupported gate type in propagate_surrogate_tensor: {gate_name}. "
+                "Expected CliffordGate, PauliRotation, DepolarizingNoise, or AmplitudeDampingNoise."
             )
-            if min_mat_abs is not None and float(min_mat_abs) > 0.0:
-                step = _prune_step_by_abs(step, float(min_mat_abs))
-            steps.append(step)
-            x_mask, z_mask = new_x, new_z
-            continue
-
-        if gate_name == "AmplitudeDampingNoise":
-            new_x, new_z, step, coeffs_cache = _process_step_chunked(
-                build_amplitude_damping_step,
-                x_mask, z_mask, chunk_size, compute_device, memory_device,
-                output_device=memory_device,
-                gate=gate,
-                t_dtype=t_dtype,
-                min_abs=min_abs_internal,
-                coeffs_cache=coeffs_cache,
-                max_weight=max_weight,
-                weight_x=weight_x,
-                weight_y=weight_y,
-                weight_z=weight_z,
-            )
-            if min_mat_abs is not None and float(min_mat_abs) > 0.0:
-                step = _prune_step_by_abs(step, float(min_mat_abs))
-            steps.append(step)
-            x_mask, z_mask = new_x, new_z
-            continue
-
-        raise TypeError(
-            f"Unsupported gate type in propagate_surrogate_tensor: {gate_name}. "
-            "Expected CliffordGate, PauliRotation, DepolarizingNoise, or AmplitudeDampingNoise."
-        )
 
     psum = TensorPauliSum(
         n_qubits=n_qubits,
@@ -685,12 +821,12 @@ def zero_filter_tensor_backprop_with_keep_mask(
         # 1. Calculate used columns (Chunked GPU acceleration)
         # Move masks to GPU, stream indices in chunks
         try:
-            row_mask_d = row_mask.to(compute_device)
+            # row_mask is kept on CPU to avoid OOM
             col_mask_d = torch.zeros((n_cols,), dtype=torch.bool, device=compute_device)
             
-            _accumulate_used_cols_chunked(old_step.mat_const, row_mask_d, col_mask_d, chunk_size*5000)
-            _accumulate_used_cols_chunked(old_step.mat_cos, row_mask_d, col_mask_d, chunk_size*5000)
-            _accumulate_used_cols_chunked(old_step.mat_sin, row_mask_d, col_mask_d, chunk_size*5000)
+            _accumulate_used_cols_chunked(old_step.mat_const, row_mask, col_mask_d, chunk_size)
+            _accumulate_used_cols_chunked(old_step.mat_cos, row_mask, col_mask_d, chunk_size)
+            _accumulate_used_cols_chunked(old_step.mat_sin, row_mask, col_mask_d, chunk_size)
             
             col_mask = col_mask_d.to(row_mask.device) # Back to CPU
         except RuntimeError as e: # Fallback to CPU if GPU OOM (e.g. masks too big)
