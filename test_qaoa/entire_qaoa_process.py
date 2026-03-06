@@ -4,6 +4,7 @@ import os
 import json
 import argparse
 import time
+import gc
 
 import numpy as np
 import torch
@@ -179,6 +180,14 @@ def main():
                           'chunk_size' : 20_000_000},
                           parallel_compile=True)
     print("Program compiled successfully.")
+
+    # [Optimization] Clear build-time memory artifacts
+    # The propagation phase uses huge memory (CPU/GPU), but the compiled program is small.
+    # We force GC and cache clearing to reclaim resources before training.
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        print(f"[System] GPU Memory after cleanup: {torch.cuda.memory_allocated(DEVICE)/1024**2:.2f} MB allocated, {torch.cuda.memory_reserved(DEVICE)/1024**2:.2f} MB reserved.")
 
 
     ########################## Training & Saving #############################
