@@ -773,6 +773,10 @@ def zero_filter_tensor_backprop_with_keep_mask(
 ) -> Tuple[TensorPauliSum, Tensor]:
     """Back-propagating zero-filter.
 
+    Memory note:
+      This function may consume (clear) internals of the input `psum` while
+      constructing the filtered result to reduce CPU memory peak.
+
     Returns:
       (filtered_psum, keep_mask_in)
     where keep_mask_in is a boolean mask over the *input coefficient dimension*
@@ -782,28 +786,42 @@ def zero_filter_tensor_backprop_with_keep_mask(
 
     if not _TORCH_AVAILABLE:
         raise RuntimeError("PyTorch is required for tensor backend.")
-    if psum.x_mask.numel() == 0:
+
+    n_qubits = int(psum.n_qubits)
+    x_mask_src = psum.x_mask
+    z_mask_src = psum.z_mask
+    coeff_init_src = psum.coeff_init
+    steps = list(psum.steps)
+
+    # Release references from input object early (consuming behavior).
+    psum.steps = []
+
+    if x_mask_src.numel() == 0:
         print("[ZeroFilter] No terms generated (empty mask). Skipping back-propagation.")
-        keep_mask = torch.zeros((int(psum.coeff_init.shape[0]),), dtype=torch.bool, device=psum.coeff_init.device)
+        keep_mask = torch.zeros((int(coeff_init_src.shape[0]),), dtype=torch.bool, device=coeff_init_src.device)
         filtered = TensorPauliSum(
-            n_qubits=psum.n_qubits,
-            x_mask=psum.x_mask,
-            z_mask=psum.z_mask,
-            coeff_init=psum.coeff_init[keep_mask],
-            steps=list(psum.steps),
+            n_qubits=n_qubits,
+            x_mask=x_mask_src,
+            z_mask=z_mask_src,
+            coeff_init=coeff_init_src[keep_mask],
+            steps=steps,
         )
         return filtered, keep_mask
 
-    out_mask = _xmask_is_zero_rows(psum.x_mask)
+    out_mask = _xmask_is_zero_rows(x_mask_src)
     
     # [Log] Show initial reduction from total propagated terms to diagonal terms
-    n_total = psum.x_mask.shape[0]
+    n_total = int(x_mask_src.shape[0])
     n_diag = int(out_mask.sum().item())
     pct = 100.0 * n_diag / n_total if n_total > 0 else 0.0
     print(f"[ZeroFilter] Initial pruning (diagonal terms only): {n_total:,} -> {n_diag:,} terms kept ({pct:.8f}%)")
-    print(f"[ZeroFilter] Zero-filtering done. Starting back-propagation of keep mask through {len(psum.steps)} steps...")
+    print(f"[ZeroFilter] Zero-filtering done. Starting back-propagation of keep mask through {len(steps)} steps...")
 
-    steps = list(psum.steps)
+    # Materialize filtered output masks once, then clear original references.
+    x_mask_out = x_mask_src[out_mask]
+    z_mask_out = z_mask_src[out_mask]
+    psum.x_mask = x_mask_out[:0]
+    psum.z_mask = z_mask_out[:0]
 
     # [Memory Optimization] Clear GPU cache from forward pass to free up VRAM for filtering
     if torch.cuda.is_available() and "cuda" in compute_device:
@@ -812,9 +830,7 @@ def zero_filter_tensor_backprop_with_keep_mask(
     row_mask = out_mask
     pbar = tqdm(reversed(range(len(steps))), total=len(steps), desc="zero-filter", dynamic_ncols=True)
     for i in pbar:
-        # [Memory Optimization] Decompose step to release old tensors immediately after filtering
         old_step = steps[i]
-        steps[i] = None  # Clear reference from list to allow GC
         
         n_cols = int(old_step.shape[1])
         
@@ -824,11 +840,11 @@ def zero_filter_tensor_backprop_with_keep_mask(
             # row_mask is kept on CPU to avoid OOM
             col_mask_d = torch.zeros((n_cols,), dtype=torch.bool, device=compute_device)
             
-            _accumulate_used_cols_chunked(old_step.mat_const, row_mask, col_mask_d, chunk_size)
-            _accumulate_used_cols_chunked(old_step.mat_cos, row_mask, col_mask_d, chunk_size)
-            _accumulate_used_cols_chunked(old_step.mat_sin, row_mask, col_mask_d, chunk_size)
+            _accumulate_used_cols_chunked(old_step.mat_const, row_mask_d, col_mask_d, chunk_size)
+            _accumulate_used_cols_chunked(old_step.mat_cos, row_mask_d, col_mask_d, chunk_size)
+            _accumulate_used_cols_chunked(old_step.mat_sin, row_mask_d, col_mask_d, chunk_size)
             
-            col_mask = col_mask_d.to(row_mask.device) # Back to CPU
+            col_mask = col_mask_d.to(row_mask.device)  # Back to CPU
         except RuntimeError as e: # Fallback to CPU if GPU OOM (e.g. masks too big)
             print(f"Warning: GPU acceleration failed in zero-filter, falling back to CPU. Error: {e}")
             col_mask = _sparse_used_cols(old_step.mat_const, row_mask, n_cols)
@@ -851,7 +867,7 @@ def zero_filter_tensor_backprop_with_keep_mask(
             keep_row_mask=row_mask,
             keep_col_mask=col_mask,
             device=compute_device,
-            chunk_size=chunk_size
+            chunk_size=chunk_size,
         )
         
         # Release old step explicitly (though GC should handle it as steps[i] was cleared)
@@ -859,12 +875,13 @@ def zero_filter_tensor_backprop_with_keep_mask(
         
         row_mask = col_mask
 
-    coeff_init = psum.coeff_init[row_mask]
+    coeff_init = coeff_init_src[row_mask]
+    psum.coeff_init = coeff_init[:0]
 
     filtered = TensorPauliSum(
-        n_qubits=psum.n_qubits,
-        x_mask=psum.x_mask[out_mask],
-        z_mask=psum.z_mask[out_mask],
+        n_qubits=n_qubits,
+        x_mask=x_mask_out,
+        z_mask=z_mask_out,
         coeff_init=coeff_init,
         steps=steps,
     )
