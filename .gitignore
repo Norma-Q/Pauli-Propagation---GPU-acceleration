@@ -32,7 +32,7 @@ test_qaoa/graph/
 test_qaoa/config/
 test_qaoa/config_quantinuum.yaml
 
-QAOA_YSL/
+QAOA/
 
 batch.ipynb
 embedding.ipynb
