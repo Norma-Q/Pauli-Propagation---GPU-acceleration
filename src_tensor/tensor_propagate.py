@@ -10,6 +10,7 @@ then walks steps backwards to remove any input columns that cannot reach them.
 
 from __future__ import annotations
 
+import gc
 from typing import Any, List, Optional, TYPE_CHECKING, Tuple, cast
 import math
 import torch.multiprocessing as mp
@@ -348,16 +349,30 @@ def _process_step_chunked(
     then assembles the result back on CPU (or step_device).
     """
     n_terms = x_mask_in.shape[0]
+
+    def _move_builder_kwargs(base_kwargs, target_device: str, start: Optional[int] = None, end: Optional[int] = None):
+        local_kwargs = base_kwargs.copy()
+
+        coeffs_cache = local_kwargs.get('coeffs_cache', None)
+        if coeffs_cache is not None:
+            if start is not None and end is not None:
+                local_kwargs['coeffs_cache'] = coeffs_cache[start:end].to(target_device)
+            else:
+                local_kwargs['coeffs_cache'] = coeffs_cache.to(target_device)
+
+        thetas_t = local_kwargs.get('thetas_t', None)
+        if thetas_t is not None:
+            local_kwargs['thetas_t'] = thetas_t.to(target_device)
+
+        return local_kwargs
     
     # Fast path: if small enough, run directly
     if n_terms <= chunk_size:
         x_gpu = x_mask_in.to(device)
         z_gpu = z_mask_in.to(device)
-        # Handle coeffs_cache if present
-        if 'coeffs_cache' in kwargs and kwargs['coeffs_cache'] is not None:
-            kwargs['coeffs_cache'] = kwargs['coeffs_cache'].to(device)
-            
-        new_x, new_z, step, cache = builder_fn(x_mask=x_gpu, z_mask=z_gpu, device=device, step_device=step_device, **kwargs)
+
+        fast_kwargs = _move_builder_kwargs(kwargs, device)
+        new_x, new_z, step, cache = builder_fn(x_mask=x_gpu, z_mask=z_gpu, device=device, step_device=step_device, **fast_kwargs)
         return new_x.to(output_device), new_z.to(output_device), step, (cache.to(output_device) if cache is not None else None)
 
     # Chunked processing
@@ -397,9 +412,7 @@ def _process_step_chunked(
         x_chunk = x_mask_in[start:end].to(device)
         z_chunk = z_mask_in[start:end].to(device)
         
-        chunk_kwargs = kwargs.copy()
-        if 'coeffs_cache' in chunk_kwargs and chunk_kwargs['coeffs_cache'] is not None:
-            chunk_kwargs['coeffs_cache'] = chunk_kwargs['coeffs_cache'][start:end].to(device)
+        chunk_kwargs = _move_builder_kwargs(kwargs, device, start=start, end=end)
             
         nx, nz, step, cache = builder_fn(x_mask=x_chunk, z_mask=z_chunk, device=device, step_device=device, **chunk_kwargs)
         
@@ -636,9 +649,10 @@ def propagate_surrogate_tensor(
         coeff_scale = coeff_max if coeff_max > 0.0 else 1.0
         coeffs_cache = (coeff_init / coeff_scale) # Keep on CPU
         min_abs_internal = float(min_abs) / coeff_scale
-        thetas_t = torch.as_tensor(thetas, dtype=coeff_init.dtype, device=compute_device)
-        if thetas_t.numel() == 0:
-            thetas_t = torch.zeros(1, dtype=coeff_init.dtype, device=compute_device)
+        # Keep on CPU and move per worker/per-step device to avoid multi-GPU mismatch.
+        thetas_t = torch.as_tensor(thetas, dtype=coeff_init.dtype, device=memory_device)
+        if thetas_t is None or thetas_t.numel() == 0:
+            thetas_t = torch.zeros(1, dtype=coeff_init.dtype, device=memory_device)
 
     # [New] Parallel compilation logic
     num_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
@@ -765,7 +779,6 @@ def zero_filter_tensor(psum: TensorPauliSum) -> TensorPauliSum:
         steps=steps,
     )
 
-
 def zero_filter_tensor_backprop_with_keep_mask(
     psum: TensorPauliSum,
     compute_device: str = "cuda",
@@ -837,12 +850,11 @@ def zero_filter_tensor_backprop_with_keep_mask(
         # 1. Calculate used columns (Chunked GPU acceleration)
         # Move masks to GPU, stream indices in chunks
         try:
-            # row_mask is kept on CPU to avoid OOM
             col_mask_d = torch.zeros((n_cols,), dtype=torch.bool, device=compute_device)
             
-            _accumulate_used_cols_chunked(old_step.mat_const, row_mask_d, col_mask_d, chunk_size)
-            _accumulate_used_cols_chunked(old_step.mat_cos, row_mask_d, col_mask_d, chunk_size)
-            _accumulate_used_cols_chunked(old_step.mat_sin, row_mask_d, col_mask_d, chunk_size)
+            _accumulate_used_cols_chunked(old_step.mat_const, row_mask, col_mask_d, chunk_size)
+            _accumulate_used_cols_chunked(old_step.mat_cos, row_mask, col_mask_d, chunk_size)
+            _accumulate_used_cols_chunked(old_step.mat_sin, row_mask, col_mask_d, chunk_size)
             
             col_mask = col_mask_d.to(row_mask.device)  # Back to CPU
         except RuntimeError as e: # Fallback to CPU if GPU OOM (e.g. masks too big)
@@ -875,6 +887,12 @@ def zero_filter_tensor_backprop_with_keep_mask(
         
         row_mask = col_mask
 
+        # [Memory Stability] Force garbage collection and clear CUDA cache to prevent OOM on large models.
+        # This is crucial in a tight loop where Python's GC might lag behind allocations.
+        gc.collect()
+        if torch.cuda.is_available() and "cuda" in compute_device:
+            torch.cuda.empty_cache()
+
     coeff_init = coeff_init_src[row_mask]
     psum.coeff_init = coeff_init[:0]
 
@@ -886,7 +904,6 @@ def zero_filter_tensor_backprop_with_keep_mask(
         steps=steps,
     )
     return filtered, row_mask
-
 
 def zero_filter_tensor_backprop(
     psum: TensorPauliSum,

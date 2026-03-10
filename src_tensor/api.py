@@ -43,6 +43,34 @@ from .tensor_sampler import TensorSparseSampler
 from .tensor_types import TensorPauliSum
 
 
+def _expvals_parallel_worker(args: Tuple) -> Tensor:
+    """
+    Worker function for parallel evaluation of batched embeddings.
+    MUST be a top-level function for torch.multiprocessing.
+    """
+    # Import dependencies inside the worker for 'spawn' context safety.
+    from .tensor_adjoint import adjoint_weights_on_zero
+
+    (
+        rank, devices, psum_union, thetas, embedding_chunk, chunk_size
+    ) = args
+
+    device = devices[rank]
+
+    # adjoint_weights_on_zero handles moving data to the compute_device.
+    # The input psum_union is on CPU and shared.
+    w_chunk = adjoint_weights_on_zero(
+        psum_union,
+        thetas,
+        embedding=embedding_chunk,
+        compute_device=device,
+        chunk_size=chunk_size,
+    )
+
+    # Return result on CPU to gather safely in the main process.
+    return w_chunk.cpu()
+
+
 @dataclass(frozen=True)
 class TensorSurrogatePreset:
     """Execution preset for high-level API."""
@@ -130,31 +158,71 @@ class CompiledTensorSurrogate:
         thetas: Any,
         *,
         embedding: Any = None,
+        parallel: bool = False,
     ) -> Tensor:
-        """Evaluate expectation values with optional data priors (embedding)."""
+        """Evaluate expectation values with optional data priors (embedding).
+
+        Args:
+            thetas: The parameters for the variational circuit.
+            embedding: Optional tensor of data priors. If batched (2D), each row is a data point.
+            parallel: If True and multiple GPUs are available, distribute the embedding batch
+                      across GPUs for parallel evaluation.
+
+        Returns:
+            A tensor of expectation values. Shape is (Num_Observables,) for single input,
+            or (Batch_Size, Num_Observables) for a batched embedding.
+        """
         if not _TORCH_AVAILABLE:
             raise RuntimeError("PyTorch is required for tensor backend.")
 
-        # [수정 포인트] embedding이 입력되었을 때만 배치 차원을 검사합니다.
-        # 기존의 1D 입력을 (1, N)으로 만들어 하부 로직이 항상 2D(Batch)를 기대하게 합니다.
         if embedding is not None:
             if embedding.ndim == 1:
                 embedding = embedding.unsqueeze(0)
-        
-        # adjoint_weights_on_zero는 이제 (Batch, Num_Paulis)를 반환하도록 2단계에서 수정할 것입니다.
-        w = adjoint_weights_on_zero(
-            self.psum_union,
-            thetas,
-            embedding=embedding,
-            compute_device=self.preset.compute_device,
-            chunk_size=self.preset.chunk_size,
+
+        # Determine if parallel execution should be used
+        num_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
+        use_parallel = (
+            parallel and
+            embedding is not None and
+            embedding.shape[0] > 1 and
+            num_gpus > 1
         )
-        
+
+        if use_parallel:
+            devices = [f"cuda:{i}" for i in range(num_gpus)]
+            embedding_chunks = torch.chunk(embedding, num_gpus)
+
+            worker_args = [
+                (
+                    i,
+                    devices,
+                    self.psum_union,
+                    thetas,
+                    embedding_chunks[i],
+                    self.preset.chunk_size,
+                )
+                for i in range(num_gpus)
+            ]
+
+            import torch.multiprocessing as mp
+            ctx = mp.get_context("spawn")
+            with ctx.Pool(processes=num_gpus) as pool:
+                w_chunks_cpu = pool.map(_expvals_parallel_worker, worker_args)
+
+            w = torch.cat(w_chunks_cpu, dim=0)
+        else:
+            # Original serial execution path
+            w = adjoint_weights_on_zero(
+                self.psum_union,
+                thetas,
+                embedding=embedding,
+                compute_device=self.preset.compute_device,
+                chunk_size=self.preset.chunk_size,
+            )
+
         V0 = self._get_V0(device=str(w.device), dtype=w.dtype)
-        
-        # [수정 포인트] expvals_from_w_and_coeff_matrix 내부에서 Batch Matmul을 수행하게 합니다.
         res = expvals_from_w_and_coeff_matrix(w, V0)
-        
+
         return res
 
     def expval(
@@ -163,7 +231,8 @@ class CompiledTensorSurrogate:
         *,
         obs_index: int = 0,
     ) -> Tensor:
-        vals = self.expvals(thetas)
+        # Note: `parallel` is False by default. This path is for single, non-batched evaluation.
+        vals = self.expvals(thetas, parallel=False)
         if obs_index < 0 or obs_index >= int(vals.shape[0]):
             raise IndexError(f"obs_index={obs_index} is out of range for {int(vals.shape[0])} observables")
         return vals[obs_index]
