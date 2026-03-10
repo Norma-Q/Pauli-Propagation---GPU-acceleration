@@ -42,6 +42,10 @@ def psum_bytes(psum):
         total += sparse_bytes(st.mat_const)
         total += sparse_bytes(st.mat_cos)
         total += sparse_bytes(st.mat_sin)
+        if st.same_cols is not None:
+            total += st.same_cols.numel() * st.same_cols.element_size()
+        if st.anti_same_pos is not None:
+            total += st.anti_same_pos.numel() * st.anti_same_pos.element_size()
     return int(total)
 
 

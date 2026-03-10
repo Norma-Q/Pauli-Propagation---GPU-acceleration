@@ -71,6 +71,8 @@ def _step_to_device(step: TensorSparseStep, device: str) -> TensorSparseStep:
         param_idx=step.param_idx,
         emb_idx=step.emb_idx,
         shape=step.shape,
+        same_cols=None if step.same_cols is None else step.same_cols.to(device),
+        anti_same_pos=None if step.anti_same_pos is None else step.anti_same_pos.to(device),
     )
 
 
@@ -84,10 +86,10 @@ class TensorSparseEvaluator:
         self.compute_device = compute_device
         self.chunk_size = chunk_size if chunk_size is not None else 1_000_000
 
-    def evaluate_coeffs(self, thetas, embedding=None) -> Tensor:
+    def evaluate_coeffs(self, thetas, embedding=None, coeff_init: Optional[Tensor] = None) -> Tensor:
         """Return coefficient vector after applying all sparse steps with gradient control."""
         psum = self.psum
-        v = psum.coeff_init
+        v = psum.coeff_init if coeff_init is None else coeff_init
         
         # 벡터는 연산 장치에 상주
         v = v.to(self.compute_device)
@@ -133,6 +135,22 @@ class TensorSparseEvaluator:
             
             return torch.cat(result_parts, dim=0)
 
+        def _apply_implicit_same(step: TensorSparseStep, vec_calc: Tensor, cos_t: Tensor) -> Optional[Tensor]:
+            if step.same_cols is None:
+                return None
+            same_cols = step.same_cols.to(vec_calc.device)
+            out = torch.zeros((step.shape[0], vec_calc.shape[1]), dtype=vec_calc.dtype, device=vec_calc.device)
+            n_same = int(same_cols.numel())
+            if n_same == 0:
+                return out
+            same_vals = vec_calc.index_select(0, same_cols)
+            if step.anti_same_pos is not None and step.anti_same_pos.numel() > 0:
+                anti_pos = step.anti_same_pos.to(vec_calc.device)
+                same_vals = same_vals.clone()
+                same_vals[anti_pos] = cos_t * same_vals.index_select(0, anti_pos)
+            out[:n_same] = same_vals
+            return out
+
         for i, step in enumerate(psum.steps):
             # [수정] 파라미터 결정 로직: emb_idx가 우선순위를 가짐
             if step.emb_idx >= 0 and embedding_t is not None:
@@ -150,9 +168,13 @@ class TensorSparseEvaluator:
                 cos_t = torch.ones((), dtype=v.dtype, device=v.device)
                 sin_t = torch.zeros((), dtype=v.dtype, device=v.device)
 
-            v_next = _chunked_mm(step.mat_const, v)
+            implicit_same = _apply_implicit_same(step, v, cos_t)
+            if implicit_same is not None:
+                v_next = implicit_same
+            else:
+                v_next = _chunked_mm(step.mat_const, v)
 
-            if step.mat_cos._nnz() > 0:
+            if implicit_same is None and step.mat_cos._nnz() > 0:
                 v_next = v_next + cos_t * _chunked_mm(step.mat_cos, v)
             if step.mat_sin._nnz() > 0:
                 v_next = v_next + sin_t * _chunked_mm(step.mat_sin, v)
@@ -217,7 +239,25 @@ class TensorSparseEvaluator:
                     y_acc = term
                 else:
                     y_acc += term
+            if y_acc is None:
+                return torch.zeros((mat_storage.shape[1], vec_calc.shape[1]), dtype=vec_calc.dtype, device=vec_calc.device)
             return y_acc
+
+        def _apply_implicit_same_T(step: TensorSparseStep, vec_calc: Tensor, cos_t: Tensor) -> Optional[Tensor]:
+            if step.same_cols is None:
+                return None
+            same_cols = step.same_cols.to(vec_calc.device)
+            out = torch.zeros((step.shape[1], vec_calc.shape[1]), dtype=vec_calc.dtype, device=vec_calc.device)
+            n_same = int(same_cols.numel())
+            if n_same == 0:
+                return out
+            same_block = vec_calc[:n_same]
+            if step.anti_same_pos is not None and step.anti_same_pos.numel() > 0:
+                anti_pos = step.anti_same_pos.to(vec_calc.device)
+                same_block = same_block.clone()
+                same_block[anti_pos] = cos_t.view(1, -1) * same_block.index_select(0, anti_pos)
+            out.index_add_(0, same_cols, same_block)
+            return out
 
         # 2. 역순 전파 루프
         for rev_i, step in enumerate(reversed(psum.steps)):
@@ -234,9 +274,13 @@ class TensorSparseEvaluator:
                 cos_t = torch.ones(batch_size, dtype=w.dtype, device=w.device)
                 sin_t = torch.zeros(batch_size, dtype=w.dtype, device=w.device)
 
-            w_next = _chunked_mm_T(step.mat_const, w)
+            implicit_same = _apply_implicit_same_T(step, w, cos_t)
+            if implicit_same is not None:
+                w_next = implicit_same
+            else:
+                w_next = _chunked_mm_T(step.mat_const, w)
 
-            if step.mat_cos._nnz() > 0:
+            if implicit_same is None and step.mat_cos._nnz() > 0:
                 w_next = w_next + cos_t.view(1, -1) * _chunked_mm_T(step.mat_cos, w)
             if step.mat_sin._nnz() > 0:
                 w_next = w_next + sin_t.view(1, -1) * _chunked_mm_T(step.mat_sin, w)

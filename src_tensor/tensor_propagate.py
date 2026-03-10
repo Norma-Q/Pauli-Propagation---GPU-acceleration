@@ -114,6 +114,22 @@ def _sparse_used_cols(mat: Tensor, row_mask: Tensor, n_cols: int) -> Tensor:
     return used
 
 
+def _implicit_same_used_cols(step: TensorSparseStep, row_mask: Tensor, n_cols: int) -> Tensor:
+    if step.same_cols is None or step.same_cols.numel() == 0 or int(row_mask.sum().item()) == 0:
+        return torch.zeros((int(n_cols),), dtype=torch.bool, device=row_mask.device)
+
+    n_same = int(step.same_cols.numel())
+    keep_same = row_mask[:n_same]
+    if not bool(keep_same.any().item()):
+        return torch.zeros((int(n_cols),), dtype=torch.bool, device=row_mask.device)
+
+    used = torch.zeros((int(n_cols),), dtype=torch.bool, device=row_mask.device)
+    same_cols = step.same_cols.to(row_mask.device)
+    keep = keep_same.to(row_mask.device)
+    used[same_cols[keep]] = True
+    return used
+
+
 def _accumulate_used_cols_chunked(mat: Tensor, row_mask_d: Tensor, col_mask_d: Tensor, chunk_size: int) -> None:
     """Accumulate used columns from a CPU sparse matrix into a GPU mask using chunks."""
     if mat._nnz() == 0:
@@ -149,6 +165,48 @@ def _accumulate_used_cols_chunked(mat: Tensor, row_mask_d: Tensor, col_mask_d: T
         idx_chunk = indices[:, start:end].to(device, non_blocking=True)
         keep = row_mask_d[idx_chunk[0]]
         col_mask_d[idx_chunk[1][keep]] = True
+
+
+def _accumulate_used_cols_same_chunked(
+    same_cols: Optional[Tensor],
+    row_mask_d: Tensor,
+    col_mask_d: Tensor,
+    chunk_size: int,
+) -> None:
+    if same_cols is None or same_cols.numel() == 0:
+        return
+
+    device = row_mask_d.device
+    n_same = int(same_cols.numel())
+    keep_same = row_mask_d[:n_same]
+    if int(keep_same.sum().item()) == 0:
+        return
+
+    nnz = n_same
+    current_chunk_size = int(chunk_size)
+    if str(device).startswith("cuda"):
+        try:
+            free_mem, _ = torch.cuda.mem_get_info(device)
+            safe_mem = max(0, free_mem - 500 * 1024 * 1024)
+            estimated_capacity = int(max(1, safe_mem // 32))
+            current_chunk_size = max(100_000, min(int(chunk_size), estimated_capacity))
+        except Exception:
+            pass
+
+    if str(device).startswith("cuda") and nnz > 100_000:
+        try:
+            if not same_cols.is_pinned():
+                same_cols = same_cols.pin_memory()
+        except Exception:
+            pass
+
+    for start in range(0, nnz, current_chunk_size):
+        end = min(start + current_chunk_size, nnz)
+        keep_chunk = keep_same[start:end]
+        if not bool(keep_chunk.any().item()):
+            continue
+        col_chunk = same_cols[start:end].to(device, non_blocking=True)
+        col_mask_d[col_chunk[keep_chunk]] = True
 
 
 def _filter_sparse_rows_cols(mat: Tensor, row_mask: Tensor, col_mask: Tensor) -> Tensor:
@@ -203,6 +261,25 @@ def _filter_sparse_rows_cols(mat: Tensor, row_mask: Tensor, col_mask: Tensor) ->
 
 
 def _filter_step_rows_cols(step: TensorSparseStep, row_mask: Tensor, col_mask: Tensor) -> TensorSparseStep:
+    same_cols = None
+    anti_same_pos = None
+    if step.same_cols is not None:
+        same_cols_dev = step.same_cols
+        keep_same = row_mask[: int(same_cols_dev.numel())].to(same_cols_dev.device)
+        col_mask_dev = col_mask.to(same_cols_dev.device)
+        col_map = torch.cumsum(col_mask_dev.to(torch.int64), dim=0) - 1
+        kept_same_cols = same_cols_dev[keep_same]
+        same_cols = col_map[kept_same_cols] if kept_same_cols.numel() > 0 else same_cols_dev[:0]
+
+        anti_pos_old = step.anti_same_pos if step.anti_same_pos is not None else same_cols_dev[:0]
+        if anti_pos_old.numel() > 0:
+            row_map_same = torch.cumsum(keep_same.to(torch.int64), dim=0) - 1
+            anti_keep = keep_same.index_select(0, anti_pos_old)
+            kept_anti_old = anti_pos_old[anti_keep]
+            anti_same_pos = row_map_same.index_select(0, kept_anti_old) if kept_anti_old.numel() > 0 else anti_pos_old[:0]
+        else:
+            anti_same_pos = same_cols_dev[:0]
+
     new_const = _filter_sparse_rows_cols(step.mat_const, row_mask, col_mask)
     new_cos = _filter_sparse_rows_cols(step.mat_cos, row_mask, col_mask)
     new_sin = _filter_sparse_rows_cols(step.mat_sin, row_mask, col_mask)
@@ -213,6 +290,8 @@ def _filter_step_rows_cols(step: TensorSparseStep, row_mask: Tensor, col_mask: T
         param_idx=step.param_idx,
         emb_idx=step.emb_idx,
         shape=(int(row_mask.sum().item()), int(col_mask.sum().item())),
+        same_cols=same_cols,
+        anti_same_pos=anti_same_pos,
     )
 
 def _step_to_device(step: TensorSparseStep, device: str) -> TensorSparseStep:
@@ -223,6 +302,8 @@ def _step_to_device(step: TensorSparseStep, device: str) -> TensorSparseStep:
         param_idx=step.param_idx,
         emb_idx=step.emb_idx,
         shape=step.shape,
+        same_cols=None if step.same_cols is None else step.same_cols.to(device),
+        anti_same_pos=None if step.anti_same_pos is None else step.anti_same_pos.to(device),
     )
 
 def _prune_sparse_by_abs(mat: Tensor, min_mat_abs: float) -> Tensor:
@@ -259,6 +340,8 @@ def _prune_step_by_abs(step: TensorSparseStep, min_mat_abs: float) -> TensorSpar
         param_idx=step.param_idx,
         emb_idx=step.emb_idx,
         shape=step.shape,
+        same_cols=step.same_cols,
+        anti_same_pos=step.anti_same_pos,
     )
 
 
@@ -295,7 +378,6 @@ def _destructive_cat(tensor_list: List[Tensor], dim: int = 0) -> Tensor:
             out[tuple(idx)] = t
             
         offset += size
-        tensor_list[i] = None  # Release reference immediately
         
     return out
 
@@ -332,14 +414,27 @@ def _process_step_chunked(
     new_x_parts = []
     new_z_parts = []
     cache_parts = []
+    same_x_parts = []
+    same_z_parts = []
+    novel_x_parts = []
+    novel_z_parts = []
+    same_cache_parts = []
+    novel_cache_parts = []
     
     # Accumulators for sparse indices
     const_indices, const_values = [], []
     cos_indices, cos_values = [], []
     sin_indices, sin_values = [], []
+    same_cols_parts = []
+    anti_same_pos_parts = []
+    implicit_sin_parts = []
+    last_step: Optional[TensorSparseStep] = None
+    implicit_mode: Optional[bool] = None
     
     row_offset = 0
     col_offset = 0
+    same_row_offset = 0
+    novel_row_offset = 0
     
     n_chunks = math.ceil(n_terms / chunk_size)
     
@@ -357,6 +452,23 @@ def _process_step_chunked(
             indices_list.append(idx)
             values_list.append(val)
 
+    def _append_implicit_same(step, same_cols_list, anti_pos_list, r_off, c_off):
+        if step.same_cols is None or step.same_cols.numel() == 0:
+            return
+        same_cols_list.append(step.same_cols.to("cpu") + int(c_off))
+        anti_pos = step.anti_same_pos
+        if anti_pos is not None and anti_pos.numel() > 0:
+            anti_pos_list.append(anti_pos.to("cpu") + int(r_off))
+
+    def _append_sparse_local(mat, indices_list, values_list, c_off, n_same_local, same_off, novel_off):
+        if mat._nnz() == 0:
+            return
+        if not mat.is_coalesced():
+            mat = mat.coalesce()
+        idx = mat.indices().to("cpu")
+        val = mat.values().to("cpu")
+        indices_list.append((idx, val, int(c_off), int(n_same_local), int(same_off), int(novel_off)))
+
     for i in range(n_chunks):
         start = i * chunk_size
         end = min(start + chunk_size, n_terms)
@@ -370,28 +482,77 @@ def _process_step_chunked(
             chunk_kwargs['coeffs_cache'] = chunk_kwargs['coeffs_cache'][start:end].to(device)
             
         nx, nz, step, cache = builder_fn(x_mask=x_chunk, z_mask=z_chunk, device=device, step_device=device, **chunk_kwargs)
+        last_step = step
+
+        step_is_implicit = step.same_cols is not None
+        if implicit_mode is None:
+            implicit_mode = bool(step_is_implicit)
+        elif bool(implicit_mode) != bool(step_is_implicit):
+            raise RuntimeError("Chunked step assembly cannot mix implicit and explicit step formats.")
         
         # 2. Collect Results (Move back to CPU immediately)
-        new_x_parts.append(nx.to(output_device))
-        new_z_parts.append(nz.to(output_device))
-        if cache is not None:
-            cache_parts.append(cache.to(output_device))
+        nx_cpu = nx.to(output_device)
+        nz_cpu = nz.to(output_device)
+        cache_cpu = cache.to(output_device) if cache is not None else None
+
+        if step_is_implicit:
+            n_same_local = int(step.same_cols.numel())
+            same_x_parts.append(nx_cpu[:n_same_local])
+            same_z_parts.append(nz_cpu[:n_same_local])
+            novel_x_parts.append(nx_cpu[n_same_local:])
+            novel_z_parts.append(nz_cpu[n_same_local:])
+            if cache_cpu is not None:
+                same_cache_parts.append(cache_cpu[:n_same_local])
+                novel_cache_parts.append(cache_cpu[n_same_local:])
+        else:
+            new_x_parts.append(nx_cpu)
+            new_z_parts.append(nz_cpu)
+            if cache_cpu is not None:
+                cache_parts.append(cache_cpu)
         
         # 3. Accumulate Sparse Matrices
-        _append_sparse(step.mat_const, const_indices, const_values, row_offset, col_offset)
-        _append_sparse(step.mat_cos, cos_indices, cos_values, row_offset, col_offset)
-        _append_sparse(step.mat_sin, sin_indices, sin_values, row_offset, col_offset)
-        
-        row_offset += nx.shape[0]
+        if step_is_implicit:
+            if step.mat_const._nnz() > 0 or step.mat_cos._nnz() > 0:
+                raise RuntimeError("Implicit rotation step unexpectedly contains explicit const/cos matrices.")
+            n_same_local = int(step.same_cols.numel())
+            _append_sparse_local(
+                step.mat_sin,
+                implicit_sin_parts,
+                sin_values,
+                col_offset,
+                n_same_local,
+                same_row_offset,
+                novel_row_offset,
+            )
+            _append_implicit_same(step, same_cols_parts, anti_same_pos_parts, same_row_offset, col_offset)
+            same_row_offset += n_same_local
+            novel_row_offset += int(nx.shape[0]) - n_same_local
+        else:
+            _append_sparse(step.mat_const, const_indices, const_values, row_offset, col_offset)
+            _append_sparse(step.mat_cos, cos_indices, cos_values, row_offset, col_offset)
+            _append_sparse(step.mat_sin, sin_indices, sin_values, row_offset, col_offset)
+            row_offset += nx.shape[0]
         col_offset += (end - start)
 
     # 4. Assemble Final Tensors
-    full_new_x = _destructive_cat(new_x_parts, dim=0)
-    new_x_parts = None
-    full_new_z = _destructive_cat(new_z_parts, dim=0)
-    new_z_parts = None
-    full_cache = _destructive_cat(cache_parts, dim=0) if cache_parts else None
-    cache_parts = None
+    if bool(implicit_mode):
+        x_parts = [*same_x_parts, *novel_x_parts]
+        z_parts = [*same_z_parts, *novel_z_parts]
+        full_new_x = _destructive_cat(x_parts, dim=0)
+        full_new_z = _destructive_cat(z_parts, dim=0)
+        full_cache = None
+        if same_cache_parts or novel_cache_parts:
+            cache_merge = [*same_cache_parts, *novel_cache_parts]
+            full_cache = _destructive_cat(cache_merge, dim=0)
+        same_x_parts = same_z_parts = novel_x_parts = novel_z_parts = None
+        same_cache_parts = novel_cache_parts = None
+    else:
+        full_new_x = _destructive_cat(new_x_parts, dim=0)
+        new_x_parts = None
+        full_new_z = _destructive_cat(new_z_parts, dim=0)
+        new_z_parts = None
+        full_cache = _destructive_cat(cache_parts, dim=0) if cache_parts else None
+        cache_parts = None
     
     def _concat_sparse(indices_list, values_list, shape):
         if not indices_list:
@@ -406,7 +567,7 @@ def _process_step_chunked(
         
         return torch.sparse_coo_tensor(all_indices, all_values, size=shape, device=step_device)
 
-    full_shape = (row_offset, col_offset)
+    full_shape = (same_row_offset + novel_row_offset, col_offset) if bool(implicit_mode) else (row_offset, col_offset)
 
     mat_const = _concat_sparse(const_indices, const_values, full_shape)
     const_indices, const_values = None, None
@@ -414,16 +575,44 @@ def _process_step_chunked(
     mat_cos = _concat_sparse(cos_indices, cos_values, full_shape)
     cos_indices, cos_values = None, None
 
-    mat_sin = _concat_sparse(sin_indices, sin_values, full_shape)
+    if bool(implicit_mode):
+        remapped_sin_indices = []
+        remapped_sin_values = []
+        total_same = int(same_row_offset)
+        for idx, val, c_off, n_same_local, same_off, novel_off in implicit_sin_parts:
+            local_idx = idx.clone()
+            local_rows = local_idx[0]
+            same_mask_local = local_rows < int(n_same_local)
+            if bool(same_mask_local.any().item()):
+                local_idx[0][same_mask_local] = local_rows[same_mask_local] + int(same_off)
+            if bool((~same_mask_local).any().item()):
+                local_idx[0][~same_mask_local] = (
+                    (local_rows[~same_mask_local] - int(n_same_local)) + total_same + int(novel_off)
+                )
+            local_idx[1] += int(c_off)
+            remapped_sin_indices.append(local_idx)
+            remapped_sin_values.append(val)
+        mat_sin = _concat_sparse(remapped_sin_indices, remapped_sin_values, full_shape)
+        implicit_sin_parts = None
+    else:
+        mat_sin = _concat_sparse(sin_indices, sin_values, full_shape)
     sin_indices, sin_values = None, None
+
+    full_same_cols = _destructive_cat(same_cols_parts, dim=0).to(step_device) if same_cols_parts else None
+    full_anti_same_pos = _destructive_cat(anti_same_pos_parts, dim=0).to(step_device) if anti_same_pos_parts else None
+    same_cols_parts, anti_same_pos_parts = None, None
+    if last_step is None:
+        raise RuntimeError("Chunked step assembly produced no chunks.")
 
     full_step = TensorSparseStep(
         mat_const=mat_const,
         mat_cos=mat_cos,
         mat_sin=mat_sin,
-        param_idx=step.param_idx,
-        emb_idx=step.emb_idx,
-        shape=full_shape
+        param_idx=last_step.param_idx,
+        emb_idx=last_step.emb_idx,
+        shape=full_shape,
+        same_cols=full_same_cols,
+        anti_same_pos=full_anti_same_pos,
     )
     
     return full_new_x, full_new_z, full_step, full_cache
@@ -490,6 +679,7 @@ def propagate_surrogate_tensor(
         coeffs_cache = (coeff_init / coeff_scale) # Keep on CPU
         min_abs_internal = float(min_abs) / coeff_scale
         thetas_t = torch.as_tensor(thetas, dtype=coeff_init.dtype, device=compute_device)
+        assert thetas_t is not None
         if thetas_t.numel() == 0:
             thetas_t = torch.zeros(1, dtype=coeff_init.dtype, device=compute_device)
 
@@ -714,6 +904,13 @@ def zero_filter_tensor_backprop_with_keep_mask(
                     row_mask_d = row_mask.to(compute_device, non_blocking=True)
                     col_mask_d = torch.zeros((n_cols,), dtype=torch.bool, device=compute_device)
 
+                    if old_step.same_nnz() > 0:
+                        _accumulate_used_cols_same_chunked(
+                            old_step.same_cols,
+                            row_mask_d,
+                            col_mask_d,
+                            used_cols_chunk_size,
+                        )
                     if nnz_const > 0:
                         _accumulate_used_cols_chunked(mat_const, row_mask_d, col_mask_d, used_cols_chunk_size)
                     if nnz_cos > 0:
@@ -724,13 +921,17 @@ def zero_filter_tensor_backprop_with_keep_mask(
                     col_mask = col_mask_d.to(row_mask.device, non_blocking=True)
                 except RuntimeError as e:
                     print(f"Warning: GPU used-cols failed, fallback to CPU. Error: {e}")
-                    col_mask = _sparse_used_cols(mat_const, row_mask, n_cols)
+                    col_mask = _implicit_same_used_cols(old_step, row_mask, n_cols)
+                    if int(mat_const._nnz()) > 0:
+                        col_mask |= _sparse_used_cols(mat_const, row_mask, n_cols)
                     if nnz_cos > 0:
                         col_mask |= _sparse_used_cols(mat_cos, row_mask, n_cols)
                     if nnz_sin > 0:
                         col_mask |= _sparse_used_cols(mat_sin, row_mask, n_cols)
             else:
-                col_mask = _sparse_used_cols(mat_const, row_mask, n_cols)
+                col_mask = _implicit_same_used_cols(old_step, row_mask, n_cols)
+                if int(mat_const._nnz()) > 0:
+                    col_mask |= _sparse_used_cols(mat_const, row_mask, n_cols)
                 if nnz_cos > 0:
                     col_mask |= _sparse_used_cols(mat_cos, row_mask, n_cols)
                 if nnz_sin > 0:
@@ -749,6 +950,8 @@ def zero_filter_tensor_backprop_with_keep_mask(
             param_idx=old_step.param_idx,
             emb_idx=old_step.emb_idx,
             shape=old_step.shape,
+            same_cols=old_step.same_cols,
+            anti_same_pos=old_step.anti_same_pos,
         )
 
         steps[i] = compact_sparse_step_chunked(

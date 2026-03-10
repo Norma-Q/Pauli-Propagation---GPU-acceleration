@@ -6,7 +6,7 @@ import random
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any, Dict, List, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from make_maxcut_graph import _plot_graph, _simulated_annealing_maxcut
 
@@ -242,6 +242,7 @@ def _build_train_cmd(
     init_mode: str,
     mixer_odd_start: float,
     mixer_odd_end: float,
+    resume_checkpoint: Optional[Path],
 ) -> List[str]:
     cmd = [
         python_exe,
@@ -287,7 +288,69 @@ def _build_train_cmd(
         cmd.extend(["--save-every", str(int(save_every))])
     if bool(no_build_min_abs):
         cmd.append("--no-build-min-abs")
+    if resume_checkpoint is not None:
+        cmd.extend(["--resume", str(resume_checkpoint)])
     return cmd
+
+
+def _build_resume_index(
+    *,
+    summary_path: Path,
+    source_n_qubits: int,
+    p_layers_filter: Optional[List[int]] = None,
+) -> Dict[str, Dict[Any, Path]]:
+    payload = json.loads(summary_path.read_text(encoding="utf-8"))
+    records = payload.get("records", []) if isinstance(payload, dict) else []
+    if not isinstance(records, list):
+        return {"best_per_p": {}, "by_graph": {}}
+
+    p_filter = set(int(x) for x in p_layers_filter) if p_layers_filter is not None else None
+
+    best_per_p: Dict[int, Tuple[float, Path]] = {}
+    by_graph: Dict[Tuple[int, int], Tuple[float, Path]] = {}
+
+    for rec in records:
+        if not isinstance(rec, dict):
+            continue
+        if str(rec.get("status", "")) != "ok":
+            continue
+        if int(rec.get("n_qubits", -1)) != int(source_n_qubits):
+            continue
+
+        p_layers = int(rec.get("p_layers", -1))
+        if p_layers < 0:
+            continue
+        if p_filter is not None and p_layers not in p_filter:
+            continue
+
+        graph_index = int(rec.get("graph_index", -1))
+        checkpoint = Path(str(rec.get("checkpoint", "")).strip())
+        report_path = Path(str(rec.get("report", "")).strip())
+        if str(checkpoint).strip() == "" or not checkpoint.exists():
+            continue
+
+        score = float("-inf")
+        if report_path.exists():
+            try:
+                report = json.loads(report_path.read_text(encoding="utf-8"))
+                score = float(report.get("training", {}).get("best_expected_cut", float("-inf")))
+            except Exception:
+                score = float("-inf")
+
+        prev = best_per_p.get(p_layers)
+        if prev is None or score > prev[0]:
+            best_per_p[p_layers] = (score, checkpoint.resolve())
+
+        if graph_index >= 0:
+            key = (p_layers, graph_index)
+            prev_g = by_graph.get(key)
+            if prev_g is None or score > prev_g[0]:
+                by_graph[key] = (score, checkpoint.resolve())
+
+    return {
+        "best_per_p": {int(p): path for p, (_score, path) in best_per_p.items()},
+        "by_graph": {(int(p), int(g)): path for (p, g), (_score, path) in by_graph.items()},
+    }
 
 
 def parse_args() -> argparse.Namespace:
@@ -328,6 +391,27 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--log-every", type=int, default=10)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--max-tries", type=int, default=3000)
+    p.add_argument(
+        "--target-density",
+        type=float,
+        default=-1.0,
+        help=(
+            "Override graph edge density for generated graphs. "
+            "Use negative value to keep base density behavior."
+        ),
+    )
+    p.add_argument(
+        "--edge-scale",
+        type=float,
+        default=1.0,
+        help="Scale factor applied to chosen density (after target-density or base-density).",
+    )
+    p.add_argument(
+        "--max-edges",
+        type=int,
+        default=0,
+        help="Optional hard cap on number of edges per generated graph (0 disables cap).",
+    )
     p.add_argument("--output-dir", type=str, default="QAOA/artifacts/weight_sweep")
     p.add_argument("--run-prefix", type=str, default="qaoa_pps")
     p.add_argument(
@@ -335,6 +419,28 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default="",
         help="Python executable used for spawned train jobs. Defaults to current interpreter.",
+    )
+    p.add_argument(
+        "--resume-source-summary-json",
+        type=str,
+        default="",
+        help="Optional source sweep summary json for warm-start checkpoints (e.g., 30q runs).",
+    )
+    p.add_argument(
+        "--resume-source-n-qubits",
+        type=int,
+        default=30,
+        help="Source n_qubits used when selecting warm-start checkpoints from resume summary.",
+    )
+    p.add_argument(
+        "--resume-match-mode",
+        type=str,
+        default="best-per-p",
+        choices=["best-per-p", "graph-index"],
+        help=(
+            "How to match resume checkpoint from source summary: "
+            "best-per-p uses best run for each p; graph-index uses (p,graph_index) if available."
+        ),
     )
     p.add_argument("--skip-training", action="store_true", help="Only generate graphs + plot + annealing report.")
     p.add_argument("--title-prefix", type=str, default="MaxCut Graph")
@@ -385,10 +491,35 @@ def main() -> None:
         raise FileNotFoundError(f"Training script not found: {train_script}")
     train_python_exe = str(args.python_exe).strip() or str(sys.executable)
 
+    resume_index: Dict[str, Dict[Any, Path]] = {"best_per_p": {}, "by_graph": {}}
+    if str(args.resume_source_summary_json).strip() != "":
+        resume_summary_path = Path(str(args.resume_source_summary_json)).resolve()
+        if not resume_summary_path.exists():
+            raise FileNotFoundError(f"resume-source-summary-json not found: {resume_summary_path}")
+        resume_index = _build_resume_index(
+            summary_path=resume_summary_path,
+            source_n_qubits=int(args.resume_source_n_qubits),
+            p_layers_filter=p_layers_list,
+        )
+        print(
+            "Warm-start resume enabled: "
+            f"source_summary={resume_summary_path}, source_n_qubits={int(args.resume_source_n_qubits)}, "
+            f"mode={str(args.resume_match_mode)}"
+        )
+        print(
+            f"Resume index size: best_per_p={len(resume_index['best_per_p'])}, "
+            f"by_graph={len(resume_index['by_graph'])}"
+        )
+
     print(f"Base graph: n={base_n_qubits}, |E|={base_n_edges}, density={base_density:.6f}")
     print(f"Sweep n_qubits={n_qubits_list}")
     print(f"Generate graphs per n: {int(args.num_graphs)} | p-layers: {p_layers_list}")
     print(f"Weight modes: {weight_modes} | max_weights: {max_weights}")
+    if float(args.target_density) >= 0.0:
+        print(f"Graph density override: target_density={float(args.target_density):.6f}")
+    print(f"Graph density scale: edge_scale={float(args.edge_scale):.6f}")
+    if int(args.max_edges) > 0:
+        print(f"Graph edge cap: max_edges={int(args.max_edges)}")
 
     graph_meta_by_q: Dict[str, Dict[int, Dict[str, Any]]] = {}
     generated_graphs_by_q: Dict[str, List[Path]] = {}
@@ -410,9 +541,19 @@ def main() -> None:
             graph_source = "sampled_like_base_edges"
         else:
             complete_edges = int(n_qubits) * (int(n_qubits) - 1) // 2
-            n_edges = int(round(base_density * complete_edges))
+            density = float(base_density)
+            if float(args.target_density) >= 0.0:
+                density = float(args.target_density)
+            density = max(0.0, min(1.0, density * float(args.edge_scale)))
+            n_edges = int(round(density * complete_edges))
             n_edges = max(int(n_qubits) - 1, min(complete_edges, int(n_edges)))
             graph_source = "sampled_like_base_density"
+            if float(args.target_density) >= 0.0:
+                graph_source = "sampled_target_density"
+
+        if int(args.max_edges) > 0:
+            n_edges = min(int(n_edges), int(args.max_edges))
+            n_edges = max(int(n_qubits) - 1, int(n_edges))
 
         generated_graphs: List[Path] = []
         graph_meta: Dict[int, Dict[str, Any]] = {}
@@ -498,6 +639,13 @@ def main() -> None:
                         )
                         run_seed = int(args.seed) + int(n_qubits) * 10_000 + g_idx * 1_000 + int(p_layers) * 10 + int(max_weight)
 
+                        resume_checkpoint: Optional[Path] = None
+                        if len(resume_index["best_per_p"]) > 0:
+                            if str(args.resume_match_mode) == "graph-index":
+                                resume_checkpoint = resume_index["by_graph"].get((int(p_layers), int(g_idx)))
+                            if resume_checkpoint is None:
+                                resume_checkpoint = resume_index["best_per_p"].get(int(p_layers))
+
                         cmd = _build_train_cmd(
                             python_exe=train_python_exe,
                             train_script=train_script,
@@ -521,6 +669,7 @@ def main() -> None:
                             init_mode=str(args.init_mode),
                             mixer_odd_start=float(args.mixer_odd_start),
                             mixer_odd_end=float(args.mixer_odd_end),
+                            resume_checkpoint=resume_checkpoint,
                         )
 
                         print("\n" + "=" * 100)
@@ -528,6 +677,8 @@ def main() -> None:
                             f"Run q={n_qubits}, graph={g_idx}, p={p_layers}, mode={weight_mode}, "
                             f"max_weight={max_weight} -> {run_name}"
                         )
+                        if resume_checkpoint is not None:
+                            print(f"resume checkpoint: {resume_checkpoint}")
                         print(" ".join(cmd))
 
                         if args.dry_run:
@@ -553,6 +704,7 @@ def main() -> None:
                                 "max_weight": int(max_weight),
                                 "run_name": run_name,
                                 "seed": int(run_seed),
+                                "resume_checkpoint": (None if resume_checkpoint is None else str(resume_checkpoint)),
                                 "status": status,
                                 "return_code": int(return_code),
                                 "checkpoint": str(ckpt_path),

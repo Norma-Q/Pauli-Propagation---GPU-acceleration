@@ -63,6 +63,10 @@ class TensorSparseStep:
     Each step represents:
         v_out = M_const v_in + cos(theta) M_cos v_in + sin(theta) M_sin v_in
     where M_* are sparse matrices with embedded phase signs.
+
+    For large Pauli rotation steps, unchanged branches may be stored implicitly
+    via `same_cols` / `anti_same_pos` instead of materializing `mat_const` and
+    `mat_cos`.
     """
     mat_const: torch.Tensor
     mat_cos: torch.Tensor
@@ -70,6 +74,21 @@ class TensorSparseStep:
     param_idx: int
     shape: Tuple[int, int]  # [수정] 기본값이 없는 필드를 위로 올림
     emb_idx: int = -1       # [수정] 기본값이 있는 필드를 가장 아래로 배치
+    same_cols: Optional[torch.Tensor] = None
+    anti_same_pos: Optional[torch.Tensor] = None
+
+    def same_nnz(self) -> int:
+        if self.same_cols is None:
+            return 0
+        return int(self.same_cols.numel())
+
+    def anti_same_nnz(self) -> int:
+        if self.anti_same_pos is None:
+            return 0
+        return int(self.anti_same_pos.numel())
+
+    def is_implicit_rotation(self) -> bool:
+        return self.same_cols is not None
 
     def to(self, device: Any) -> "TensorSparseStep":
         return TensorSparseStep(
@@ -79,6 +98,8 @@ class TensorSparseStep:
             param_idx=self.param_idx,
             shape=self.shape,
             emb_idx=self.emb_idx,
+            same_cols=None if self.same_cols is None else self.same_cols.to(device),
+            anti_same_pos=None if self.anti_same_pos is None else self.anti_same_pos.to(device),
         )
 
 

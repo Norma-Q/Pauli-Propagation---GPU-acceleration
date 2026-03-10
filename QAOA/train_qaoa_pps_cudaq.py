@@ -136,6 +136,8 @@ def _extract_compile_resources(program: Any) -> Dict[str, Any]:
     nnz_const_total = 0
     nnz_cos_total = 0
     nnz_sin_total = 0
+    implicit_same_total = 0
+    implicit_anti_same_total = 0
     max_step_rows = 0
     max_step_cols = 0
     max_step_nnz_total = 0
@@ -148,6 +150,8 @@ def _extract_compile_resources(program: Any) -> Dict[str, Any]:
         nnz_const_total += n_const
         nnz_cos_total += n_cos
         nnz_sin_total += n_sin
+        implicit_same_total += int(step.same_nnz())
+        implicit_anti_same_total += int(step.anti_same_nnz())
 
         rows, cols = step.shape
         max_step_rows = max(max_step_rows, int(rows))
@@ -155,6 +159,7 @@ def _extract_compile_resources(program: Any) -> Dict[str, Any]:
         max_step_nnz_total = max(max_step_nnz_total, int(step_total))
 
     nnz_total = int(nnz_const_total + nnz_cos_total + nnz_sin_total)
+    effective_work_total = int(nnz_total + implicit_same_total + implicit_anti_same_total)
     density_proxy = float(nnz_total) / float(max(1, n_steps * max_step_rows * max_step_cols))
 
     return {
@@ -164,7 +169,10 @@ def _extract_compile_resources(program: Any) -> Dict[str, Any]:
         "nnz_cos_total": int(nnz_cos_total),
         "nnz_sin_total": int(nnz_sin_total),
         "nnz_total": int(nnz_total),
+        "implicit_same_total": int(implicit_same_total),
+        "implicit_anti_same_total": int(implicit_anti_same_total),
         "gpu_work_proxy_nnz_total": int(nnz_total),
+        "effective_work_proxy_total": int(effective_work_total),
         "max_step_rows": int(max_step_rows),
         "max_step_cols": int(max_step_cols),
         "max_step_nnz_total": int(max_step_nnz_total),

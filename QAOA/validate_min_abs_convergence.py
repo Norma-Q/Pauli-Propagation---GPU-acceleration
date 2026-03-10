@@ -176,12 +176,17 @@ def _extract_compile_resources(program: Any) -> Dict[str, Any]:
     nnz_const_total = 0
     nnz_cos_total = 0
     nnz_sin_total = 0
+    implicit_same_total = 0
+    implicit_anti_same_total = 0
     for step in psum.steps:
         nnz_const_total += int(step.mat_const._nnz())
         nnz_cos_total += int(step.mat_cos._nnz())
         nnz_sin_total += int(step.mat_sin._nnz())
+        implicit_same_total += int(step.same_nnz())
+        implicit_anti_same_total += int(step.anti_same_nnz())
 
     nnz_total = int(nnz_const_total + nnz_cos_total + nnz_sin_total)
+    effective_work_total = int(nnz_total + implicit_same_total + implicit_anti_same_total)
     return {
         "terms_after_zero_filter": int(n_terms),
         "n_steps": int(n_steps),
@@ -189,6 +194,9 @@ def _extract_compile_resources(program: Any) -> Dict[str, Any]:
         "nnz_const_total": int(nnz_const_total),
         "nnz_cos_total": int(nnz_cos_total),
         "nnz_sin_total": int(nnz_sin_total),
+        "implicit_same_total": int(implicit_same_total),
+        "implicit_anti_same_total": int(implicit_anti_same_total),
+        "effective_work_proxy_total": int(effective_work_total),
     }
 
 
