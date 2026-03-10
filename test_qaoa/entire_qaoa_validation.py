@@ -31,7 +31,7 @@ from qaoa_surrogate_common import (
 from src_tensor.api import compile_expval_program
 
 
-DEFAULT_THRESHOLDS = [1e-2, 5e-3, 1e-3, 5e-4, 1e-4, 5e-5, 1e-5]
+DEFAULT_THRESHOLDS = [1e-2, 5e-3, 1e-3, 5e-4, 1e-4]
 
 
 def parse_args() -> argparse.Namespace:
@@ -135,7 +135,7 @@ def _evaluate_expected_cut(
 	zz_obj = build_maxcut_observable(n_qubits=n_qubits, edges=edges)
 
 	preset = "hybrid" if device.startswith("cuda") else "cpu"
-	preset_overrides = default_cpu_exact_overrides() if preset == "cpu" else {'chunk_size': 30_000_000}
+	preset_overrides = default_cpu_exact_overrides() if preset == "cpu" else {'chunk_size': 20_000_000}
 
 	program = compile_expval_program(
 		circuit=circuit,
@@ -157,7 +157,7 @@ def _plot_validation(
 	expected_cuts: list[float],
 	ok_mask: list[bool],
 ) -> None:
-	x = np.asarray(thresholds, dtype=np.float64)
+	x = np.arange(len(thresholds), dtype=np.int64)
 	y = np.asarray(expected_cuts, dtype=np.float64)
 	ok = np.asarray(ok_mask, dtype=bool)
 
@@ -167,9 +167,9 @@ def _plot_validation(
 	if np.any(~ok):
 		ax.scatter(x[~ok], np.zeros_like(x[~ok]), marker="x", s=60, label="failed")
 
-	ax.set_xscale("log")
-	ax.invert_xaxis()
 	ax.set_xlabel("coeff threshold (build_min_abs)")
+	ax.set_xticks(x)
+	ax.set_xticklabels([f"{th:.0e}" for th in thresholds], rotation=30)
 	ax.set_ylabel("Expected cut")
 	ax.set_title("Min-abs validation for trained QAOA parameters")
 	if np.any(ok):
