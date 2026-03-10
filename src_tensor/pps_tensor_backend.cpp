@@ -864,6 +864,324 @@ build_pauli_rotation_step_mw_cpp(const torch::Tensor& gx_words, const torch::Ten
                          coeffs_cache_out);
 }
 
+static std::tuple<torch::Tensor, torch::Tensor,
+                  torch::Tensor, torch::Tensor,
+                  torch::Tensor, torch::Tensor, torch::Tensor,
+                  py::object>
+build_pauli_rotation_step_implicit_cpp(int64_t gx, int64_t gz, int64_t param_idx, const torch::Tensor& x_mask,
+                                       const torch::Tensor& z_mask, const py::object& coeff_dtype_obj,
+                                       c10::optional<double> min_abs, c10::optional<torch::Tensor> coeffs_cache,
+                                       c10::optional<torch::Tensor> thetas_t, int64_t max_weight,
+                                       double weight_x, double weight_y, double weight_z) {
+  require_1d_i64(x_mask, "x_mask");
+  require_1d_i64(z_mask, "z_mask");
+  auto device = x_mask.device();
+  auto coeff_dtype = coerce_scalar_type(coeff_dtype_obj);
+
+  auto gx_t = torch::scalar_tensor(gx, torch::TensorOptions().dtype(torch::kInt64).device(device));
+  auto gz_t = torch::scalar_tensor(gz, torch::TensorOptions().dtype(torch::kInt64).device(device));
+
+  auto symp = popcount_u64((x_mask & gz_t) ^ (z_mask & gx_t)) & 1;
+  auto comm_idx = torch::nonzero(symp.eq(0)).flatten().to(torch::kInt64);
+  auto anti_idx = torch::nonzero(symp.eq(1)).flatten().to(torch::kInt64);
+
+  auto anti_x = x_mask.index_select(0, anti_idx);
+  auto anti_z = z_mask.index_select(0, anti_idx);
+  auto sin_x = anti_x ^ gx_t;
+  auto sin_z = anti_z ^ gz_t;
+
+  auto same_idx = comm_idx;
+  auto cos_idx = anti_idx;
+  auto sin_idx = anti_idx;
+
+  torch::Tensor sin_sign;
+  torch::Tensor coeffs_prev;
+  bool do_prune = min_abs.has_value();
+  torch::Tensor cos_t;
+  torch::Tensor sin_t;
+
+  if (do_prune) {
+    if (!coeffs_cache.has_value() || !thetas_t.has_value()) {
+      throw std::runtime_error("min_abs provided but coeffs_cache/thetas_t is None");
+    }
+    coeffs_prev = coeffs_cache.value();
+    auto theta = thetas_t.value().index({param_idx});
+    cos_t = torch::cos(theta);
+    sin_t = torch::sin(theta);
+
+    auto mask_comm = coeffs_prev.index_select(0, comm_idx).abs() >= min_abs.value();
+    auto mask_cos = (coeffs_prev.index_select(0, anti_idx) * cos_t).abs() >= min_abs.value();
+    auto sin_sign_all = phase_sign_tensor(anti_x, anti_z, gx_t, gz_t).to(coeffs_prev.dtype());
+    auto mask_sin = (coeffs_prev.index_select(0, anti_idx) * sin_t * sin_sign_all).abs() >= min_abs.value();
+
+    auto comm_keep = torch::nonzero(mask_comm).flatten().to(torch::kInt64);
+    auto cos_keep = torch::nonzero(mask_cos).flatten().to(torch::kInt64);
+    auto sin_keep = torch::nonzero(mask_sin).flatten().to(torch::kInt64);
+
+    same_idx = torch::cat({comm_idx.index_select(0, comm_keep), anti_idx.index_select(0, cos_keep)}, 0);
+    cos_idx = anti_idx.index_select(0, cos_keep);
+    sin_x = sin_x.index_select(0, sin_keep);
+    sin_z = sin_z.index_select(0, sin_keep);
+    sin_idx = anti_idx.index_select(0, sin_keep);
+    sin_sign = sin_sign_all.index_select(0, sin_keep);
+  } else {
+    same_idx = torch::cat({comm_idx, anti_idx}, 0);
+    cos_idx = anti_idx;
+    sin_sign = phase_sign_tensor(anti_x, anti_z, gx_t, gz_t);
+  }
+
+  auto same_x = x_mask.index_select(0, same_idx);
+  auto same_z = z_mask.index_select(0, same_idx);
+  auto n_same = same_idx.numel();
+
+  auto same_keys = torch::stack({same_x, same_z}, 1);
+  auto sin_keys = torch::stack({sin_x, sin_z}, 1);
+  auto all_keys = torch::cat({same_keys, sin_keys}, 0);
+
+  py::module torch_mod = py::module::import("torch");
+  py::tuple uniq_out = torch_mod.attr("unique")(all_keys, py::arg("dim") = 0, py::arg("return_inverse") = true,
+                                                  py::arg("sorted") = false)
+                           .cast<py::tuple>();
+  torch::Tensor uniq = uniq_out[0].cast<torch::Tensor>();
+  torch::Tensor inv = uniq_out[1].cast<torch::Tensor>();
+
+  auto same_inv = inv.slice(0, 0, n_same).to(torch::kInt64);
+  auto sin_inv = inv.slice(0, n_same).to(torch::kInt64);
+  auto n_uniq = uniq.size(0);
+
+  auto keyid_to_same = torch::full({n_uniq}, -1, torch::TensorOptions().dtype(torch::kInt64).device(device));
+  if (n_same > 0) {
+    keyid_to_same.index_put_({same_inv}, torch::arange(n_same, torch::TensorOptions().dtype(torch::kInt64).device(device)));
+  }
+
+  auto row_sin = keyid_to_same.index_select(0, sin_inv);
+  auto novel_mask = row_sin.lt(0);
+  torch::Tensor novel_key_ids = torch::zeros({0}, torch::TensorOptions().dtype(torch::kInt64).device(device));
+  if (sin_inv.numel() > 0 && novel_mask.any().item<bool>()) {
+    py::tuple novel_out = torch_mod.attr("unique")(sin_inv.index({novel_mask}), py::arg("sorted") = false,
+                                                    py::arg("return_inverse") = true)
+                             .cast<py::tuple>();
+    novel_key_ids = novel_out[0].cast<torch::Tensor>().to(torch::kInt64);
+    auto novel_inv = novel_out[1].cast<torch::Tensor>().to(torch::kInt64);
+    auto novel_rows = novel_inv + static_cast<int64_t>(n_same);
+    row_sin.index_put_({novel_mask}, novel_rows);
+  }
+
+  auto novel_keys = novel_key_ids.numel() > 0 ? uniq.index_select(0, novel_key_ids) : uniq.slice(0, 0, 0);
+  auto new_x = torch::cat({same_x, novel_keys.select(1, 0)}, 0);
+  auto new_z = torch::cat({same_z, novel_keys.select(1, 1)}, 0);
+  auto anti_same_pos = torch::arange(n_same - cos_idx.numel(), n_same,
+                                     torch::TensorOptions().dtype(torch::kInt64).device(device));
+  auto val_sin = sin_sign.to(coeff_dtype);
+
+  py::object coeffs_cache_out = py::none();
+  if (do_prune) {
+    auto same_comm_n = same_idx.numel() - cos_idx.numel();
+    auto same_vals = torch::cat({
+        coeffs_prev.index_select(0, same_idx.slice(0, 0, same_comm_n)),
+        coeffs_prev.index_select(0, cos_idx) * cos_t,
+    }, 0);
+    std::vector<int64_t> out_sz{new_x.numel()};
+    auto out = torch::zeros(out_sz,
+                            torch::TensorOptions().dtype(coeffs_prev.dtype()).device(coeffs_prev.device()));
+    if (same_vals.numel() > 0) {
+      out.index_put_({torch::arange(n_same, torch::TensorOptions().dtype(torch::kInt64).device(device))}, same_vals);
+    }
+    if (sin_idx.numel() > 0) {
+      out.index_add_(0, row_sin, coeffs_prev.index_select(0, sin_idx) * sin_t * sin_sign.to(coeffs_prev.dtype()));
+    }
+    coeffs_cache_out = py::cast(out);
+  }
+
+  auto mask = truncate_terms_mask(new_x, new_z, max_weight, weight_x, weight_y, weight_z);
+  if (!(mask.all().item<bool>())) {
+    auto row_map = torch::cumsum(mask.to(torch::kInt64), 0) - 1;
+    auto keep_same = mask.slice(0, 0, n_same);
+    same_idx = same_idx.index({keep_same});
+    if (anti_same_pos.numel() > 0) {
+      auto anti_keep = keep_same.index_select(0, anti_same_pos);
+      auto kept_anti = anti_same_pos.index({anti_keep});
+      anti_same_pos = row_map.index_select(0, kept_anti);
+    }
+    if (row_sin.numel() > 0) {
+      auto keep_rows = mask.index_select(0, row_sin);
+      auto keep_idx = torch::nonzero(keep_rows).flatten().to(torch::kInt64);
+      row_sin = row_sin.index_select(0, keep_idx);
+      sin_idx = sin_idx.index_select(0, keep_idx);
+      val_sin = val_sin.index_select(0, keep_idx);
+      row_sin = row_map.index_select(0, row_sin);
+    }
+    auto out_idx = torch::nonzero(mask).flatten().to(torch::kInt64);
+    new_x = new_x.index_select(0, out_idx);
+    new_z = new_z.index_select(0, out_idx);
+    if (do_prune) {
+      auto out_coeffs = coeffs_cache_out.cast<torch::Tensor>();
+      out_coeffs = out_coeffs.index_select(0, out_idx);
+      coeffs_cache_out = py::cast(out_coeffs);
+    }
+  }
+
+  return std::make_tuple(new_x, new_z, same_idx, anti_same_pos, row_sin, sin_idx, val_sin, coeffs_cache_out);
+}
+
+static std::tuple<torch::Tensor, torch::Tensor,
+                  torch::Tensor, torch::Tensor,
+                  torch::Tensor, torch::Tensor, torch::Tensor,
+                  py::object>
+build_pauli_rotation_step_implicit_mw_cpp(const torch::Tensor& gx_words, const torch::Tensor& gz_words, int64_t param_idx,
+                                          const torch::Tensor& x_mask, const torch::Tensor& z_mask,
+                                          const py::object& coeff_dtype_obj, c10::optional<double> min_abs,
+                                          c10::optional<torch::Tensor> coeffs_cache, c10::optional<torch::Tensor> thetas_t,
+                                          int64_t max_weight, double weight_x, double weight_y, double weight_z) {
+  require_2d_i64(x_mask, "x_mask");
+  require_2d_i64(z_mask, "z_mask");
+  if (x_mask.sizes() != z_mask.sizes()) {
+    throw std::runtime_error("x_mask/z_mask shape mismatch");
+  }
+  auto device = x_mask.device();
+  auto coeff_dtype = coerce_scalar_type(coeff_dtype_obj);
+  auto gx_t = gx_words.unsqueeze(0);
+  auto gz_t = gz_words.unsqueeze(0);
+
+  auto symp = popcount_u64((torch::bitwise_and(x_mask, gz_t)) ^ (torch::bitwise_and(z_mask, gx_t))).sum(1) & 1;
+  auto comm_idx = torch::nonzero(symp.eq(0)).flatten().to(torch::kInt64);
+  auto anti_idx = torch::nonzero(symp.eq(1)).flatten().to(torch::kInt64);
+
+  auto anti_x = x_mask.index_select(0, anti_idx);
+  auto anti_z = z_mask.index_select(0, anti_idx);
+  auto sin_x = anti_x ^ gx_t;
+  auto sin_z = anti_z ^ gz_t;
+
+  auto same_idx = comm_idx;
+  auto cos_idx = anti_idx;
+  auto sin_idx = anti_idx;
+
+  torch::Tensor sin_sign;
+  torch::Tensor coeffs_prev;
+  bool do_prune = min_abs.has_value();
+  torch::Tensor cos_t;
+  torch::Tensor sin_t;
+
+  if (do_prune) {
+    if (!coeffs_cache.has_value() || !thetas_t.has_value()) {
+      throw std::runtime_error("min_abs provided but coeffs_cache/thetas_t is None");
+    }
+    coeffs_prev = coeffs_cache.value();
+    auto theta = thetas_t.value().index({param_idx});
+    cos_t = torch::cos(theta);
+    sin_t = torch::sin(theta);
+
+    auto mask_comm = coeffs_prev.index_select(0, comm_idx).abs() >= min_abs.value();
+    auto mask_cos = (coeffs_prev.index_select(0, anti_idx) * cos_t).abs() >= min_abs.value();
+    auto sin_sign_all = phase_sign_tensor_mw(anti_x, anti_z, gx_words, gz_words).to(coeffs_prev.dtype());
+    auto mask_sin = (coeffs_prev.index_select(0, anti_idx) * sin_t * sin_sign_all).abs() >= min_abs.value();
+
+    auto comm_keep = torch::nonzero(mask_comm).flatten().to(torch::kInt64);
+    auto cos_keep = torch::nonzero(mask_cos).flatten().to(torch::kInt64);
+    auto sin_keep = torch::nonzero(mask_sin).flatten().to(torch::kInt64);
+
+    same_idx = torch::cat({comm_idx.index_select(0, comm_keep), anti_idx.index_select(0, cos_keep)}, 0);
+    cos_idx = anti_idx.index_select(0, cos_keep);
+    sin_x = sin_x.index_select(0, sin_keep);
+    sin_z = sin_z.index_select(0, sin_keep);
+    sin_idx = anti_idx.index_select(0, sin_keep);
+    sin_sign = sin_sign_all.index_select(0, sin_keep);
+  } else {
+    same_idx = torch::cat({comm_idx, anti_idx}, 0);
+    cos_idx = anti_idx;
+    sin_sign = phase_sign_tensor_mw(anti_x, anti_z, gx_words, gz_words);
+  }
+
+  auto same_x = x_mask.index_select(0, same_idx);
+  auto same_z = z_mask.index_select(0, same_idx);
+  auto n_same = same_idx.numel();
+  auto same_keys = torch::cat({same_x, same_z}, 1);
+  auto sin_keys = torch::cat({sin_x, sin_z}, 1);
+  auto all_keys = torch::cat({same_keys, sin_keys}, 0);
+
+  py::module torch_mod = py::module::import("torch");
+  py::tuple uniq_out = torch_mod.attr("unique")(all_keys, py::arg("dim") = 0, py::arg("return_inverse") = true,
+                                                  py::arg("sorted") = false)
+                           .cast<py::tuple>();
+  torch::Tensor uniq = uniq_out[0].cast<torch::Tensor>();
+  torch::Tensor inv = uniq_out[1].cast<torch::Tensor>();
+  auto same_inv = inv.slice(0, 0, n_same).to(torch::kInt64);
+  auto sin_inv = inv.slice(0, n_same).to(torch::kInt64);
+  auto n_uniq = uniq.size(0);
+  auto keyid_to_same = torch::full({n_uniq}, -1, torch::TensorOptions().dtype(torch::kInt64).device(device));
+  if (n_same > 0) {
+    keyid_to_same.index_put_({same_inv}, torch::arange(n_same, torch::TensorOptions().dtype(torch::kInt64).device(device)));
+  }
+  auto row_sin = keyid_to_same.index_select(0, sin_inv);
+  auto novel_mask = row_sin.lt(0);
+  torch::Tensor novel_key_ids = torch::zeros({0}, torch::TensorOptions().dtype(torch::kInt64).device(device));
+  if (sin_inv.numel() > 0 && novel_mask.any().item<bool>()) {
+    py::tuple novel_out = torch_mod.attr("unique")(sin_inv.index({novel_mask}), py::arg("sorted") = false,
+                                                    py::arg("return_inverse") = true)
+                             .cast<py::tuple>();
+    novel_key_ids = novel_out[0].cast<torch::Tensor>().to(torch::kInt64);
+    auto novel_inv = novel_out[1].cast<torch::Tensor>().to(torch::kInt64);
+    auto novel_rows = novel_inv + static_cast<int64_t>(n_same);
+    row_sin.index_put_({novel_mask}, novel_rows);
+  }
+  auto n_words = x_mask.size(1);
+  auto novel_keys = novel_key_ids.numel() > 0 ? uniq.index_select(0, novel_key_ids) : uniq.slice(0, 0, 0);
+  auto new_x = torch::cat({same_x, novel_keys.slice(1, 0, n_words)}, 0);
+  auto new_z = torch::cat({same_z, novel_keys.slice(1, n_words, 2 * n_words)}, 0);
+  auto anti_same_pos = torch::arange(n_same - cos_idx.numel(), n_same,
+                                     torch::TensorOptions().dtype(torch::kInt64).device(device));
+  auto val_sin = sin_sign.to(coeff_dtype);
+
+  py::object coeffs_cache_out = py::none();
+  if (do_prune) {
+    auto same_comm_n = same_idx.numel() - cos_idx.numel();
+    auto same_vals = torch::cat({
+        coeffs_prev.index_select(0, same_idx.slice(0, 0, same_comm_n)),
+        coeffs_prev.index_select(0, cos_idx) * cos_t,
+    }, 0);
+    std::vector<int64_t> out_sz{new_x.size(0)};
+    auto out = torch::zeros(out_sz,
+                            torch::TensorOptions().dtype(coeffs_prev.dtype()).device(coeffs_prev.device()));
+    if (same_vals.numel() > 0) {
+      out.index_put_({torch::arange(n_same, torch::TensorOptions().dtype(torch::kInt64).device(device))}, same_vals);
+    }
+    if (sin_idx.numel() > 0) {
+      out.index_add_(0, row_sin, coeffs_prev.index_select(0, sin_idx) * sin_t * sin_sign.to(coeffs_prev.dtype()));
+    }
+    coeffs_cache_out = py::cast(out);
+  }
+
+  auto mask = truncate_terms_mask(new_x, new_z, max_weight, weight_x, weight_y, weight_z);
+  if (!(mask.all().item<bool>())) {
+    auto row_map = torch::cumsum(mask.to(torch::kInt64), 0) - 1;
+    auto keep_same = mask.slice(0, 0, n_same);
+    same_idx = same_idx.index({keep_same});
+    if (anti_same_pos.numel() > 0) {
+      auto anti_keep = keep_same.index_select(0, anti_same_pos);
+      auto kept_anti = anti_same_pos.index({anti_keep});
+      anti_same_pos = row_map.index_select(0, kept_anti);
+    }
+    if (row_sin.numel() > 0) {
+      auto keep_rows = mask.index_select(0, row_sin);
+      auto keep_idx = torch::nonzero(keep_rows).flatten().to(torch::kInt64);
+      row_sin = row_sin.index_select(0, keep_idx);
+      sin_idx = sin_idx.index_select(0, keep_idx);
+      val_sin = val_sin.index_select(0, keep_idx);
+      row_sin = row_map.index_select(0, row_sin);
+    }
+    auto out_idx = torch::nonzero(mask).flatten().to(torch::kInt64);
+    new_x = new_x.index_select(0, out_idx);
+    new_z = new_z.index_select(0, out_idx);
+    if (do_prune) {
+      auto out_coeffs = coeffs_cache_out.cast<torch::Tensor>();
+      out_coeffs = out_coeffs.index_select(0, out_idx);
+      coeffs_cache_out = py::cast(out_coeffs);
+    }
+  }
+
+  return std::make_tuple(new_x, new_z, same_idx, anti_same_pos, row_sin, sin_idx, val_sin, coeffs_cache_out);
+}
+
 static std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, py::object>
 build_depolarizing_step_cpp(int64_t qubit, double px, double py, double pz, const torch::Tensor& x_mask,
                             const torch::Tensor& z_mask, const py::object& coeff_dtype_obj,
@@ -1280,6 +1598,18 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       py::arg("weight_z"));
 
   m.def("build_pauli_rotation_step_mw_cpp", &build_pauli_rotation_step_mw_cpp,
+        py::arg("gx_words"), py::arg("gz_words"), py::arg("param_idx"), py::arg("x_mask"), py::arg("z_mask"),
+        py::arg("coeff_dtype"), py::arg("min_abs") = py::none(), py::arg("coeffs_cache") = py::none(),
+      py::arg("thetas_t") = py::none(), py::arg("max_weight"), py::arg("weight_x"), py::arg("weight_y"),
+      py::arg("weight_z"));
+
+  m.def("build_pauli_rotation_step_implicit_cpp", &build_pauli_rotation_step_implicit_cpp,
+        py::arg("gx"), py::arg("gz"), py::arg("param_idx"), py::arg("x_mask"), py::arg("z_mask"),
+        py::arg("coeff_dtype"), py::arg("min_abs") = py::none(), py::arg("coeffs_cache") = py::none(),
+      py::arg("thetas_t") = py::none(), py::arg("max_weight"), py::arg("weight_x"), py::arg("weight_y"),
+      py::arg("weight_z"));
+
+  m.def("build_pauli_rotation_step_implicit_mw_cpp", &build_pauli_rotation_step_implicit_mw_cpp,
         py::arg("gx_words"), py::arg("gz_words"), py::arg("param_idx"), py::arg("x_mask"), py::arg("z_mask"),
         py::arg("coeff_dtype"), py::arg("min_abs") = py::none(), py::arg("coeffs_cache") = py::none(),
       py::arg("thetas_t") = py::none(), py::arg("max_weight"), py::arg("weight_x"), py::arg("weight_y"),

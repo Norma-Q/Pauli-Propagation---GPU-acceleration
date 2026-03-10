@@ -1,0 +1,58 @@
+[
+  {
+    "run_name": "qaoa_pps_q30_g01_p03_wmyz_mw1000000000",
+    "n_qubits": 30,
+    "p_layers": 3,
+    "graph_index": 1,
+    "target_step": "0",
+    "abs_eps": 0.5,
+    "converged": false,
+    "tail_window": 2,
+    "tail_max_abs_delta": 0.7037630081176758,
+    "tail_mean_abs_delta": 0.6144499778747559,
+    "stable_from_min_abs": null,
+    "recommended_min_abs": null,
+    "min_abs_values": [
+      0.01,
+      0.0031622776601683794,
+      0.001
+    ],
+    "expected_values": [
+      93.16458702087402,
+      92.63945007324219,
+      91.93568706512451
+    ],
+    "pair_abs_deltas": [
+      0.5251369476318359,
+      0.7037630081176758
+    ]
+  },
+  {
+    "run_name": "qaoa_pps_q30_g01_p03_wmyz_mw1000000000",
+    "n_qubits": 30,
+    "p_layers": 3,
+    "graph_index": 1,
+    "target_step": "final",
+    "abs_eps": 0.5,
+    "converged": false,
+    "tail_window": 2,
+    "tail_max_abs_delta": 2.8731021881103516,
+    "tail_mean_abs_delta": 2.811844825744629,
+    "stable_from_min_abs": null,
+    "recommended_min_abs": null,
+    "min_abs_values": [
+      0.01,
+      0.0031622776601683794,
+      0.001
+    ],
+    "expected_values": [
+      91.25704002380371,
+      94.00762748718262,
+      96.88072967529297
+    ],
+    "pair_abs_deltas": [
+      2.7505874633789062,
+      2.8731021881103516
+    ]
+  }
+]
