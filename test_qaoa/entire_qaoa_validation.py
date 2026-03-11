@@ -13,8 +13,10 @@
 # 이 파일은 단 하나의 테스트를 돌리게 되어 있으며, 터미널에서 config 파일을 인자로 받아서, 해당 config에 맞는 결과 폴더에서 validation을 수행하도록 하자.
 
 import argparse
+import gc
 import json
 from pathlib import Path
+import ctypes
 
 import matplotlib.pyplot as plt
 import numpy as np  
@@ -31,7 +33,20 @@ from qaoa_surrogate_common import (
 from src_tensor.api import compile_expval_program
 
 
-DEFAULT_THRESHOLDS = [1e-2, 5e-3, 1e-3, 5e-4, 1e-4]
+DEFAULT_THRESHOLDS = [1e-2, 5e-3, 1e-3]
+
+
+def _cleanup_memory(device: str) -> None:
+	gc.collect()
+	if device.startswith("cuda") and torch.cuda.is_available():
+		pass
+		# torch.cuda.empty_cache()  # Disabled due to CUDA indexing assertion errors
+	try:
+		libc = ctypes.CDLL("libc.so.6")
+		if hasattr(libc, "malloc_trim"):
+			libc.malloc_trim(0)
+	except Exception:
+		pass
 
 
 def parse_args() -> argparse.Namespace:
@@ -135,19 +150,22 @@ def _evaluate_expected_cut(
 	zz_obj = build_maxcut_observable(n_qubits=n_qubits, edges=edges)
 
 	preset = "hybrid" if device.startswith("cuda") else "cpu"
-	preset_overrides = default_cpu_exact_overrides() if preset == "cpu" else {'chunk_size': 20_000_000}
+	preset_overrides = default_cpu_exact_overrides() if preset == "cpu" else {'chunk_size': 20_000_000, 'compute_device': 'cuda:3'}
 
+	thetas_dev = thetas.detach().to(device)
 	program = compile_expval_program(
 		circuit=circuit,
 		observables=[zz_obj],
 		preset=preset,
 		preset_overrides= preset_overrides,		
-		build_thetas=thetas.to(device),
-		build_min_abs=float(min_abs),
-		parallel_compile=True
+		build_thetas=thetas_dev,
+		build_min_abs=float(min_abs)
 	)
 
-	sum_zz = float(program.expval(thetas.to(device), obs_index=0).detach().cpu().item())
+	with torch.no_grad():
+		sum_zz = float(program.expval(thetas_dev, obs_index=0).detach().cpu().item())
+
+	del program, thetas_dev, circuit, zz_obj
 	return expected_cut_from_sum_zz(sum_zz, n_edges=len(edges))
 
 
@@ -186,6 +204,29 @@ def _plot_validation(
 	fig.tight_layout()
 	fig.savefig(output_path, dpi=160)
 	plt.close(fig)
+
+
+def _save_partial_state(
+	result_dir: Path,
+	thresholds_done: list[float],
+	expected_cuts: list[float],
+	ok_mask: list[bool],
+) -> None:
+	plot_path = result_dir / "validation.png"
+	_plot_validation(plot_path, thresholds_done, expected_cuts, ok_mask)
+
+	state_path = result_dir / "validation_progress.json"
+	with open(state_path, "w", encoding="utf-8") as f:
+		json.dump(
+			{
+				"thresholds_done": thresholds_done,
+				"expected_cuts": expected_cuts,
+				"ok_mask": ok_mask,
+				"completed_count": len(thresholds_done),
+			},
+			f,
+			indent=2,
+		)
 
 
 def main() -> None:
@@ -235,11 +276,20 @@ def main() -> None:
 			ok_mask.append(False)
 			print(f"  [FAIL] threshold={th:.1e} | failed: {e}")
 
-		if device.startswith("cuda"):
-			torch.cuda.empty_cache()
+		_cleanup_memory(device)
+
+		# Save partial progress at every threshold so completed results survive later failures.
+		thresholds_done = thresholds[:len(expected_cuts)]
+		_save_partial_state(
+			result_dir=result_dir,
+			thresholds_done=thresholds_done,
+			expected_cuts=expected_cuts,
+			ok_mask=ok_mask,
+		)
 
 	plot_path = result_dir / "validation.png"
-	_plot_validation(plot_path, thresholds, expected_cuts, ok_mask)
+	thresholds_done = thresholds[:len(expected_cuts)]
+	_plot_validation(plot_path, thresholds_done, expected_cuts, ok_mask)
 	print(f"[done] validation plot saved to: {plot_path}")
 
 

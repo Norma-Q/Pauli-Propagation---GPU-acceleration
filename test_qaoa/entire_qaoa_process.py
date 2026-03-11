@@ -128,7 +128,7 @@ def main():
     EDGE_PROB = 0.15
     DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-    MAX_WEIGHT = 4
+    MAX_WEIGHT = 3
 
     torch.manual_seed(SEED)
     np.random.seed(SEED)
@@ -176,8 +176,7 @@ def main():
     # Compile Surrogate Program
     program = compile_expval_program(
         circuit=circuit, observables=[zz_obj], preset="hybrid",
-        preset_overrides={'max_weight': MAX_WEIGHT,                    
-                          'chunk_size' : 20_000_000},
+        preset_overrides={'max_weight': MAX_WEIGHT},
                           parallel_compile=True)
     print("Program compiled successfully.")
 

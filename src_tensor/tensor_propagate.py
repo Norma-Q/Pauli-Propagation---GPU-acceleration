@@ -10,7 +10,7 @@ then walks steps backwards to remove any input columns that cannot reach them.
 
 from __future__ import annotations
 
-from typing import Any, List, Optional, TYPE_CHECKING, Tuple, cast
+from typing import Any, List, Optional, Sequence, TYPE_CHECKING, Tuple, cast
 import math
 import torch.multiprocessing as mp
 
@@ -827,6 +827,7 @@ def propagate_surrogate_tensor(
     chunk_size: int = 1_000_000,
     parallel_compile: bool = False,
     parallel_threshold: int = -1,
+    parallel_devices: Optional[Sequence[int]] = None,
 ) -> TensorPauliSum:
     """Tensor-native propagation to a tensor PauliSum.
 
@@ -879,12 +880,26 @@ def propagate_surrogate_tensor(
             thetas_t = torch.zeros(1, dtype=coeff_init.dtype, device=compute_device)
 
     num_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
-    use_parallel = bool(parallel_compile) and num_gpus > 1 and str(compute_device).startswith("cuda")
+    selected_device_ids: List[int] = []
+    if bool(parallel_compile) and str(compute_device).startswith("cuda") and num_gpus > 0:
+        if parallel_devices is None:
+            selected_device_ids = list(range(num_gpus))
+        else:
+            selected_device_ids = sorted({int(i) for i in parallel_devices})
+            if len(selected_device_ids) == 0:
+                raise ValueError("parallel_devices must not be empty when provided")
+            invalid_ids = [i for i in selected_device_ids if i < 0 or i >= num_gpus]
+            if invalid_ids:
+                raise ValueError(
+                    f"parallel_devices contains invalid GPU id(s): {invalid_ids}. available ids: 0..{num_gpus-1}"
+                )
+
+    use_parallel = bool(parallel_compile) and len(selected_device_ids) > 1 and str(compute_device).startswith("cuda")
     parallel_started_logged = False
     consecutive_soft_candidates = 0
 
     if use_parallel:
-        devices = [f"cuda:{i}" for i in range(num_gpus)]
+        devices = [f"cuda:{i}" for i in selected_device_ids]
         primary_device = str(compute_device) if ":" in str(compute_device) else "cuda:0"
 
         manual_parallel_threshold = int(parallel_threshold) if int(parallel_threshold) > 0 else None

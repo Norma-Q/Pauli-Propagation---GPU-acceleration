@@ -48,3 +48,6 @@ max_weight_truncation_analysis/
 
 generating_configfiles.py
 generating_shfiles.py
+
+
+# 캐시 삭제하고 싶으면 git rm -r --cached <file> 명령어 사용

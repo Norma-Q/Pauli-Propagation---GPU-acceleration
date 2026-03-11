@@ -609,6 +609,7 @@ def compile_expval_program(
     build_min_abs: Optional[float] = None,
     build_min_mat_abs: Optional[float] = None,
     parallel_compile: bool = False,
+    parallel_devices: Optional[Sequence[int]] = None,
 ) -> CompiledTensorSurrogate:
     """Compile a reusable expval program with fixed memory-first flow.
 
@@ -643,6 +644,7 @@ def compile_expval_program(
         min_mat_abs=build_min_mat_abs,
         chunk_size=int(cfg.chunk_size),
         parallel_compile=parallel_compile,
+        parallel_devices=parallel_devices,
     )
 
 
