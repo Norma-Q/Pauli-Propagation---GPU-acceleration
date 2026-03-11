@@ -121,12 +121,12 @@ def main():
     ###################### Parameters Setting ######################
     N_QUBITS = config.QAOA.n_qubits
     P_LAYERS = config.QAOA.n_layers   
-    DELTA_T = 0.8  # TQA initialization parameter
-    STEPS = 150
-    LR = 0.05
+    DELTA_T = config.QAOA.delta_t
+    STEPS = config.QAOA.steps
+    LR = config.TRAINING.lr
     SEED = 42
-    EDGE_PROB = 0.15
-    DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+    
+    DEVICE = "cuda:0" if torch.cuda.is_available() else "cpu"
 
     MAX_WEIGHT = 3
 
@@ -149,6 +149,7 @@ def main():
         with open(graph_path, "r") as f:
             edges = json.load(f) # list of list where each inner list is [i, j] representing an edge between qubits i and j
     except:
+        EDGE_PROB = 0.15
         print(f"Graph file not found at {graph_path}. Generating a new graph...")
         edges = make_erdos_renyi_graph(n_qubits = N_QUBITS, edge_prob=EDGE_PROB, seed=SEED,
                                        ensure_connected=True, max_tries=3)
@@ -177,7 +178,8 @@ def main():
     program = compile_expval_program(
         circuit=circuit, observables=[zz_obj], preset="hybrid",
         preset_overrides={'max_weight': MAX_WEIGHT},
-                          parallel_compile=True)
+                          parallel_compile=True,
+                          parallel_devices=[0,1,2,3])
     print("Program compiled successfully.")
 
     # [Optimization] Clear build-time memory artifacts
