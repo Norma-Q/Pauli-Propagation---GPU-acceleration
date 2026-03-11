@@ -1,3 +1,0 @@
-run_name,n_qubits,p_layers,graph_index,weight_mode,max_weight,target_step,checkpoint,min_abs,sum_zz,expected_cut,terms_after_zero_filter,nnz_total,status
-qaoa_pps_q30_g01_p03_wmyz_mw1000000000,30,3,1,yz,1000000000,0,/home/quantum/ys_lee/Pauli-Propagation---GPU-acceleration/QAOA/artifacts/sweep_multi_graphs_minabs_only_oddneg/q30/runs/qaoa_pps_q30_g01_p03_wmyz_mw1000000000_steps/step_000000.pt,0.001,-30.871374130249023,91.93568706512451,1142,9083637,ok
-qaoa_pps_q30_g01_p03_wmyz_mw1000000000,30,3,1,yz,1000000000,0,/home/quantum/ys_lee/Pauli-Propagation---GPU-acceleration/QAOA/artifacts/sweep_multi_graphs_minabs_only_oddneg/q30/runs/qaoa_pps_q30_g01_p03_wmyz_mw1000000000_steps/step_000000.pt,0.0005,-31.124052047729492,92.06202602386475,2856,27010407,ok

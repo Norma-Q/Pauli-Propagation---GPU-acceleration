@@ -1,2 +1,0 @@
-run_name,n_qubits,p_layers,graph_index,target_step,abs_eps,converged,tail_window,tail_max_abs_delta,tail_mean_abs_delta,stable_from_min_abs,recommended_min_abs,min_abs_values,expected_values,pair_abs_deltas
-qaoa_pps_q30_g01_p03_wmyz_mw1000000000,30,3,1,0,0.5,True,1,0.12633895874023438,0.12633895874023438,0.001,0.001,"[0.001, 0.0005]","[91.93568706512451, 92.06202602386475]",[0.12633895874023438]
