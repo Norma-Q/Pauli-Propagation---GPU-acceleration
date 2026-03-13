@@ -42,6 +42,9 @@ if _REPO_ROOT not in _loaded_api.parents:
     )
 
 
+_EXACT_MAX_QUBITS = 20
+
+
 def _choose_device(raw: str) -> str:
     if raw == "auto":
         return "cuda" if torch.cuda.is_available() else "cpu"
@@ -390,6 +393,24 @@ def parse_args() -> argparse.Namespace:
         help="Optional checkpoint (.pt) to initialize thetas from (best_thetas or thetas).",
     )
     p.add_argument(
+        "--resume-mode",
+        type=str,
+        default="init",
+        choices=["init", "build", "both"],
+        help=(
+            "How to use --resume checkpoint: "
+            "'init' initializes trainable theta, "
+            "'build' uses resume theta only for initial PPS compile build_thetas, "
+            "'both' applies both behaviors."
+        ),
+    )
+    p.add_argument(
+        "--init-noise-std",
+        type=float,
+        default=0.0,
+        help="Add Gaussian noise N(0, std^2) to initial trainable theta after init/resume selection.",
+    )
+    p.add_argument(
         "--save-every",
         type=int,
         default=0,
@@ -470,25 +491,44 @@ def main() -> None:
     preset_overrides["weight_y"] = float(weight_tuple["weight_y"])
     preset_overrides["weight_z"] = float(weight_tuple["weight_z"])
 
+    resume_thetas_np: Optional[np.ndarray] = None
+    resume_mode = str(args.resume_mode).strip().lower()
     if str(args.resume).strip():
         resume_path = Path(args.resume)
         payload = torch.load(resume_path, map_location="cpu")
         if "best_thetas" in payload:
-            init_theta_np = payload["best_thetas"].detach().cpu().numpy()
+            resume_thetas_np = payload["best_thetas"].detach().cpu().numpy()
         elif "thetas" in payload:
-            init_theta_np = payload["thetas"].detach().cpu().numpy()
+            resume_thetas_np = payload["thetas"].detach().cpu().numpy()
         else:
             raise KeyError("Resume checkpoint missing 'best_thetas' or 'thetas'.")
-        if int(init_theta_np.shape[0]) != int(n_params):
+        if int(resume_thetas_np.shape[0]) != int(n_params):
             raise RuntimeError(
-                f"Resume theta size mismatch: {int(init_theta_np.shape[0])} vs n_params={int(n_params)}"
+                f"Resume theta size mismatch: {int(resume_thetas_np.shape[0])} vs n_params={int(n_params)}"
             )
+    elif resume_mode in ("build", "both"):
+        print(
+            f"[warn] resume-mode={resume_mode} requested but --resume is empty. "
+            "Falling back to non-resume initialization/build."
+        )
+
+    if resume_thetas_np is not None and resume_mode in ("init", "both"):
+        init_theta_np = np.asarray(resume_thetas_np, dtype=np.float64).copy()
+
+    init_noise_std = float(args.init_noise_std)
+    if init_noise_std > 0.0:
+        init_theta_np = np.asarray(init_theta_np, dtype=np.float64) + np.random.normal(
+            loc=0.0, scale=init_noise_std, size=init_theta_np.shape
+        )
 
     thetas = torch.nn.Parameter(torch.tensor(init_theta_np, dtype=torch.float64, device=run_device))
     build_min_abs: Optional[float] = None if bool(args.no_build_min_abs) else float(args.build_min_abs)
 
     # Compile program (adaptive retry to avoid OOM)
-    compile_thetas = thetas.detach().cpu()
+    if resume_thetas_np is not None and resume_mode in ("build", "both"):
+        compile_thetas = torch.as_tensor(resume_thetas_np, dtype=torch.float64, device="cpu")
+    else:
+        compile_thetas = thetas.detach().cpu()
     program, used_chunk = _compile_with_retry(
         circuit=circuit,
         obs=zz_obj,
@@ -511,6 +551,9 @@ def main() -> None:
     best_val = float("inf")
     best_thetas = None
     history = []
+    exact_enabled = int(args.n_qubits) <= int(_EXACT_MAX_QUBITS)
+    history_exact: Optional[List[float]] = [] if exact_enabled else None
+    best_exact_at_best_surrogate: Optional[float] = None
 
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -556,17 +599,41 @@ def main() -> None:
 
         val = float(zz_val.detach().cpu().item())
         history.append(val)
+        exact_sum_zz: Optional[float] = None
+        if exact_enabled:
+            exact_sum_zz = float(
+                program.expvals_pennylane(
+                    thetas.detach().cpu(),
+                    max_qubits=int(_EXACT_MAX_QUBITS),
+                )[0].item()
+            )
+            assert history_exact is not None
+            history_exact.append(exact_sum_zz)
+
         if val < best_val:
             best_val = val
             best_thetas = thetas.detach().cpu().clone()
+            best_exact_at_best_surrogate = exact_sum_zz
 
         if int(args.save_every) > 0 and (step % int(args.save_every) == 0):
             step_path = step_dir / f"step_{step:06d}.pt"
-            torch.save({"thetas": thetas.detach().cpu()}, step_path)
+            step_payload: Dict[str, Any] = {"thetas": thetas.detach().cpu()}
+            if exact_sum_zz is not None:
+                step_payload["exact_sum_zz"] = float(exact_sum_zz)
+            torch.save(step_payload, step_path)
 
         if (step % int(args.log_every) == 0) or (step == int(args.steps) - 1):
             exp_cut = expected_cut_from_sum_zz(val, m_edges)
-            print(f"step={step:04d} sum<ZZ>={val:+.8f} E[cut]={exp_cut:.6f}")
+            if exact_sum_zz is None:
+                print(f"step={step:04d} sum<ZZ>={val:+.8f} E[cut]={exp_cut:.6f}")
+            else:
+                exact_cut = expected_cut_from_sum_zz(exact_sum_zz, m_edges)
+                abs_err = abs(val - exact_sum_zz)
+                print(
+                    f"step={step:04d} sum<ZZ>={val:+.8f} E[cut]={exp_cut:.6f} "
+                    f"exact_sum<ZZ>={exact_sum_zz:+.8f} exact_E[cut]={exact_cut:.6f} "
+                    f"|err|={abs_err:.6e}"
+                )
 
     if best_thetas is None:
         raise RuntimeError("Training produced no best_thetas.")
@@ -600,6 +667,11 @@ def main() -> None:
             "log_file": str(log_path),
             "log_append": bool(args.log_append),
             "log_to_terminal": bool(args.log_to_terminal),
+            "resume": str(args.resume),
+            "resume_mode": str(args.resume_mode),
+            "init_noise_std": float(args.init_noise_std),
+            "resume_applied_to_init": bool(resume_thetas_np is not None and resume_mode in ("init", "both")),
+            "resume_applied_to_build": bool(resume_thetas_np is not None and resume_mode in ("build", "both")),
         },
         "graph": {
             "source": graph_source,
@@ -611,6 +683,20 @@ def main() -> None:
             "history_expected_cut": [expected_cut_from_sum_zz(v, m_edges) for v in history],
             "best_sum_zz": float(best_val),
             "best_expected_cut": float(expected_cut_from_sum_zz(best_val, m_edges)),
+            "exact_enabled": bool(exact_enabled),
+            "exact_max_qubits": int(_EXACT_MAX_QUBITS),
+            "history_exact_sum_zz": ([float(v) for v in history_exact] if history_exact is not None else None),
+            "history_exact_expected_cut": (
+                [expected_cut_from_sum_zz(v, m_edges) for v in history_exact] if history_exact is not None else None
+            ),
+            "best_exact_sum_zz_at_best_surrogate": (
+                float(best_exact_at_best_surrogate) if best_exact_at_best_surrogate is not None else None
+            ),
+            "best_exact_expected_cut_at_best_surrogate": (
+                float(expected_cut_from_sum_zz(best_exact_at_best_surrogate, m_edges))
+                if best_exact_at_best_surrogate is not None
+                else None
+            ),
         },
         "resources": {
             "compile_events": compile_events,

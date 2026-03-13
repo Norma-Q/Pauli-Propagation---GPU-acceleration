@@ -33,9 +33,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--init-mode", type=str, default="odd-linear-neg", choices=["tqa", "odd-linear-neg"])
     p.add_argument("--mixer-odd-start", type=float, default=-1.0)
     p.add_argument("--mixer-odd-end", type=float, default=-0.05)
+    p.add_argument("--init-noise-std", type=float, default=0.0)
 
     p.add_argument("--build-min-abs", type=float, default=1e-3)
     p.add_argument("--max-weight-disabled-value", type=int, default=1_000_000_000)
+    p.add_argument("--resume-mode", type=str, default="init", choices=["init", "build", "both"])
 
     p.add_argument("--weight-modes", type=str, default="yz")
     p.add_argument("--chunk-size", type=int, default=1_000_000)
@@ -80,6 +82,8 @@ def build_cmd(args: argparse.Namespace) -> List[str]:
         str(float(args.mixer_odd_start)),
         "--mixer-odd-end",
         str(float(args.mixer_odd_end)),
+        "--init-noise-std",
+        str(float(args.init_noise_std)),
         "--build-min-abs",
         str(float(args.build_min_abs)),
         "--min-abs-only",
@@ -97,6 +101,8 @@ def build_cmd(args: argparse.Namespace) -> List[str]:
         str(int(args.log_every)),
         "--seed",
         str(int(args.seed)),
+        "--resume-mode",
+        str(args.resume_mode),
     ]
 
     if bool(args.continue_on_error):

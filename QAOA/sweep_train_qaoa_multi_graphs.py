@@ -242,7 +242,9 @@ def _build_train_cmd(
     init_mode: str,
     mixer_odd_start: float,
     mixer_odd_end: float,
+    init_noise_std: float,
     resume_checkpoint: Optional[Path],
+    resume_mode: str,
 ) -> List[str]:
     cmd = [
         python_exe,
@@ -265,6 +267,8 @@ def _build_train_cmd(
         str(float(mixer_odd_start)),
         "--mixer-odd-end",
         str(float(mixer_odd_end)),
+        "--init-noise-std",
+        str(float(init_noise_std)),
         "--seed",
         str(int(seed)),
         "--output-dir",
@@ -290,6 +294,7 @@ def _build_train_cmd(
         cmd.append("--no-build-min-abs")
     if resume_checkpoint is not None:
         cmd.extend(["--resume", str(resume_checkpoint)])
+        cmd.extend(["--resume-mode", str(resume_mode)])
     return cmd
 
 
@@ -372,6 +377,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--init-mode", type=str, default="tqa", choices=["tqa", "odd-linear-neg"])
     p.add_argument("--mixer-odd-start", type=float, default=-1.0)
     p.add_argument("--mixer-odd-end", type=float, default=-0.05)
+    p.add_argument(
+        "--init-noise-std",
+        type=float,
+        default=0.0,
+        help="Gaussian noise std added to train initialization theta per run.",
+    )
     p.add_argument("--chunk-size", type=int, default=1_000_000)
     p.add_argument("--build-min-abs", type=float, default=1e-3)
     p.add_argument("--no-build-min-abs", action="store_true")
@@ -440,6 +451,16 @@ def parse_args() -> argparse.Namespace:
         help=(
             "How to match resume checkpoint from source summary: "
             "best-per-p uses best run for each p; graph-index uses (p,graph_index) if available."
+        ),
+    )
+    p.add_argument(
+        "--resume-mode",
+        type=str,
+        default="init",
+        choices=["init", "build", "both"],
+        help=(
+            "How to use selected resume checkpoint for each run: "
+            "init=train init only, build=compile build_thetas only, both=both."
         ),
     )
     p.add_argument("--skip-training", action="store_true", help="Only generate graphs + plot + annealing report.")
@@ -669,7 +690,9 @@ def main() -> None:
                             init_mode=str(args.init_mode),
                             mixer_odd_start=float(args.mixer_odd_start),
                             mixer_odd_end=float(args.mixer_odd_end),
+                            init_noise_std=float(args.init_noise_std),
                             resume_checkpoint=resume_checkpoint,
+                            resume_mode=str(args.resume_mode),
                         )
 
                         print("\n" + "=" * 100)
