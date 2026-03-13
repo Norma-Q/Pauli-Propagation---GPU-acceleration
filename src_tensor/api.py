@@ -209,10 +209,10 @@ class CompiledTensorSurrogate:
         if not _TORCH_AVAILABLE:
             raise RuntimeError("PyTorch is required for tensor backend.")
 
-        # [수정 포인트] embedding이 입력되었을 때만 배치 차원을 검사합니다.
-        # 기존의 1D 입력을 (1, N)으로 만들어 하부 로직이 항상 2D(Batch)를 기대하게 합니다.
+        embedding_was_vector = False
         if embedding is not None:
             if embedding.ndim == 1:
+                embedding_was_vector = True
                 embedding = embedding.unsqueeze(0)
         
         num_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
@@ -256,9 +256,12 @@ class CompiledTensorSurrogate:
         
         V0 = self._get_V0(device=str(w.device), dtype=w.dtype)
         
-        # [수정 포인트] expvals_from_w_and_coeff_matrix 내부에서 Batch Matmul을 수행하게 합니다.
         res = expvals_from_w_and_coeff_matrix(w, V0)
-        
+
+        if embedding is None and res.dim() == 2 and int(res.shape[0]) == 1:
+            return res.squeeze(0)
+        if embedding_was_vector and res.dim() == 2 and int(res.shape[0]) == 1:
+            return res.squeeze(0)
         return res
 
     def expval(

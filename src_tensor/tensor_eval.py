@@ -101,9 +101,10 @@ class TensorSparseEvaluator:
         if thetas_t.numel() == 0:
             thetas_t = torch.zeros(1, dtype=v.dtype, device=v.device)
         
-        # embedding 처리 [추가]
         if embedding is not None:
             embedding_t = torch.as_tensor(embedding, dtype=v.dtype, device=v.device)
+            if embedding_t.dim() == 1:
+                embedding_t = embedding_t.unsqueeze(0)
         else:
             embedding_t = None
 
@@ -152,19 +153,20 @@ class TensorSparseEvaluator:
             return out
 
         for i, step in enumerate(psum.steps):
-            # [수정] 파라미터 결정 로직: emb_idx가 우선순위를 가짐
             if step.emb_idx >= 0 and embedding_t is not None:
-                # 임베딩 층: embedding에서 값을 가져오고 detach()로 기울기 차단
-                theta = embedding_t[step.emb_idx].detach()
+                if int(embedding_t.shape[0]) != 1:
+                    raise ValueError(
+                        "evaluate_coeffs() does not support batched embedding; "
+                        "use a single embedding vector or call expvals() for batched evaluation."
+                    )
+                theta = embedding_t[0, step.emb_idx].detach()
                 cos_t = torch.cos(theta)
                 sin_t = torch.sin(theta)
             elif step.param_idx >= 0:
-                # 학습 층: thetas에서 값을 가져옴 (기울기 유지)
                 theta = thetas_t[step.param_idx]
                 cos_t = torch.cos(theta)
                 sin_t = torch.sin(theta)
             else:
-                # 파라미터 없는 스텝 (Clifford 등)
                 cos_t = torch.ones((), dtype=v.dtype, device=v.device)
                 sin_t = torch.zeros((), dtype=v.dtype, device=v.device)
 

@@ -327,6 +327,8 @@ def _filter_step_rows_cols(step: TensorSparseStep, row_mask: Tensor, col_mask: T
         same_cols_dev = step.same_cols
         keep_same = row_mask[: int(same_cols_dev.numel())].to(same_cols_dev.device)
         col_mask_dev = col_mask.to(same_cols_dev.device)
+        if same_cols_dev.numel() > 0:
+            keep_same = keep_same & col_mask_dev.index_select(0, same_cols_dev)
         col_map = torch.cumsum(col_mask_dev.to(torch.int64), dim=0) - 1
         kept_same_cols = same_cols_dev[keep_same]
         same_cols = col_map[kept_same_cols] if kept_same_cols.numel() > 0 else same_cols_dev[:0]
@@ -1187,7 +1189,10 @@ def zero_filter_tensor_backprop_with_keep_mask(
         nnz_sin = int(mat_sin._nnz())
         nnz_total = nnz_const + nnz_cos + nnz_sin
 
-        if nnz_total == 0 or int(row_mask.sum().item()) == 0:
+        same_nnz = old_step.same_nnz()
+        if int(row_mask.sum().item()) == 0:
+            col_mask = torch.zeros((n_cols,), dtype=torch.bool, device=row_mask.device)
+        elif nnz_total == 0 and same_nnz == 0:
             col_mask = torch.zeros((n_cols,), dtype=torch.bool, device=row_mask.device)
         else:
             use_gpu = (
@@ -1200,7 +1205,7 @@ def zero_filter_tensor_backprop_with_keep_mask(
                     row_mask_d = row_mask.to(compute_device, non_blocking=True)
                     col_mask_d = torch.zeros((n_cols,), dtype=torch.bool, device=compute_device)
 
-                    if old_step.same_nnz() > 0:
+                    if same_nnz > 0:
                         _accumulate_used_cols_same_chunked(
                             old_step.same_cols,
                             row_mask_d,

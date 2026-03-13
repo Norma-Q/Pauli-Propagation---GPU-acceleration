@@ -725,6 +725,9 @@ def compact_sparse_step_chunked(
         if keep_col_mask_dev is None:
             keep_col_mask_dev = torch.ones((int(step.shape[1]),), dtype=torch.bool, device=same_cols.device)
 
+        if n_same_old > 0:
+            keep_row_same = keep_row_same & keep_col_mask_dev.index_select(0, same_cols)
+
         col_cumsum = torch.cumsum(keep_col_mask_dev.to(torch.int64), dim=0) - 1
         kept_same_cols = same_cols[keep_row_same]
         new_same_cols = col_cumsum.index_select(0, kept_same_cols) if kept_same_cols.numel() > 0 else _empty_i64(same_cols.device)
