@@ -1,0 +1,125 @@
+{
+  "config": {
+    "n_qubits": 8,
+    "p_layers": 3,
+    "delta_t": 0.8,
+    "steps": 10,
+    "lr": 0.05,
+    "seed": 81032,
+    "device": "cuda",
+    "preset": "hybrid",
+    "build_min_abs": null,
+    "no_build_min_abs": true,
+    "build_min_mat_abs": null,
+    "rebuild_every": 10,
+    "chunk_size": 1000000,
+    "max_weight": 2,
+    "weight_mode": "yz",
+    "weight_x": 0.0,
+    "weight_y": 1.0,
+    "weight_z": 1.0
+  },
+  "graph": {
+    "source": "edges_json",
+    "params": {
+      "edges_json": "/home/quantum/ys_lee/Pauli-Propagation---GPU-acceleration/QAOA/artifacts/weight_sweep_yz_xyz_no_minabs/q08/graphs/edges_graph_01.json"
+    },
+    "edges": [
+      [
+        0,
+        1
+      ],
+      [
+        0,
+        5
+      ],
+      [
+        0,
+        6
+      ],
+      [
+        0,
+        7
+      ],
+      [
+        1,
+        3
+      ],
+      [
+        1,
+        4
+      ],
+      [
+        2,
+        4
+      ],
+      [
+        2,
+        6
+      ],
+      [
+        5,
+        6
+      ],
+      [
+        5,
+        7
+      ]
+    ]
+  },
+  "training": {
+    "history_sum_zz": [
+      4.186519145965576,
+      3.342273712158203,
+      2.328207492828369,
+      1.16373610496521,
+      -0.07298992574214935,
+      -1.2536873817443848,
+      -2.2161307334899902,
+      -2.811030864715576,
+      -2.999218225479126,
+      -2.9586877822875977
+    ],
+    "history_expected_cut": [
+      2.906740427017212,
+      3.3288631439208984,
+      3.8358962535858154,
+      4.418131947517395,
+      5.036494962871075,
+      5.626843690872192,
+      6.108065366744995,
+      6.405515432357788,
+      6.499609112739563,
+      6.479343891143799
+    ],
+    "best_sum_zz": -2.999218225479126,
+    "best_expected_cut": 6.499609112739563
+  },
+  "resources": {
+    "compile_events": [
+      {
+        "step": -1,
+        "chunk_size": 1000000,
+        "terms_after_zero_filter": 78,
+        "n_steps": 62,
+        "nnz_const_total": 8323,
+        "nnz_cos_total": 3200,
+        "nnz_sin_total": 2288,
+        "nnz_total": 13811,
+        "gpu_work_proxy_nnz_total": 13811,
+        "max_step_rows": 452,
+        "max_step_cols": 452,
+        "max_step_nnz_total": 520,
+        "nnz_density_proxy": 0.0010903264963785782
+      }
+    ],
+    "terms_after_zero_filter_last": 78,
+    "nnz_total_last": 13811,
+    "gpu_work_proxy_nnz_total_last": 13811,
+    "terms_after_zero_filter_mean": 78.0,
+    "nnz_total_mean": 13811.0,
+    "nnz_total_std": 0.0,
+    "rebuild_count": 0
+  },
+  "checkpoint": "/home/quantum/ys_lee/Pauli-Propagation---GPU-acceleration/QAOA/artifacts/weight_sweep_yz_xyz_no_minabs/q08/runs/qaoa_pps_q08_g01_p03_wmyz_mw02.pt"
+}

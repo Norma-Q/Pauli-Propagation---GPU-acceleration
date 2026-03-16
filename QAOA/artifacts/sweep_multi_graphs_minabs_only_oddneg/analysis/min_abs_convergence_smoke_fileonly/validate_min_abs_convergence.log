@@ -1,0 +1,23 @@
+[log] writing realtime log to: /home/quantum/ys_lee/Pauli-Propagation---GPU-acceleration/QAOA/artifacts/sweep_multi_graphs_minabs_only_oddneg/analysis/min_abs_convergence_smoke_fileonly/validate_min_abs_convergence.log
+sweep_dir: /home/quantum/ys_lee/Pauli-Propagation---GPU-acceleration/QAOA/artifacts/sweep_multi_graphs_minabs_only_oddneg
+summary_json: /home/quantum/ys_lee/Pauli-Propagation---GPU-acceleration/QAOA/artifacts/sweep_multi_graphs_minabs_only_oddneg/summary_partial.json
+target_steps: [0, 'final']
+min_abs_values: [0.01, 0.001]
+n_runs: 1
+
+====================================================================================================
+[1/1] run=qaoa_pps_q30_g01_p03_wmyz_mw1000000000
+  - validate step=0 using step_000000.pt
+  - validate step=final using qaoa_pps_q30_g01_p03_wmyz_mw1000000000.pt
+
+----------------------------------------------------------------------------------------------------
+saved detail json: /home/quantum/ys_lee/Pauli-Propagation---GPU-acceleration/QAOA/artifacts/sweep_multi_graphs_minabs_only_oddneg/analysis/min_abs_convergence_smoke_fileonly/min_abs_convergence_detail.json
+saved detail csv: /home/quantum/ys_lee/Pauli-Propagation---GPU-acceleration/QAOA/artifacts/sweep_multi_graphs_minabs_only_oddneg/analysis/min_abs_convergence_smoke_fileonly/min_abs_convergence_detail.csv
+saved summary json: /home/quantum/ys_lee/Pauli-Propagation---GPU-acceleration/QAOA/artifacts/sweep_multi_graphs_minabs_only_oddneg/analysis/min_abs_convergence_smoke_fileonly/min_abs_convergence_summary.json
+saved summary csv: /home/quantum/ys_lee/Pauli-Propagation---GPU-acceleration/QAOA/artifacts/sweep_multi_graphs_minabs_only_oddneg/analysis/min_abs_convergence_smoke_fileonly/min_abs_convergence_summary.csv
+saved missing-targets json: /home/quantum/ys_lee/Pauli-Propagation---GPU-acceleration/QAOA/artifacts/sweep_multi_graphs_minabs_only_oddneg/analysis/min_abs_convergence_smoke_fileonly/min_abs_convergence_missing_targets.json
+saved failed json: /home/quantum/ys_lee/Pauli-Propagation---GPU-acceleration/QAOA/artifacts/sweep_multi_graphs_minabs_only_oddneg/analysis/min_abs_convergence_smoke_fileonly/min_abs_convergence_failed.json
+detail rows: ok=0, dry_run=4, total=4
+summary rows: 0
+missing targets: 0
+failed runs: 0

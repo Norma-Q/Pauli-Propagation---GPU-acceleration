@@ -1,0 +1,113 @@
+{
+  "base_graph": "/home/quantum/ys_lee/Pauli-Propagation---GPU-acceleration/QAOA/artifacts/maxcut_edges.json",
+  "base_n_qubits": 30,
+  "base_n_edges": 153,
+  "base_density": 0.35172413793103446,
+  "n_qubits_list": [
+    45,
+    50,
+    55
+  ],
+  "num_graphs": 1,
+  "p_layers": [
+    7
+  ],
+  "max_weights": [
+    1000000000
+  ],
+  "weight_modes": [
+    "yz"
+  ],
+  "graph_meta_by_q": {
+    "45": {
+      "1": {
+        "edges_json": "/home/quantum/ys_lee/Pauli-Propagation---GPU-acceleration/QAOA/artifacts/sweep_q45_q50_q55_sparse_dryrun/q45/graphs/edges_graph_01.json",
+        "n_qubits": 45,
+        "n_edges": 79,
+        "graph_source": "sampled_target_density",
+        "plot": "/home/quantum/ys_lee/Pauli-Propagation---GPU-acceleration/QAOA/artifacts/sweep_q45_q50_q55_sparse_dryrun/q45/plots/graph_01.png",
+        "anneal_report": "/home/quantum/ys_lee/Pauli-Propagation---GPU-acceleration/QAOA/artifacts/sweep_q45_q50_q55_sparse_dryrun/q45/anneal_reports/graph_01_anneal.json",
+        "anneal_best_cut": 66.0,
+        "anneal_best_bitstring": "000111011001101000100001010101101000001001001"
+      }
+    },
+    "50": {
+      "1": {
+        "edges_json": "/home/quantum/ys_lee/Pauli-Propagation---GPU-acceleration/QAOA/artifacts/sweep_q45_q50_q55_sparse_dryrun/q50/graphs/edges_graph_01.json",
+        "n_qubits": 50,
+        "n_edges": 98,
+        "graph_source": "sampled_target_density",
+        "plot": "/home/quantum/ys_lee/Pauli-Propagation---GPU-acceleration/QAOA/artifacts/sweep_q45_q50_q55_sparse_dryrun/q50/plots/graph_01.png",
+        "anneal_report": "/home/quantum/ys_lee/Pauli-Propagation---GPU-acceleration/QAOA/artifacts/sweep_q45_q50_q55_sparse_dryrun/q50/anneal_reports/graph_01_anneal.json",
+        "anneal_best_cut": 82.0,
+        "anneal_best_bitstring": "11101011100000010011111000101001111110101000010101"
+      }
+    },
+    "55": {
+      "1": {
+        "edges_json": "/home/quantum/ys_lee/Pauli-Propagation---GPU-acceleration/QAOA/artifacts/sweep_q45_q50_q55_sparse_dryrun/q55/graphs/edges_graph_01.json",
+        "n_qubits": 55,
+        "n_edges": 119,
+        "graph_source": "sampled_target_density",
+        "plot": "/home/quantum/ys_lee/Pauli-Propagation---GPU-acceleration/QAOA/artifacts/sweep_q45_q50_q55_sparse_dryrun/q55/plots/graph_01.png",
+        "anneal_report": "/home/quantum/ys_lee/Pauli-Propagation---GPU-acceleration/QAOA/artifacts/sweep_q45_q50_q55_sparse_dryrun/q55/anneal_reports/graph_01_anneal.json",
+        "anneal_best_cut": 99.0,
+        "anneal_best_bitstring": "0010010001111100110101101100101110110000101000010111000"
+      }
+    }
+  },
+  "records": [
+    {
+      "n_qubits": 45,
+      "graph_index": 1,
+      "graph_edges_json": "/home/quantum/ys_lee/Pauli-Propagation---GPU-acceleration/QAOA/artifacts/sweep_q45_q50_q55_sparse_dryrun/q45/graphs/edges_graph_01.json",
+      "graph_plot": "/home/quantum/ys_lee/Pauli-Propagation---GPU-acceleration/QAOA/artifacts/sweep_q45_q50_q55_sparse_dryrun/q45/plots/graph_01.png",
+      "graph_anneal_report": "/home/quantum/ys_lee/Pauli-Propagation---GPU-acceleration/QAOA/artifacts/sweep_q45_q50_q55_sparse_dryrun/q45/anneal_reports/graph_01_anneal.json",
+      "graph_anneal_best_cut": 66.0,
+      "p_layers": 7,
+      "weight_mode": "yz",
+      "max_weight": 1000000000,
+      "run_name": "qaoa_pps_q45_g01_p07_wmyz_mw1000000000",
+      "seed": 1000451070,
+      "status": "dry_run",
+      "return_code": 0,
+      "checkpoint": "/home/quantum/ys_lee/Pauli-Propagation---GPU-acceleration/QAOA/artifacts/sweep_q45_q50_q55_sparse_dryrun/q45/runs/qaoa_pps_q45_g01_p07_wmyz_mw1000000000.pt",
+      "report": "/home/quantum/ys_lee/Pauli-Propagation---GPU-acceleration/QAOA/artifacts/sweep_q45_q50_q55_sparse_dryrun/q45/runs/qaoa_pps_q45_g01_p07_wmyz_mw1000000000.json"
+    },
+    {
+      "n_qubits": 50,
+      "graph_index": 1,
+      "graph_edges_json": "/home/quantum/ys_lee/Pauli-Propagation---GPU-acceleration/QAOA/artifacts/sweep_q45_q50_q55_sparse_dryrun/q50/graphs/edges_graph_01.json",
+      "graph_plot": "/home/quantum/ys_lee/Pauli-Propagation---GPU-acceleration/QAOA/artifacts/sweep_q45_q50_q55_sparse_dryrun/q50/plots/graph_01.png",
+      "graph_anneal_report": "/home/quantum/ys_lee/Pauli-Propagation---GPU-acceleration/QAOA/artifacts/sweep_q45_q50_q55_sparse_dryrun/q50/anneal_reports/graph_01_anneal.json",
+      "graph_anneal_best_cut": 82.0,
+      "p_layers": 7,
+      "weight_mode": "yz",
+      "max_weight": 1000000000,
+      "run_name": "qaoa_pps_q50_g01_p07_wmyz_mw1000000000",
+      "seed": 1000501070,
+      "status": "dry_run",
+      "return_code": 0,
+      "checkpoint": "/home/quantum/ys_lee/Pauli-Propagation---GPU-acceleration/QAOA/artifacts/sweep_q45_q50_q55_sparse_dryrun/q50/runs/qaoa_pps_q50_g01_p07_wmyz_mw1000000000.pt",
+      "report": "/home/quantum/ys_lee/Pauli-Propagation---GPU-acceleration/QAOA/artifacts/sweep_q45_q50_q55_sparse_dryrun/q50/runs/qaoa_pps_q50_g01_p07_wmyz_mw1000000000.json"
+    },
+    {
+      "n_qubits": 55,
+      "graph_index": 1,
+      "graph_edges_json": "/home/quantum/ys_lee/Pauli-Propagation---GPU-acceleration/QAOA/artifacts/sweep_q45_q50_q55_sparse_dryrun/q55/graphs/edges_graph_01.json",
+      "graph_plot": "/home/quantum/ys_lee/Pauli-Propagation---GPU-acceleration/QAOA/artifacts/sweep_q45_q50_q55_sparse_dryrun/q55/plots/graph_01.png",
+      "graph_anneal_report": "/home/quantum/ys_lee/Pauli-Propagation---GPU-acceleration/QAOA/artifacts/sweep_q45_q50_q55_sparse_dryrun/q55/anneal_reports/graph_01_anneal.json",
+      "graph_anneal_best_cut": 99.0,
+      "p_layers": 7,
+      "weight_mode": "yz",
+      "max_weight": 1000000000,
+      "run_name": "qaoa_pps_q55_g01_p07_wmyz_mw1000000000",
+      "seed": 1000551070,
+      "status": "dry_run",
+      "return_code": 0,
+      "checkpoint": "/home/quantum/ys_lee/Pauli-Propagation---GPU-acceleration/QAOA/artifacts/sweep_q45_q50_q55_sparse_dryrun/q55/runs/qaoa_pps_q55_g01_p07_wmyz_mw1000000000.pt",
+      "report": "/home/quantum/ys_lee/Pauli-Propagation---GPU-acceleration/QAOA/artifacts/sweep_q45_q50_q55_sparse_dryrun/q55/runs/qaoa_pps_q55_g01_p07_wmyz_mw1000000000.json"
+    }
+  ],
+  "skip_training": false
+}
