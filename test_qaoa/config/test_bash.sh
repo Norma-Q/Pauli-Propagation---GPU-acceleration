@@ -1,0 +1,2 @@
+python /home/ubuntu/PPS-lab/test_qaoa/entire_qaoa_process.py --config /home/ubuntu/PPS-lab/test_qaoa/config/test_10.yaml
+python /home/ubuntu/PPS-lab/test_qaoa/entire_qaoa_process.py --config /home/ubuntu/PPS-lab/test_qaoa/config/test_15.yaml

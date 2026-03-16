@@ -26,11 +26,9 @@ src_tensor/_pps_tensor_backend_candidate.so
 src_tensor/_pps_tensor_backend_local.so.bak
 ##### files to be ignored for specific projects #####
 cudaq_sampling/
-test_qaoa/artifacts/
 test_qaoa/results/
-test_qaoa/graph/
-test_qaoa/config/
-test_qaoa/config_quantinuum.yaml
+
+
 
 QAOA/
 
@@ -45,6 +43,10 @@ embedding_implementation_from_scratch.md
 
 max_weight_truncation_analysis/
 
+one_layer_qaoa_maxcut/
+multi_layer_qaoa_maxcut/
+multi_layer_qaoa_maxcut_initialization/
+initialization_comparison.ipynb
 
 generating_configfiles.py
 generating_shfiles.py
