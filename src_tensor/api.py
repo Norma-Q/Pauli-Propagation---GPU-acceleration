@@ -44,6 +44,24 @@ from .tensor_sampler import TensorSparseSampler
 from .tensor_types import TensorPauliSum
 
 
+def _expvals_parallel_worker(args: Tuple) -> Tensor:
+    from .tensor_adjoint import adjoint_weights_on_zero
+
+    (
+        rank, devices, psum_union, thetas, embedding_chunk, chunk_size
+    ) = args
+
+    device = devices[rank]
+    w_chunk = adjoint_weights_on_zero(
+        psum_union,
+        thetas,
+        embedding=embedding_chunk,
+        compute_device=device,
+        chunk_size=chunk_size,
+    )
+    return w_chunk.cpu()
+
+
 @dataclass(frozen=True)
 class TensorSurrogatePreset:
     """Execution preset for high-level API."""
@@ -185,31 +203,65 @@ class CompiledTensorSurrogate:
         thetas: Any,
         *,
         embedding: Any = None,
+        parallel: bool = False,
     ) -> Tensor:
         """Evaluate expectation values with optional data priors (embedding)."""
         if not _TORCH_AVAILABLE:
             raise RuntimeError("PyTorch is required for tensor backend.")
 
-        # [수정 포인트] embedding이 입력되었을 때만 배치 차원을 검사합니다.
-        # 기존의 1D 입력을 (1, N)으로 만들어 하부 로직이 항상 2D(Batch)를 기대하게 합니다.
+        embedding_was_vector = False
         if embedding is not None:
             if embedding.ndim == 1:
+                embedding_was_vector = True
                 embedding = embedding.unsqueeze(0)
         
-        # adjoint_weights_on_zero는 이제 (Batch, Num_Paulis)를 반환하도록 2단계에서 수정할 것입니다.
-        w = adjoint_weights_on_zero(
-            self.psum_union,
-            thetas,
-            embedding=embedding,
-            compute_device=self.preset.compute_device,
-            chunk_size=self.preset.chunk_size,
+        num_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
+        use_parallel = (
+            parallel
+            and embedding is not None
+            and embedding.shape[0] > 1
+            and num_gpus > 1
         )
+
+        if use_parallel:
+            devices = [f"cuda:{i}" for i in range(num_gpus)]
+            embedding_chunks = torch.chunk(embedding, num_gpus)
+            worker_args = [
+                (
+                    i,
+                    devices,
+                    self.psum_union,
+                    thetas,
+                    embedding_chunks[i],
+                    self.preset.chunk_size,
+                )
+                for i in range(num_gpus)
+            ]
+
+            import torch.multiprocessing as mp
+
+            ctx = mp.get_context("spawn")
+            with ctx.Pool(processes=num_gpus) as pool:
+                w_chunks_cpu = pool.map(_expvals_parallel_worker, worker_args)
+
+            w = torch.cat(w_chunks_cpu, dim=0)
+        else:
+            w = adjoint_weights_on_zero(
+                self.psum_union,
+                thetas,
+                embedding=embedding,
+                compute_device=self.preset.compute_device,
+                chunk_size=self.preset.chunk_size,
+            )
         
         V0 = self._get_V0(device=str(w.device), dtype=w.dtype)
         
-        # [수정 포인트] expvals_from_w_and_coeff_matrix 내부에서 Batch Matmul을 수행하게 합니다.
         res = expvals_from_w_and_coeff_matrix(w, V0)
-        
+
+        if embedding is None and res.dim() == 2 and int(res.shape[0]) == 1:
+            return res.squeeze(0)
+        if embedding_was_vector and res.dim() == 2 and int(res.shape[0]) == 1:
+            return res.squeeze(0)
         return res
 
     def expval(
@@ -559,6 +611,8 @@ def compile_expval_program(
     build_thetas: Any = None,
     build_min_abs: Optional[float] = None,
     build_min_mat_abs: Optional[float] = None,
+    parallel_compile: bool = False,
+    parallel_devices: Optional[Sequence[int]] = None,
 ) -> CompiledTensorSurrogate:
     """Compile a reusable expval program with fixed memory-first flow.
 
@@ -592,6 +646,8 @@ def compile_expval_program(
         min_abs=build_min_abs,
         min_mat_abs=build_min_mat_abs,
         chunk_size=int(cfg.chunk_size),
+        parallel_compile=parallel_compile,
+        parallel_devices=parallel_devices,
     )
 
 

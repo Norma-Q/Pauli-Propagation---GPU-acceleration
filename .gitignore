@@ -27,7 +27,13 @@ src_tensor/_pps_tensor_backend_local.so.bak
 ##### files to be ignored for specific projects #####
 cudaq_sampling/
 test_qaoa/artifacts/
-Tutorial/
+test_qaoa/results/
+test_qaoa/graph/
+test_qaoa/config/
+test_qaoa/config_quantinuum.yaml
+
+QAOA/
+
 batch.ipynb
 embedding.ipynb
 QGAN_adaptability.ipynb
@@ -37,6 +43,9 @@ benchmark_cpu_vs_gpu_storage.ipynb
 batch_implementation_from_embedding.md
 embedding_implementation_from_scratch.md
 NPU_PPS_validation_demo.ipynb
-NPU_PPS_validation_demo.ipynb
-QAOA
-QAOA_1layer_Analysis
+max_weight_truncation_analysis/
+generating_configfiles.py
+generating_shfiles.py
+QAOA_1layer_Analysis/
+
+# 캐시 삭제하고 싶으면 git rm -r --cached <file> 명령어 사용

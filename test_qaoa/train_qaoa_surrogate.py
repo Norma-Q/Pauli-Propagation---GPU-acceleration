@@ -20,6 +20,8 @@ from qaoa_surrogate_common import (
     build_maxcut_observable,
     build_qaoa_circuit,
     build_qaoa_theta_init_tqa,
+    choose_device,
+    default_cpu_exact_overrides,
     expected_cut_from_sum_zz,
     load_edges_json,
     load_qaoa_problem_json,
@@ -135,18 +137,18 @@ def _train_one_delta_t(
     seed: int,
     log_every: int,
 ) -> Dict[str, Any]:
-    torch.manual_seed(int(seed))
-    np.random.seed(int(seed))
+    torch.manual_seed(seed)
+    np.random.seed(seed)
 
     init_theta_np = build_qaoa_theta_init_tqa(
-        p_layers=int(p_layers),
-        n_edges=int(m_edges),
-        n_qubits=int(n_qubits),
-        delta_t=float(delta_t),
+        p_layers=p_layers,
+        n_edges=m_edges,
+        n_qubits=n_qubits,
+        delta_t=delta_t,
         dtype=np.float64,
     )
-    if int(init_theta_np.shape[0]) != int(n_params):
-        raise RuntimeError(f"TQA init size mismatch: {int(init_theta_np.shape[0])} vs n_params={int(n_params)}")
+    if init_theta_np.shape[0] != n_params:
+        raise RuntimeError(f"TQA init size mismatch: {init_theta_np.shape[0]} vs n_params={n_params}")
 
     thetas = torch.nn.Parameter(torch.tensor(init_theta_np, dtype=torch.float64, device=run_device))
     program = compile_expval_program(
@@ -154,12 +156,12 @@ def _train_one_delta_t(
         observables=[zz_obj],
         preset=preset,
         preset_overrides=preset_overrides,
-        build_min_abs=float(build_min_abs),
+        build_min_abs=build_min_abs,
         build_min_mat_abs=build_min_mat_abs,
         build_thetas=thetas,
     )
 
-    opt = torch.optim.Adam([thetas], lr=float(lr))
+    opt = torch.optim.Adam([thetas], lr=lr)
     best_val = float("inf")
     best_thetas = None
     history = []
@@ -167,7 +169,7 @@ def _train_one_delta_t(
 
     stream_device = run_device
     offload_back = bool(run_device.startswith("cuda"))
-    for step in range(int(steps)):
+    for step in range(steps):
         opt.zero_grad(set_to_none=True)
         zz_val = program.expval(
             thetas,
@@ -191,7 +193,7 @@ def _train_one_delta_t(
             best_val = val
             best_thetas = thetas.detach().cpu().clone()
 
-        if (step % int(log_every) == 0) or (step == int(steps) - 1):
+        if (step % log_every == 0) or (step == steps - 1):
             exp_cut = expected_cut_from_sum_zz(val, m_edges)
             print(f"step={step:04d} sum<ZZ>={val:+.8f} E[cut]={exp_cut:.6f}")
 
@@ -244,15 +246,15 @@ def _build_payload(
     payload: Dict[str, Any] = {
         "config": {
             "n_qubits": n_qubits,
-            "p_layers": int(p_layers),
-            "delta_t": float(delta_t),
-            "steps": int(steps),
-            "lr": float(lr),
-            "seed": int(seed),
+            "p_layers": p_layers,
+            "delta_t": delta_t,
+            "steps": steps,
+            "lr": lr,
+            "seed": seed,
             "device": run_device,
             "preset": preset,
             "preset_overrides": preset_overrides,
-            "build_min_abs": float(build_min_abs),
+            "build_min_abs": build_min_abs,
             "build_min_mat_abs": build_min_mat_abs,
             "problem_json": problem_json,
         },
@@ -263,7 +265,7 @@ def _build_payload(
         "surrogate_settings": surrogate_settings,
         "training_config": training_config,
         "m_edges": m_edges,
-        "n_params": int(n_params),
+        "n_params": n_params,
         "history_sum_zz": run_result["history_sum_zz"],
         "history_expected_cut": run_result["history_expected_cut"],
         "step_log": run_result["step_log"],
@@ -288,30 +290,30 @@ def _build_payload(
 def main() -> None:
     args = parse_args()
 
-    torch.manual_seed(int(args.seed))
-    np.random.seed(int(args.seed))
+    torch.manual_seed(args.seed)
+    np.random.seed(args.seed)
 
     problem_def = None
     if str(args.problem_json).strip():
         problem_def = load_qaoa_problem_json(args.problem_json)
-        n_qubits = int(problem_def["n_qubits"])
+        n_qubits = problem_def["n_qubits"]
         edges = list(problem_def["edges"])
-        p_layers = int(problem_def["qaoa"]["p_layers"])
-        base_delta_t = float(problem_def["qaoa"]["init"]["delta_t"])
+        p_layers = problem_def["qaoa"]["p_layers"]
+        base_delta_t = problem_def["qaoa"]["init"]["delta_t"]
     else:
-        n_qubits = int(args.n_qubits)
-        p_layers = int(args.p_layers)
-        base_delta_t = float(args.delta_t)
+        n_qubits = args.n_qubits
+        p_layers = args.p_layers
+        base_delta_t = args.delta_t
         if args.edges_json:
             edges = load_edges_json(args.edges_json)
         else:
-            edges = make_ring_chord_graph(n_qubits=n_qubits, chord_shift=int(args.chord_shift))
+            edges = make_ring_chord_graph(n_qubits=n_qubits, chord_shift=args.chord_shift)
 
     m_edges = len(edges)
     if m_edges < 1:
         raise ValueError("The graph must contain at least one edge.")
 
-    circuit, n_params = build_qaoa_circuit(n_qubits=n_qubits, edges=edges, p_layers=int(p_layers))
+    circuit, n_params = build_qaoa_circuit(n_qubits=n_qubits, edges=edges, p_layers=p_layers)
     zz_obj = build_maxcut_observable(n_qubits=n_qubits, edges=edges)
 
     delta_t_values = _parse_delta_t_sweep(args.delta_t_sweep)
@@ -320,7 +322,7 @@ def main() -> None:
     else:
         print(f"[delta_t sweep] using explicit list: {delta_t_values}")
 
-    run_device = _choose_device(str(args.device))
+    run_device = choose_device(args.device)
     if run_device.startswith("cuda") and not torch.cuda.is_available():
         raise RuntimeError("CUDA device requested but torch.cuda.is_available() is False.")
 
@@ -332,7 +334,7 @@ def main() -> None:
     preset_overrides: Optional[Dict[str, object]] = None
     if run_device == "cpu" and preset == "cpu":
         # Keep parity with Tutorial/07 CPU fallback.
-        preset_overrides = _default_cpu_exact_overrides()
+        preset_overrides = default_cpu_exact_overrides()
 
     out_path = Path(args.output)
     if str(args.output_json).lower() == "auto":
@@ -344,23 +346,23 @@ def main() -> None:
 
     qaoa_structure = {
         "n_qubits": n_qubits,
-        "p_layers": int(p_layers),
+        "p_layers": p_layers,
         "n_edges": m_edges,
-        "n_params": int(n_params),
+        "n_params": n_params,
         "init_state": "|+>^n (Hadamard on each qubit)",
         "layer_pattern": "for each layer: ZZ rotations on all edges, then X rotations on all qubits",
         "gate_counts": {
-            "hadamard": int(n_qubits),
-            "cost_pauli_rotation_zz": int(m_edges * int(p_layers)),
-            "mixer_pauli_rotation_x": int(n_qubits * int(p_layers)),
-            "total_gates": int(len(circuit)),
+            "hadamard": n_qubits,
+            "cost_pauli_rotation_zz": m_edges * p_layers,
+            "mixer_pauli_rotation_x": n_qubits * p_layers,
+            "total_gates": len(circuit),
         },
     }
     surrogate_settings = {
         "preset": preset,
         "preset_overrides": preset_overrides,
         "compile": {
-            "build_min_abs": float(args.build_min_abs),
+            "build_min_abs": args.build_min_abs,
             "build_min_mat_abs": args.build_min_mat_abs,
             "build_thetas_from": "TQA init theta",
         },
@@ -380,20 +382,20 @@ def main() -> None:
         run_result = _train_one_delta_t(
             delta_t=float(delta_t),
             n_qubits=n_qubits,
-            p_layers=int(p_layers),
+            p_layers=p_layers,
             m_edges=m_edges,
-            n_params=int(n_params),
+            n_params=n_params,
             circuit=circuit,
             zz_obj=zz_obj,
             run_device=run_device,
             preset=preset,
             preset_overrides=preset_overrides,
-            build_min_abs=float(args.build_min_abs),
+            build_min_abs=args.build_min_abs,
             build_min_mat_abs=args.build_min_mat_abs,
-            steps=int(args.steps),
-            lr=float(args.lr),
-            seed=int(args.seed),
-            log_every=int(args.log_every),
+            steps=args.steps,
+            lr=args.lr,
+            seed=args.seed,
+            log_every=args.log_every,
         )
         run_results.append(run_result)
         run_summary = {
@@ -430,23 +432,23 @@ def main() -> None:
             run_out_path = out_path.with_name(f"{out_path.stem}_dt{tag}{pt_suffix}")
             run_training_config = {
                 "optimizer": "Adam",
-                "lr": float(args.lr),
-                "steps": int(args.steps),
-                "seed": int(args.seed),
+                "lr": args.lr,
+                "steps": args.steps,
+                "seed": args.seed,
                 "delta_t_tqa_init": float(delta_t),
-                "log_every": int(args.log_every),
+                "log_every": args.log_every,
             }
             run_payload = _build_payload(
                 n_qubits=n_qubits,
-                p_layers=int(p_layers),
+                p_layers=p_layers,
                 delta_t=float(delta_t),
-                steps=int(args.steps),
-                lr=float(args.lr),
-                seed=int(args.seed),
+                steps=args.steps,
+                lr=args.lr,
+                seed=args.seed,
                 run_device=run_device,
                 preset=preset,
                 preset_overrides=preset_overrides,
-                build_min_abs=float(args.build_min_abs),
+                build_min_abs=args.build_min_abs,
                 build_min_mat_abs=args.build_min_mat_abs,
                 problem_json=(str(args.problem_json) if str(args.problem_json).strip() else None),
                 problem_definition=(problem_def["raw"] if problem_def is not None else None),
@@ -456,7 +458,7 @@ def main() -> None:
                 surrogate_settings=surrogate_settings,
                 training_config=run_training_config,
                 m_edges=m_edges,
-                n_params=int(n_params),
+                n_params=n_params,
                 run_result=run_result,
                 delta_t_values=[float(delta_t)],
                 sweep_runs=[],
@@ -501,23 +503,23 @@ def main() -> None:
 
     training_config = {
         "optimizer": "Adam",
-        "lr": float(args.lr),
-        "steps": int(args.steps),
-        "seed": int(args.seed),
+        "lr": args.lr,
+        "steps": args.steps,
+        "seed": args.seed,
         "delta_t_tqa_init": float(selected_delta_t),
-        "log_every": int(args.log_every),
+        "log_every": args.log_every,
     }
     payload = _build_payload(
         n_qubits=n_qubits,
-        p_layers=int(p_layers),
+        p_layers=p_layers,
         delta_t=float(selected_delta_t),
-        steps=int(args.steps),
-        lr=float(args.lr),
-        seed=int(args.seed),
+        steps=args.steps,
+        lr=args.lr,
+        seed=args.seed,
         run_device=run_device,
         preset=preset,
         preset_overrides=preset_overrides,
-        build_min_abs=float(args.build_min_abs),
+        build_min_abs=args.build_min_abs,
         build_min_mat_abs=args.build_min_mat_abs,
         problem_json=(str(args.problem_json) if str(args.problem_json).strip() else None),
         problem_definition=(problem_def["raw"] if problem_def is not None else None),
@@ -527,7 +529,7 @@ def main() -> None:
         surrogate_settings=surrogate_settings,
         training_config=training_config,
         m_edges=m_edges,
-        n_params=int(n_params),
+        n_params=n_params,
         run_result=selected_run,
         delta_t_values=[float(v) for v in delta_t_values],
         sweep_runs=run_summaries,

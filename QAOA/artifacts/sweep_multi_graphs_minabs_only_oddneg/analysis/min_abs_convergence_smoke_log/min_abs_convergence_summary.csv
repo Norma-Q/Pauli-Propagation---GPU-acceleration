@@ -1,3 +1,0 @@
-run_name,n_qubits,p_layers,graph_index,target_step,abs_eps,converged,tail_window,tail_max_abs_delta,tail_mean_abs_delta,stable_from_min_abs,recommended_min_abs,min_abs_values,expected_values,pair_abs_deltas
-qaoa_pps_q30_g01_p03_wmyz_mw1000000000,30,3,1,0,0.5,False,1,1.2288999557495117,1.2288999557495117,,,"[0.01, 0.001]","[93.16458702087402, 91.93568706512451]",[1.2288999557495117]
-qaoa_pps_q30_g01_p03_wmyz_mw1000000000,30,3,1,final,0.5,False,1,5.623689651489258,5.623689651489258,,,"[0.01, 0.001]","[91.25704002380371, 96.88072967529297]",[5.623689651489258]

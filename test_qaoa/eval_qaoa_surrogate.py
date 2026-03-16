@@ -23,7 +23,9 @@ from qaoa_surrogate_common import (
     build_maxcut_observable,
     build_qaoa_circuit,
     build_qaoa_theta_init_tqa,
+    choose_device,
     cut_value_from_bits,
+    default_cpu_exact_overrides,
     expected_cut_from_sum_zz,
     parse_min_abs_schedule,
 )
@@ -67,7 +69,7 @@ def _compile_program_for_eval(
     preset = "gpu" if run_device.startswith("cuda") else "cpu"
     preset_overrides = None
     if run_device == "cpu" and preset == "cpu":
-        preset_overrides = _cpu_exact_overrides()
+        preset_overrides = default_cpu_exact_overrides()
 
     program = compile_expval_program(
         circuit=circuit,
@@ -443,7 +445,7 @@ def main() -> None:
     m_edges = int(data["m_edges"])
     best_thetas_cpu = data["best_thetas"].detach().cpu().to(torch.float64)
     history_sum_zz = [float(v) for v in data.get("history_sum_zz", [])]
-    run_device = _choose_device(str(args.device))
+    run_device = choose_device(args.device)
     plot_dir = Path(args.plot_dir)
 
     if run_device.startswith("cuda") and not torch.cuda.is_available():

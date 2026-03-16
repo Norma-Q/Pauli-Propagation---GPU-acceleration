@@ -10,8 +10,9 @@ then walks steps backwards to remove any input columns that cannot reach them.
 
 from __future__ import annotations
 
-from typing import Any, List, Optional, TYPE_CHECKING, Tuple, cast
+from typing import Any, List, Optional, Sequence, TYPE_CHECKING, Tuple, cast
 import math
+import torch.multiprocessing as mp
 
 torch: Any
 try:
@@ -41,6 +42,46 @@ from .tensor_propagate_impl import (
 )
 
 
+_PARALLEL_USABLE_VRAM_RATIO = 0.875
+_PARALLEL_TARGET_USAGE_RATIO = 0.50
+_PARALLEL_BYTES_PER_TERM_EST = 120
+_PARALLEL_SOFT_VRAM_GB = 9.5
+_PARALLEL_HARD_VRAM_GB = 11.0
+_PARALLEL_MIN_TERMS_SOFT = 10_000_000
+_PARALLEL_MIN_TERMS_HARD = 5_000_000
+_PARALLEL_CONSEC_STEPS_SOFT = 2
+
+
+def _auto_parallel_threshold_from_device(compute_device: str) -> int:
+    if (not torch.cuda.is_available()) or (not str(compute_device).startswith("cuda")):
+        return 1_000_000
+
+    try:
+        if ":" in str(compute_device):
+            dev_idx = int(str(compute_device).split(":", 1)[1])
+        else:
+            dev_idx = 0
+
+        props = torch.cuda.get_device_properties(dev_idx)
+        total_bytes = int(props.total_memory)
+        usable_bytes = int(total_bytes * _PARALLEL_USABLE_VRAM_RATIO)
+        budget_bytes = int(usable_bytes * _PARALLEL_TARGET_USAGE_RATIO)
+
+        threshold = int(budget_bytes // _PARALLEL_BYTES_PER_TERM_EST)
+        return max(1_000_000, threshold)
+    except Exception:
+        return 1_000_000
+
+
+def _current_vram_allocated_gb(device: str) -> float:
+    if (not torch.cuda.is_available()) or (not str(device).startswith("cuda")):
+        return 0.0
+    try:
+        return float(torch.cuda.memory_allocated(device) / (1024 ** 3))
+    except Exception:
+        return 0.0
+
+
 def _make_sparse(row_idx, col_idx, values, shape, device, dtype):
     if row_idx.numel() == 0:
         return torch.sparse_coo_tensor(
@@ -54,6 +95,25 @@ def _make_sparse(row_idx, col_idx, values, shape, device, dtype):
     sp = torch.sparse_coo_tensor(indices, values, size=shape, device=device, dtype=dtype)
     # Memory-first default: avoid coalesce() (it can allocate large temporary buffers).
     return sp
+
+
+def _parallel_propagate_worker(args: Tuple) -> Tuple[Tensor, Tensor, TensorSparseStep, Optional[Tensor]]:
+    (
+        rank, devices, builder_fn, x_mask_chunk, z_mask_chunk,
+        chunk_size, step_device, output_device, kwargs
+    ) = args
+
+    device = devices[rank]
+    return _process_step_chunked(
+        builder_fn,
+        x_mask_chunk,
+        z_mask_chunk,
+        chunk_size,
+        device,
+        step_device,
+        output_device,
+        **kwargs,
+    )
 
 
 def _xmask_is_zero_rows(x_mask: Tensor) -> Tensor:
@@ -267,6 +327,8 @@ def _filter_step_rows_cols(step: TensorSparseStep, row_mask: Tensor, col_mask: T
         same_cols_dev = step.same_cols
         keep_same = row_mask[: int(same_cols_dev.numel())].to(same_cols_dev.device)
         col_mask_dev = col_mask.to(same_cols_dev.device)
+        if same_cols_dev.numel() > 0:
+            keep_same = keep_same & col_mask_dev.index_select(0, same_cols_dev)
         col_map = torch.cumsum(col_mask_dev.to(torch.int64), dim=0) - 1
         kept_same_cols = same_cols_dev[keep_same]
         same_cols = col_map[kept_same_cols] if kept_same_cols.numel() > 0 else same_cols_dev[:0]
@@ -618,6 +680,139 @@ def _process_step_chunked(
     return full_new_x, full_new_z, full_step, full_cache
 
 
+def _process_step_parallel(
+    builder_fn,
+    x_mask_in: Tensor,
+    z_mask_in: Tensor,
+    chunk_size: int,
+    devices: List[str],
+    step_device: str,
+    output_device: str = "cpu",
+    parallel_threshold: int = 1_000_000,
+    **kwargs,
+) -> Tuple[Tensor, Tensor, TensorSparseStep, Optional[Tensor]]:
+    n_terms = int(x_mask_in.shape[0])
+    n_gpus = len(devices)
+
+    if n_terms < int(parallel_threshold) or n_gpus < 2:
+
+        return _process_step_chunked(
+            builder_fn,
+            x_mask_in,
+            z_mask_in,
+            chunk_size,
+            devices[0],
+            step_device,
+            output_device,
+            **kwargs,
+        )
+
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    input_indices_chunks = torch.chunk(torch.arange(n_terms), n_gpus)
+    worker_args = []
+    for i in range(n_gpus):
+        worker_kwargs = kwargs.copy()
+        if "coeffs_cache" in kwargs and kwargs["coeffs_cache"] is not None:
+            worker_kwargs["coeffs_cache"] = kwargs["coeffs_cache"][input_indices_chunks[i]]
+        worker_args.append(
+            (
+                i,
+                devices,
+                builder_fn,
+                x_mask_in[input_indices_chunks[i]],
+                z_mask_in[input_indices_chunks[i]],
+                chunk_size,
+                step_device,
+                output_device,
+                worker_kwargs,
+            )
+        )
+
+    ctx = mp.get_context("spawn")
+    with ctx.Pool(processes=n_gpus) as pool:
+        results = pool.map(_parallel_propagate_worker, worker_args)
+
+    step_parts = [r[2] for r in results]
+    if any(s.same_cols is not None for s in step_parts):
+        return _process_step_chunked(
+            builder_fn,
+            x_mask_in,
+            z_mask_in,
+            chunk_size,
+            devices[0],
+            step_device,
+            output_device,
+            **kwargs,
+        )
+
+    new_x_parts = [r[0] for r in results]
+    new_z_parts = [r[1] for r in results]
+    cache_parts = [r[3] for r in results if r[3] is not None]
+    results = None
+
+    full_new_x = _destructive_cat(new_x_parts, dim=0)
+    full_new_z = _destructive_cat(new_z_parts, dim=0)
+    full_cache = _destructive_cat(cache_parts, dim=0) if cache_parts else None
+
+    const_indices, const_values = [], []
+    cos_indices, cos_values = [], []
+    sin_indices, sin_values = [], []
+    row_offset = 0
+    col_offset = 0
+
+    def _append_sparse(mat, indices_list, values_list, r_off, c_off):
+        if mat._nnz() > 0:
+            if not mat.is_coalesced():
+                mat = mat.coalesce()
+            idx = mat.indices()
+            val = mat.values()
+            idx[0] += r_off
+            idx[1] += c_off
+            indices_list.append(idx)
+            values_list.append(val)
+
+    ref_step = step_parts[0]
+    for step in step_parts:
+        _append_sparse(step.mat_const, const_indices, const_values, row_offset, col_offset)
+        _append_sparse(step.mat_cos, cos_indices, cos_values, row_offset, col_offset)
+        _append_sparse(step.mat_sin, sin_indices, sin_values, row_offset, col_offset)
+        row_offset += int(step.shape[0])
+        col_offset += int(step.shape[1])
+
+    def _concat_sparse(indices_list, values_list, shape, t_dtype):
+        if not indices_list:
+            return _make_sparse(
+                torch.tensor([], dtype=torch.int64),
+                torch.tensor([], dtype=torch.int64),
+                torch.tensor([], dtype=t_dtype),
+                shape,
+                step_device,
+                t_dtype,
+            )
+        all_indices = _destructive_cat(indices_list, dim=1).to(step_device)
+        all_values = _destructive_cat(values_list, dim=0).to(step_device)
+        return torch.sparse_coo_tensor(all_indices, all_values, size=shape, device=step_device)
+
+    full_shape = (row_offset, col_offset)
+    t_dtype = kwargs["t_dtype"]
+    mat_const = _concat_sparse(const_indices, const_values, full_shape, t_dtype)
+    mat_cos = _concat_sparse(cos_indices, cos_values, full_shape, t_dtype)
+    mat_sin = _concat_sparse(sin_indices, sin_values, full_shape, t_dtype)
+
+    full_step = TensorSparseStep(
+        mat_const=mat_const,
+        mat_cos=mat_cos,
+        mat_sin=mat_sin,
+        param_idx=ref_step.param_idx,
+        emb_idx=ref_step.emb_idx,
+        shape=full_shape,
+    )
+
+    return full_new_x, full_new_z, full_step, full_cache
+
+
 def propagate_surrogate_tensor(
     circuit,
     observable,
@@ -632,6 +827,9 @@ def propagate_surrogate_tensor(
     min_abs: Optional[float] = None,
     min_mat_abs: Optional[float] = None,
     chunk_size: int = 1_000_000,
+    parallel_compile: bool = False,
+    parallel_threshold: int = -1,
+    parallel_devices: Optional[Sequence[int]] = None,
 ) -> TensorPauliSum:
     """Tensor-native propagation to a tensor PauliSum.
 
@@ -683,15 +881,112 @@ def propagate_surrogate_tensor(
         if thetas_t.numel() == 0:
             thetas_t = torch.zeros(1, dtype=coeff_init.dtype, device=compute_device)
 
+    num_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
+    selected_device_ids: List[int] = []
+    if bool(parallel_compile) and str(compute_device).startswith("cuda") and num_gpus > 0:
+        if parallel_devices is None:
+            selected_device_ids = list(range(num_gpus))
+        else:
+            selected_device_ids = sorted({int(i) for i in parallel_devices})
+            if len(selected_device_ids) == 0:
+                raise ValueError("parallel_devices must not be empty when provided")
+            invalid_ids = [i for i in selected_device_ids if i < 0 or i >= num_gpus]
+            if invalid_ids:
+                raise ValueError(
+                    f"parallel_devices contains invalid GPU id(s): {invalid_ids}. available ids: 0..{num_gpus-1}"
+                )
+
+    use_parallel = bool(parallel_compile) and len(selected_device_ids) > 1 and str(compute_device).startswith("cuda")
+    parallel_started_logged = False
+    consecutive_soft_candidates = 0
+
+    if use_parallel:
+        devices = [f"cuda:{i}" for i in selected_device_ids]
+        primary_device = str(compute_device) if ":" in str(compute_device) else "cuda:0"
+
+        manual_parallel_threshold = int(parallel_threshold) if int(parallel_threshold) > 0 else None
+
+        def process_step_fn(builder_fn, x_mask, z_mask, chunk_size_local, **kwargs):
+            nonlocal parallel_started_logged, consecutive_soft_candidates
+            n_terms_local = int(x_mask.shape[0])
+
+            if manual_parallel_threshold is not None:
+                use_parallel_this_step = n_terms_local >= manual_parallel_threshold
+                effective_parallel_threshold = manual_parallel_threshold
+            else:
+                current_alloc_gb = _current_vram_allocated_gb(primary_device)
+                hard_candidate = (
+                    current_alloc_gb >= _PARALLEL_HARD_VRAM_GB
+                    and n_terms_local >= _PARALLEL_MIN_TERMS_HARD
+                )
+                soft_candidate = (
+                    current_alloc_gb >= _PARALLEL_SOFT_VRAM_GB
+                    and n_terms_local >= _PARALLEL_MIN_TERMS_SOFT
+                )
+
+                if soft_candidate:
+                    consecutive_soft_candidates += 1
+                else:
+                    consecutive_soft_candidates = 0
+
+                use_parallel_this_step = bool(
+                    hard_candidate
+                    or (consecutive_soft_candidates >= _PARALLEL_CONSEC_STEPS_SOFT)
+                )
+                effective_parallel_threshold = _PARALLEL_MIN_TERMS_HARD
+
+            if use_parallel_this_step:
+                if not parallel_started_logged:
+                    print(
+                        f"[PPS Info] Starting multi-GPU parallel compile across {num_gpus} GPUs ({devices}) "
+                        f"at terms={n_terms_local:,}."
+                    )
+                    parallel_started_logged = True
+                return _process_step_parallel(
+                    builder_fn,
+                    x_mask,
+                    z_mask,
+                    chunk_size_local,
+                    devices,
+                    memory_device,
+                    memory_device,
+                    parallel_threshold=effective_parallel_threshold,
+                    **kwargs,
+                )
+
+            return _process_step_chunked(
+                builder_fn,
+                x_mask,
+                z_mask,
+                chunk_size_local,
+                compute_device,
+                memory_device,
+                output_device=memory_device,
+                **kwargs,
+            )
+    else:
+        def process_step_fn(builder_fn, x_mask, z_mask, chunk_size_local, **kwargs):
+            return _process_step_chunked(
+                builder_fn,
+                x_mask,
+                z_mask,
+                chunk_size_local,
+                compute_device,
+                memory_device,
+                output_device=memory_device,
+                **kwargs,
+            )
+
     total_gates = len(circuit)
     for gate in tqdm(reversed(circuit), total=total_gates, desc="propagate", dynamic_ncols=True):
         gate_name = gate.__class__.__name__
 
         if gate_name == "CliffordGate":
-            new_x, new_z, step, coeffs_cache = _process_step_chunked(
+            new_x, new_z, step, coeffs_cache = process_step_fn(
                 build_clifford_step,
-                x_mask, z_mask, chunk_size, compute_device, memory_device,
-                output_device=memory_device,
+                x_mask,
+                z_mask,
+                chunk_size,
                 gate=gate,
                 t_dtype=t_dtype,
                 min_abs=min_abs_internal,
@@ -708,10 +1003,11 @@ def propagate_surrogate_tensor(
             continue
 
         if gate_name == "PauliRotation":
-            new_x, new_z, step, coeffs_cache = _process_step_chunked(
+            new_x, new_z, step, coeffs_cache = process_step_fn(
                 build_pauli_rotation_step,
-                x_mask, z_mask, chunk_size, compute_device, memory_device,
-                output_device=memory_device,
+                x_mask,
+                z_mask,
+                chunk_size,
                 gate=gate,
                 t_dtype=t_dtype,
                 min_abs=min_abs_internal,
@@ -729,10 +1025,11 @@ def propagate_surrogate_tensor(
             continue
 
         if gate_name == "DepolarizingNoise":
-            new_x, new_z, step, coeffs_cache = _process_step_chunked(
+            new_x, new_z, step, coeffs_cache = process_step_fn(
                 build_depolarizing_step,
-                x_mask, z_mask, chunk_size, compute_device, memory_device,
-                output_device=memory_device,
+                x_mask,
+                z_mask,
+                chunk_size,
                 gate=gate,
                 t_dtype=t_dtype,
                 min_abs=min_abs_internal,
@@ -749,10 +1046,11 @@ def propagate_surrogate_tensor(
             continue
 
         if gate_name == "AmplitudeDampingNoise":
-            new_x, new_z, step, coeffs_cache = _process_step_chunked(
+            new_x, new_z, step, coeffs_cache = process_step_fn(
                 build_amplitude_damping_step,
-                x_mask, z_mask, chunk_size, compute_device, memory_device,
-                output_device=memory_device,
+                x_mask,
+                z_mask,
+                chunk_size,
                 gate=gate,
                 t_dtype=t_dtype,
                 min_abs=min_abs_internal,
@@ -891,7 +1189,10 @@ def zero_filter_tensor_backprop_with_keep_mask(
         nnz_sin = int(mat_sin._nnz())
         nnz_total = nnz_const + nnz_cos + nnz_sin
 
-        if nnz_total == 0 or int(row_mask.sum().item()) == 0:
+        same_nnz = old_step.same_nnz()
+        if int(row_mask.sum().item()) == 0:
+            col_mask = torch.zeros((n_cols,), dtype=torch.bool, device=row_mask.device)
+        elif nnz_total == 0 and same_nnz == 0:
             col_mask = torch.zeros((n_cols,), dtype=torch.bool, device=row_mask.device)
         else:
             use_gpu = (
@@ -904,7 +1205,7 @@ def zero_filter_tensor_backprop_with_keep_mask(
                     row_mask_d = row_mask.to(compute_device, non_blocking=True)
                     col_mask_d = torch.zeros((n_cols,), dtype=torch.bool, device=compute_device)
 
-                    if old_step.same_nnz() > 0:
+                    if same_nnz > 0:
                         _accumulate_used_cols_same_chunked(
                             old_step.same_cols,
                             row_mask_d,

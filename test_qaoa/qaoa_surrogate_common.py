@@ -7,6 +7,7 @@ import json
 import sys
 
 import numpy as np
+import torch
 
 _THIS_DIR = Path(__file__).resolve().parent
 _REPO_ROOT = _THIS_DIR.parent
@@ -17,6 +18,25 @@ from src.pauli_surrogate_python import CliffordGate, PauliRotation, PauliSum
 
 
 Edge = Tuple[int, int]
+
+
+def choose_device(raw: str) -> str:
+    if raw == "auto":
+        return "cuda" if torch.cuda.is_available() else "cpu"
+    return str(raw)
+
+
+def default_cpu_exact_overrides() -> Dict[str, object]:
+    return {
+        "build_device": "cpu",
+        "step_device": "cpu",
+        "stream_device": "cpu",
+        "dtype": "float64",
+        "max_weight": 1_000_000_000,
+        "max_xy": 1_000_000_000,
+        "offload_steps": False,
+        "offload_back": False,
+    }
 
 
 @dataclass(frozen=True)

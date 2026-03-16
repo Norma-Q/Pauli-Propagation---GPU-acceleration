@@ -102,6 +102,9 @@ If no errors occur, the installation is successful.
 ## Run Tutorial
 Launch Jupyter and run the notebooks in `Tutorial/`:
 
+Setup/installation instructions are intentionally centralized in this README.
+`Tutorial/README_TUTORIAL.md` focuses on notebook scope/order and feature usage mapping.
+
 ```bash
 cd Pauli-propagation-surrogate
 jupyter lab
