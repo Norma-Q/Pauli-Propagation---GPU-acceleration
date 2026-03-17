@@ -1,3 +1,4 @@
+.gitignore
 .venv/
 .env/
 
@@ -28,7 +29,7 @@ src_tensor/_pps_tensor_backend_local.so.bak
 cudaq_sampling/
 test_qaoa/results/
 
-
+overleaf/
 
 QAOA/
 
@@ -43,13 +44,14 @@ embedding_implementation_from_scratch.md
 
 max_weight_truncation_analysis/
 
-one_layer_qaoa_maxcut/
+single_layer_qaoa_maxcut/
 multi_layer_qaoa_maxcut/
 multi_layer_qaoa_maxcut_initialization/
 initialization_comparison.ipynb
 
 generating_configfiles.py
 generating_shfiles.py
+lightning_gpu_vs_cudaq_benchmark.ipynb
 
 
 # 캐시 삭제하고 싶으면 git rm -r --cached <file> 명령어 사용

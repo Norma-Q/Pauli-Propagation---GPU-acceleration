@@ -188,15 +188,16 @@ def build_qaoa_circuit(n_qubits: int, edges: Sequence[Edge], p_layers: int):
     return circuit, param_idx
 
 
-def tqa_init_qaoa_params(p: int, delta_t: float, dtype=np.float64) -> QAOAParams:
-    if int(p) < 1:
-        raise ValueError("p must be >= 1")
-    if not (float(delta_t) > 0.0):
+def tqa_init_qaoa_params(p_layers: int, delta_t: float, dtype=np.float64) -> QAOAParams:
+    if int(p_layers) < 1:
+        raise ValueError("p_layers must be >= 1")
+    if float(delta_t) <= 0.0:
         raise ValueError("delta_t must be > 0")
-    i = np.arange(1, int(p) + 1, dtype=dtype)
-    pp = dtype(p)
-    gammas = (i / pp) * dtype(delta_t)
-    betas = (dtype(1.0) - (i / pp)) * dtype(delta_t)
+    i = np.arange(1, int(p_layers) + 1, dtype=dtype)
+    p = dtype(p_layers)
+    gammas = (i / p) * dtype(delta_t)
+    betas = -(dtype(1.0) - (i / p)) * dtype(delta_t)
+
     return QAOAParams(gammas=gammas, betas=betas)
 
 
@@ -207,7 +208,7 @@ def build_qaoa_theta_init_tqa(
     delta_t: float,
     dtype=np.float64,
 ) -> np.ndarray:
-    params = tqa_init_qaoa_params(p=int(p_layers), delta_t=float(delta_t), dtype=dtype)
+    params = tqa_init_qaoa_params(p_layers=int(p_layers), delta_t=float(delta_t), dtype=dtype)
     thetas: List[float] = []
     for l in range(int(p_layers)):
         thetas.append(float(params.gammas[l]))

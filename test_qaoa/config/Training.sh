@@ -61,17 +61,11 @@ echo "Starting QAOA batch process..."
 
 
 
-########### 70Q 실험해보자
-echo "[1/17] Running Q70_L3..."
-python /home/ubuntu/PPS-lab/test_qaoa/entire_qaoa_process.py --config /home/ubuntu/PPS-lab/test_qaoa/config/Q70_L3.yaml
+########### 100Q 실험해보자
+# echo "[1/2] Running Q100_L3..."
+# python /home/ubuntu/PPS-lab/test_qaoa/entire_qaoa_process.py --config /home/ubuntu/PPS-lab/test_qaoa/config/Q100_L3.yaml
 
-echo "[2/17] Running Q70_L5..."
-python /home/ubuntu/PPS-lab/test_qaoa/entire_qaoa_process.py --config /home/ubuntu/PPS-lab/test_qaoa/config/Q70_L5.yaml
-
-echo "[3/17] Running Q70_L7..."
-python /home/ubuntu/PPS-lab/test_qaoa/entire_qaoa_process.py --config /home/ubuntu/PPS-lab/test_qaoa/config/Q70_L7.yaml
-
-echo "[4/17] Running Q70_L9..."
-python /home/ubuntu/PPS-lab/test_qaoa/entire_qaoa_process.py --config /home/ubuntu/PPS-lab/test_qaoa/config/Q70_L9.yaml
+echo "[2/2] Running Q100_L5..."
+python /home/ubuntu/PPS-lab/test_qaoa/entire_qaoa_process.py --config /home/ubuntu/PPS-lab/test_qaoa/config/Q100_L5.yaml
 
 echo "All tasks completed successfully!"

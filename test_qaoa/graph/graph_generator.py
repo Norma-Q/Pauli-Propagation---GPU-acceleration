@@ -2,8 +2,14 @@
 import numpy as np
 import matplotlib.pyplot as plt
 import sys
-sys.path.append('/home/ubuntu/PPS-lab/test_qaoa')
-from make_qaoa_problem import _make_erdos_renyi_graph as make_erdos_renyi_graph
+from pathlib import Path
+
+_THIS_DIR = Path(__file__).resolve().parent
+_REPO_ROOT = _THIS_DIR.parent.parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from test_qaoa.make_graph import _make_erdos_renyi_graph as make_erdos_renyi_graph
 
 def save_graph_circle(n, edges, dir = None):
     theta = np.linspace(0, 2*np.pi, n, endpoint=False)
@@ -23,9 +29,9 @@ def save_graph_circle(n, edges, dir = None):
     plt.savefig(dir)
 
 e_list = []
-EDGE_PROB = 0.15 
+EDGE_PROB = 0.2 
 SEED = 42
-q_list = [10, 15]
+q_list = [100]
 for q in q_list:
     N_QUBITS = q
     edges = make_erdos_renyi_graph(n_qubits = N_QUBITS, edge_prob=0.15, seed=SEED,

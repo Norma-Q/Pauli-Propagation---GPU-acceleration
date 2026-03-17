@@ -17,13 +17,22 @@ if "/home/ubuntu/PPS-lab" not in sys.path:
     sys.path.insert(0, "/home/ubuntu/PPS-lab")
 
 from src_tensor.api import compile_expval_program
-from make_qaoa_problem import _make_erdos_renyi_graph as make_erdos_renyi_graph
-from qaoa_surrogate_common import (
-    build_qaoa_circuit,
-    build_maxcut_observable,
-    build_qaoa_theta_init_tqa,
-    expected_cut_from_sum_zz,
-)
+try:
+    from test_qaoa.make_graph import _make_erdos_renyi_graph as make_erdos_renyi_graph
+    from test_qaoa.qaoa_surrogate_common import (
+        build_qaoa_circuit,
+        build_maxcut_observable,
+        build_qaoa_theta_init_tqa,
+        expected_cut_from_sum_zz,
+    )
+except ImportError:
+    from make_graph import _make_erdos_renyi_graph as make_erdos_renyi_graph
+    from qaoa_surrogate_common import (
+        build_qaoa_circuit,
+        build_maxcut_observable,
+        build_qaoa_theta_init_tqa,
+        expected_cut_from_sum_zz,
+    )
 
 def graph_visualization_and_save(n, edges, graph_path):
     theta = np.linspace(0, 2*np.pi, n, endpoint=False)
@@ -178,8 +187,7 @@ def main():
     program = compile_expval_program(
         circuit=circuit, observables=[zz_obj], preset="hybrid",
         preset_overrides={'max_weight': MAX_WEIGHT},
-                          parallel_compile=True,
-                          parallel_devices=[0,1,2,3])
+                          parallel_compile=False)
     print("Program compiled successfully.")
 
     # [Optimization] Clear build-time memory artifacts
