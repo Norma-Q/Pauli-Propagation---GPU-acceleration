@@ -136,20 +136,34 @@ class TensorSparseEvaluator:
             
             return torch.cat(result_parts, dim=0)
 
+        def _chunk_bounds(length: int):
+            chunk = max(1, int(self.chunk_size))
+            for start in range(0, int(length), chunk):
+                end = min(start + chunk, int(length))
+                yield start, end
+
         def _apply_implicit_same(step: TensorSparseStep, vec_calc: Tensor, cos_t: Tensor) -> Optional[Tensor]:
             if step.same_cols is None:
                 return None
-            same_cols = step.same_cols.to(vec_calc.device)
             out = torch.zeros((step.shape[0], vec_calc.shape[1]), dtype=vec_calc.dtype, device=vec_calc.device)
-            n_same = int(same_cols.numel())
+            same_cols_src = step.same_cols
+            n_same = int(same_cols_src.numel())
             if n_same == 0:
                 return out
-            same_vals = vec_calc.index_select(0, same_cols)
-            if step.anti_same_pos is not None and step.anti_same_pos.numel() > 0:
-                anti_pos = step.anti_same_pos.to(vec_calc.device)
-                same_vals = same_vals.clone()
-                same_vals[anti_pos] = cos_t * same_vals.index_select(0, anti_pos)
-            out[:n_same] = same_vals
+            anti_pos_src = step.anti_same_pos
+
+            for start, end in _chunk_bounds(n_same):
+                cols_chunk = same_cols_src[start:end].to(vec_calc.device, non_blocking=True)
+                same_vals = vec_calc.index_select(0, cols_chunk)
+
+                if anti_pos_src is not None and anti_pos_src.numel() > 0:
+                    anti_mask = (anti_pos_src >= int(start)) & (anti_pos_src < int(end))
+                    if bool(anti_mask.any().item()):
+                        anti_local = (anti_pos_src[anti_mask] - int(start)).to(vec_calc.device, non_blocking=True)
+                        same_vals = same_vals.clone()
+                        same_vals[anti_local] = cos_t * same_vals.index_select(0, anti_local)
+
+                out[start:end] = same_vals
             return out
 
         for i, step in enumerate(psum.steps):
@@ -248,17 +262,25 @@ class TensorSparseEvaluator:
         def _apply_implicit_same_T(step: TensorSparseStep, vec_calc: Tensor, cos_t: Tensor) -> Optional[Tensor]:
             if step.same_cols is None:
                 return None
-            same_cols = step.same_cols.to(vec_calc.device)
             out = torch.zeros((step.shape[1], vec_calc.shape[1]), dtype=vec_calc.dtype, device=vec_calc.device)
-            n_same = int(same_cols.numel())
+            same_cols_src = step.same_cols
+            n_same = int(same_cols_src.numel())
             if n_same == 0:
                 return out
-            same_block = vec_calc[:n_same]
-            if step.anti_same_pos is not None and step.anti_same_pos.numel() > 0:
-                anti_pos = step.anti_same_pos.to(vec_calc.device)
-                same_block = same_block.clone()
-                same_block[anti_pos] = cos_t.view(1, -1) * same_block.index_select(0, anti_pos)
-            out.index_add_(0, same_cols, same_block)
+            anti_pos_src = step.anti_same_pos
+
+            for start, end in _chunk_bounds(n_same):
+                cols_chunk = same_cols_src[start:end].to(vec_calc.device, non_blocking=True)
+                same_block = vec_calc[start:end]
+
+                if anti_pos_src is not None and anti_pos_src.numel() > 0:
+                    anti_mask = (anti_pos_src >= int(start)) & (anti_pos_src < int(end))
+                    if bool(anti_mask.any().item()):
+                        anti_local = (anti_pos_src[anti_mask] - int(start)).to(vec_calc.device, non_blocking=True)
+                        same_block = same_block.clone()
+                        same_block[anti_local] = cos_t.view(1, -1) * same_block.index_select(0, anti_local)
+
+                out.index_add_(0, cols_chunk, same_block)
             return out
 
         # 2. 역순 전파 루프
