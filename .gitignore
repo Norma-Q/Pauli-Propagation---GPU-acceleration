@@ -41,7 +41,7 @@ benchmark_cpu_vs_gpu_storage.ipynb
 
 batch_implementation_from_embedding.md
 embedding_implementation_from_scratch.md
-
+NPU_PPS_validation_demo.ipynb
 max_weight_truncation_analysis/
 
 single_layer_qaoa_maxcut/
@@ -52,6 +52,6 @@ initialization_comparison.ipynb
 generating_configfiles.py
 generating_shfiles.py
 lightning_gpu_vs_cudaq_benchmark.ipynb
-
+QAOA_1layer_Analysis/
 
 # 캐시 삭제하고 싶으면 git rm -r --cached <file> 명령어 사용

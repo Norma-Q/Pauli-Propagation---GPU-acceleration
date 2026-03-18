@@ -201,6 +201,29 @@ def tqa_init_qaoa_params(p_layers: int, delta_t: float, dtype=np.float64) -> QAO
     return QAOAParams(gammas=gammas, betas=betas)
 
 
+def flattened_tqa_init_qaoa_params(
+    p_layers: int,
+    delta_t: float,
+    flatten_alpha: float = 0.5,
+    dtype=np.float64,
+) -> QAOAParams:
+    if not (0.0 <= float(flatten_alpha) <= 1.0):
+        raise ValueError("flatten_alpha must lie in [0, 1].")
+
+    tqa_params = tqa_init_qaoa_params(
+        p_layers=int(p_layers),
+        delta_t=float(delta_t),
+        dtype=dtype,
+    )
+    gamma_mean = np.mean(tqa_params.gammas, dtype=dtype)
+    beta_mean = np.mean(tqa_params.betas, dtype=dtype)
+    alpha = dtype(flatten_alpha)
+
+    gammas = (dtype(1.0) - alpha) * gamma_mean + alpha * tqa_params.gammas
+    betas = (dtype(1.0) - alpha) * beta_mean + alpha * tqa_params.betas
+    return QAOAParams(gammas=gammas.astype(dtype, copy=False), betas=betas.astype(dtype, copy=False))
+
+
 def build_qaoa_theta_init_tqa(
     p_layers: int,
     n_edges: int,
@@ -209,6 +232,27 @@ def build_qaoa_theta_init_tqa(
     dtype=np.float64,
 ) -> np.ndarray:
     params = tqa_init_qaoa_params(p_layers=int(p_layers), delta_t=float(delta_t), dtype=dtype)
+    thetas: List[float] = []
+    for l in range(int(p_layers)):
+        thetas.append(float(params.gammas[l]))
+        thetas.append(float(params.betas[l]))
+    return np.asarray(thetas, dtype=dtype)
+
+
+def build_qaoa_theta_init_flattened_tqa(
+    p_layers: int,
+    n_edges: int,
+    n_qubits: int,
+    delta_t: float,
+    flatten_alpha: float = 0.5,
+    dtype=np.float64,
+) -> np.ndarray:
+    params = flattened_tqa_init_qaoa_params(
+        p_layers=int(p_layers),
+        delta_t=float(delta_t),
+        flatten_alpha=float(flatten_alpha),
+        dtype=dtype,
+    )
     thetas: List[float] = []
     for l in range(int(p_layers)):
         thetas.append(float(params.gammas[l]))
