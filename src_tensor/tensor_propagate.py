@@ -11,7 +11,10 @@ then walks steps backwards to remove any input columns that cannot reach them.
 from __future__ import annotations
 
 from typing import Any, List, Optional, Sequence, TYPE_CHECKING, Tuple, cast
+import os
 import math
+import numpy as np
+import time
 import torch.multiprocessing as mp
 
 torch: Any
@@ -35,7 +38,9 @@ from tqdm import tqdm
 
 from .tensor_propagate_impl import (
     build_clifford_step,
+    build_pauli_rotation_anti_sin,
     build_pauli_rotation_step,
+    merge_pauli_query_into_base,
     build_depolarizing_step,
     build_amplitude_damping_step,
     compact_sparse_step_chunked,
@@ -50,6 +55,54 @@ _PARALLEL_HARD_VRAM_GB = 11.0
 _PARALLEL_MIN_TERMS_SOFT = 10_000_000
 _PARALLEL_MIN_TERMS_HARD = 5_000_000
 _PARALLEL_CONSEC_STEPS_SOFT = 2
+
+
+def _env_flag_true(name: str) -> bool:
+    raw = str(os.environ.get(name, "")).strip().lower()
+    return raw not in ("", "0", "false", "no", "off")
+
+
+def _propagation_profile_enabled() -> bool:
+    return _env_flag_true("PPS_PROFILE_PROPAGATION")
+
+
+def _propagation_profile_min_terms() -> int:
+    raw = os.environ.get("PPS_PROFILE_MIN_TERMS", "1000000")
+    try:
+        return max(1, int(raw))
+    except Exception:
+        return 1_000_000
+
+
+def _profile_sync(device: Optional[str]) -> None:
+    if device is None or (not torch.cuda.is_available()) or (not str(device).startswith("cuda")):
+        return
+    try:
+        torch.cuda.synchronize(device)
+    except Exception:
+        pass
+
+
+def _profile_start(device: Optional[str]) -> float:
+    _profile_sync(device)
+    return time.perf_counter()
+
+
+def _profile_end(stats: Optional[dict], key: str, start_time: float, device: Optional[str]) -> None:
+    if stats is None:
+        return
+    _profile_sync(device)
+    stats[key] = float(stats.get(key, 0.0)) + (time.perf_counter() - start_time)
+
+
+def _tensor_nbytes(tensor: Optional[Tensor]) -> int:
+    if tensor is None:
+        return 0
+    return int(tensor.numel()) * int(tensor.element_size())
+
+
+def _format_gib(nbytes: int) -> str:
+    return f"{(float(nbytes) / (1024 ** 3)):.2f}GiB"
 
 
 def _auto_parallel_threshold_from_device(compute_device: str) -> int:
@@ -95,6 +148,183 @@ def _make_sparse(row_idx, col_idx, values, shape, device, dtype):
     sp = torch.sparse_coo_tensor(indices, values, size=shape, device=device, dtype=dtype)
     # Memory-first default: avoid coalesce() (it can allocate large temporary buffers).
     return sp
+
+
+def _make_empty_sparse(shape, device, dtype):
+    return torch.sparse_coo_tensor(
+        torch.zeros((2, 0), dtype=torch.int64, device=device),
+        torch.zeros((0,), dtype=dtype, device=device),
+        size=shape,
+        device=device,
+        dtype=dtype,
+    )
+
+
+def _numpy_key_view(x_mask: Tensor, z_mask: Tensor) -> np.ndarray:
+    x_np = x_mask.detach().cpu().contiguous().numpy()
+    z_np = z_mask.detach().cpu().contiguous().numpy()
+    if x_np.ndim == 1:
+        flat = np.stack([x_np, z_np], axis=1)
+    else:
+        flat = np.concatenate([x_np, z_np], axis=1)
+    flat = np.ascontiguousarray(flat)
+    item_nbytes = int(flat.dtype.itemsize * flat.shape[1])
+    return flat.view(np.dtype((np.void, item_nbytes))).reshape(-1)
+
+
+def _build_same_lookup(x_mask: Tensor, z_mask: Tensor) -> Tuple[np.ndarray, np.ndarray]:
+    keys = _numpy_key_view(x_mask, z_mask)
+    order = np.argsort(keys)
+    return keys[order], order.astype(np.int64, copy=False)
+
+
+def _lookup_same_rows(sorted_keys: np.ndarray, sorted_rows: np.ndarray, x_mask: Tensor, z_mask: Tensor) -> np.ndarray:
+    keys = _numpy_key_view(x_mask, z_mask)
+    pos = np.searchsorted(sorted_keys, keys)
+    rows = np.full((keys.shape[0],), -1, dtype=np.int64)
+    valid = pos < sorted_keys.shape[0]
+    if np.any(valid):
+        valid_pos = pos[valid]
+        matched = sorted_keys[valid_pos] == keys[valid]
+        if np.any(matched):
+            matched_idx = np.nonzero(valid)[0][matched]
+            rows[matched_idx] = sorted_rows[valid_pos[matched]]
+    return rows
+
+
+def _lookup_same_rows_torch(same_x: Tensor, same_z: Tensor, query_x: Tensor, query_z: Tensor) -> Tensor:
+    if int(query_x.shape[0]) == 0:
+        return torch.empty((0,), dtype=torch.int64, device=same_x.device)
+
+    if same_x.dim() == 1:
+        same_keys = torch.stack([same_x, same_z], dim=1)
+        query_keys = torch.stack([query_x, query_z], dim=1)
+    else:
+        same_keys = torch.cat([same_x, same_z], dim=1)
+        query_keys = torch.cat([query_x, query_z], dim=1)
+
+    all_keys = torch.cat([same_keys, query_keys], dim=0)
+    _, inv = torch.unique(all_keys, dim=0, return_inverse=True, sorted=False)
+    inv = inv.to(torch.int64)
+    n_same = int(same_keys.shape[0])
+    same_inv = inv[:n_same]
+    query_inv = inv[n_same:]
+
+    keyid_to_row = torch.full(
+        (int(inv.max().item()) + 1,),
+        -1,
+        dtype=torch.int64,
+        device=same_x.device,
+    )
+    if n_same > 0:
+        same_rows = torch.arange(n_same, dtype=torch.int64, device=same_x.device)
+        keyid_to_row.index_put_((same_inv,), same_rows)
+    return keyid_to_row.index_select(0, query_inv)
+
+
+def _prepare_lookup_state(
+    same_x: Tensor,
+    same_z: Tensor,
+    *,
+    compute_device: str,
+) -> Tuple[Tensor, Tensor]:
+    if int(same_x.shape[0]) == 0:
+        return same_x, same_z
+    if (not torch.cuda.is_available()) or (not str(compute_device).startswith("cuda")):
+        return same_x, same_z
+    if same_x.device.type == "cuda" and same_z.device.type == "cuda":
+        return same_x, same_z
+    try:
+        return (
+            same_x.to(compute_device, non_blocking=True),
+            same_z.to(compute_device, non_blocking=True),
+        )
+    except RuntimeError:
+        return same_x, same_z
+
+
+def _popcount_u64(x: Tensor) -> Tensor:
+    count = torch.zeros_like(x, dtype=torch.int64)
+    for i in range(64):
+        count = count + torch.bitwise_and(torch.bitwise_right_shift(x, i), 1)
+    return count
+
+
+def _rotation_anti_local_rows(*, gate, x_mask: Tensor, z_mask: Tensor) -> Tensor:
+    if x_mask.dim() == 2:
+        n_words = int(x_mask.shape[1])
+        gx_words = torch.zeros((n_words,), dtype=torch.int64, device=x_mask.device)
+        gz_words = torch.zeros((n_words,), dtype=torch.int64, device=x_mask.device)
+        for q, p in zip(gate.qubits, gate.pauli):
+            qi = int(q)
+            w = qi // 63
+            b = qi % 63
+            bit = int(1) << b
+            if p == "X":
+                gx_words[w] |= bit
+            elif p == "Z":
+                gz_words[w] |= bit
+            elif p == "Y":
+                gx_words[w] |= bit
+                gz_words[w] |= bit
+        gx_t = gx_words.unsqueeze(0)
+        gz_t = gz_words.unsqueeze(0)
+        symp = _popcount_u64((torch.bitwise_and(x_mask, gz_t)) ^ (torch.bitwise_and(z_mask, gx_t))).sum(1) & 1
+    else:
+        gx = 0
+        gz = 0
+        for q, p in zip(gate.qubits, gate.pauli):
+            bit = 1 << int(q)
+            if p == "X":
+                gx |= bit
+            elif p == "Z":
+                gz |= bit
+            elif p == "Y":
+                gx |= bit
+                gz |= bit
+        gx_t = torch.scalar_tensor(int(gx), dtype=torch.int64, device=x_mask.device)
+        gz_t = torch.scalar_tensor(int(gz), dtype=torch.int64, device=x_mask.device)
+        symp = _popcount_u64((x_mask & gz_t) ^ (z_mask & gx_t)) & 1
+    return torch.nonzero(symp.eq(1), as_tuple=False).flatten().to(torch.int64)
+
+
+def _truncation_is_effective(
+    x_mask: Tensor,
+    *,
+    max_weight: int,
+    weight_x: float,
+    weight_y: float,
+    weight_z: float,
+) -> bool:
+    weights = (float(weight_x), float(weight_y), float(weight_z))
+    if any(w < 0.0 for w in weights):
+        return True
+    max_axis_weight = max(weights)
+    if max_axis_weight <= 0.0:
+        return False
+    n_words = int(x_mask.shape[1]) if x_mask.dim() == 2 else 1
+    max_possible_weight = float(n_words * 63) * max_axis_weight
+    return float(max_weight) < max_possible_weight
+
+
+def _truncate_terms_mask(x_mask: Tensor, z_mask: Tensor, *, max_weight: int, weight_x: float, weight_y: float, weight_z: float) -> Tensor:
+    if not _truncation_is_effective(
+        x_mask,
+        max_weight=max_weight,
+        weight_x=weight_x,
+        weight_y=weight_y,
+        weight_z=weight_z,
+    ):
+        return torch.ones((int(x_mask.shape[0]),), dtype=torch.bool, device=x_mask.device)
+    x_cnt = _popcount_u64(x_mask & (~z_mask)).to(torch.float64)
+    y_cnt = _popcount_u64(x_mask & z_mask).to(torch.float64)
+    z_cnt = _popcount_u64((~x_mask) & z_mask).to(torch.float64)
+    if x_mask.dim() == 2:
+        x_cnt = x_cnt.sum(1)
+        y_cnt = y_cnt.sum(1)
+        z_cnt = z_cnt.sum(1)
+    weighted = x_cnt * float(weight_x) + y_cnt * float(weight_y) + z_cnt * float(weight_z)
+    return weighted <= float(max_weight)
 
 
 def _parallel_propagate_worker(args: Tuple) -> Tuple[Tensor, Tensor, TensorSparseStep, Optional[Tensor]]:
@@ -440,8 +670,384 @@ def _destructive_cat(tensor_list: List[Tensor], dim: int = 0) -> Tensor:
             out[tuple(idx)] = t
             
         offset += size
-        
+    
     return out
+
+
+def _process_pauli_rotation_step_chunked_anti_only(
+    x_mask_in: Tensor,
+    z_mask_in: Tensor,
+    chunk_size: int,
+    device: str,
+    step_device: str,
+    output_device: str = "cpu",
+    **kwargs,
+) -> Tuple[Tensor, Tensor, TensorSparseStep, Optional[Tensor]]:
+    gate = kwargs["gate"]
+    t_dtype = kwargs["t_dtype"]
+    min_abs = kwargs.get("min_abs")
+    coeffs_cache = kwargs.get("coeffs_cache")
+    thetas_t = kwargs.get("thetas_t")
+    max_weight = int(kwargs["max_weight"])
+    weight_x = float(kwargs["weight_x"])
+    weight_y = float(kwargs["weight_y"])
+    weight_z = float(kwargs["weight_z"])
+
+    n_terms = int(x_mask_in.shape[0])
+    outer_chunks = int(math.ceil(float(n_terms) / float(chunk_size)))
+    p_idx = int(getattr(gate, "param_idx", -1))
+    e_idx = int(getattr(gate, "embedding_idx", -1))
+    theta_idx = p_idx if p_idx >= 0 else (e_idx if e_idx >= 0 else -1)
+    profile_stats: Optional[dict[str, Any]] = None
+    total_start = 0.0
+    if _propagation_profile_enabled() and n_terms >= _propagation_profile_min_terms():
+        profile_stats = {
+            "gate": repr(gate),
+            "n_terms": int(n_terms),
+            "chunk_size": int(chunk_size),
+            "outer_chunks": int(outer_chunks),
+            "h2d_scan_sec": 0.0,
+            "h2d_scan_bytes": 0,
+            "anti_detect_sec": 0.0,
+            "pre_cat_sec": 0.0,
+            "same_gather_sec": 0.0,
+            "lookup_build_sec": 0.0,
+            "h2d_anti_sec": 0.0,
+            "h2d_anti_bytes": 0,
+            "anti_backend_sec": 0.0,
+            "d2h_anti_sec": 0.0,
+            "d2h_anti_bytes": 0,
+            "lookup_sec": 0.0,
+            "output_cat_sec": 0.0,
+            "truncate_sec": 0.0,
+        }
+        total_start = _profile_start(device)
+
+    if min_abs is not None:
+        if coeffs_cache is None or thetas_t is None:
+            raise RuntimeError("min_abs provided but coeffs_cache/thetas_t is None")
+        if theta_idx < 0:
+            raise RuntimeError("Rotation pruning requires a valid param_idx or embedding_idx")
+        coeffs_cache_mem = coeffs_cache if str(coeffs_cache.device) == str(torch.device(output_device)) else coeffs_cache.to(output_device)
+        theta_mem = thetas_t.index_select(
+            0,
+            torch.as_tensor([theta_idx], dtype=torch.int64, device=thetas_t.device),
+        )[0].to(dtype=coeffs_cache_mem.dtype, device=output_device)
+        cos_t_mem = torch.cos(theta_mem)
+        sin_t_mem = torch.sin(theta_mem)
+    else:
+        coeffs_cache_mem = None
+        cos_t_mem = None
+        sin_t_mem = None
+
+    anti_row_parts: List[Tensor] = []
+    comm_keep_parts: List[Tensor] = []
+    anti_same_col_parts: List[Tensor] = []
+
+    for chunk_idx in range(outer_chunks):
+        start = int(chunk_idx * chunk_size)
+        end = int(min(start + int(chunk_size), n_terms))
+        chunk_len = int(end - start)
+
+        h2d_start = _profile_start(device) if profile_stats is not None else 0.0
+        x_chunk = x_mask_in[start:end].to(device)
+        z_chunk = z_mask_in[start:end].to(device)
+        if profile_stats is not None:
+            _profile_end(profile_stats, "h2d_scan_sec", h2d_start, device)
+            profile_stats["h2d_scan_bytes"] = int(profile_stats["h2d_scan_bytes"]) + _tensor_nbytes(x_chunk) + _tensor_nbytes(z_chunk)
+
+        anti_detect_start = _profile_start(device) if profile_stats is not None else 0.0
+        anti_local = _rotation_anti_local_rows(gate=gate, x_mask=x_chunk, z_mask=z_chunk).to(output_device)
+        _profile_end(profile_stats, "anti_detect_sec", anti_detect_start, device)
+        if int(anti_local.numel()) > 0:
+            anti_row_parts.append(anti_local + int(start))
+
+        local_rows = torch.arange(chunk_len, dtype=torch.int64, device=output_device)
+        if min_abs is None:
+            keep_comm = torch.ones((chunk_len,), dtype=torch.bool, device=output_device)
+            if int(anti_local.numel()) > 0:
+                keep_comm[anti_local] = False
+                anti_same_col_parts.append(anti_local + int(start))
+            if bool(keep_comm.any().item()):
+                comm_keep_parts.append(local_rows[keep_comm] + int(start))
+        else:
+            coeff_chunk = coeffs_cache_mem[start:end]
+            keep_comm = coeff_chunk.abs() >= float(min_abs)
+            if int(anti_local.numel()) > 0:
+                keep_comm = keep_comm.clone()
+                keep_comm[anti_local] = False
+                anti_cos_keep = (coeff_chunk.index_select(0, anti_local) * cos_t_mem).abs() >= float(min_abs)
+                if bool(anti_cos_keep.any().item()):
+                    anti_same_col_parts.append(anti_local[anti_cos_keep] + int(start))
+            if bool(keep_comm.any().item()):
+                comm_keep_parts.append(local_rows[keep_comm] + int(start))
+
+    pre_cat_start = _profile_start(None) if profile_stats is not None else 0.0
+    anti_rows = _destructive_cat(anti_row_parts, dim=0) if anti_row_parts else torch.empty((0,), dtype=torch.int64, device=output_device)
+    comm_keep_cols = _destructive_cat(comm_keep_parts, dim=0) if comm_keep_parts else torch.empty((0,), dtype=torch.int64, device=output_device)
+    anti_same_cols = _destructive_cat(anti_same_col_parts, dim=0) if anti_same_col_parts else torch.empty((0,), dtype=torch.int64, device=output_device)
+    same_cols = (
+        _destructive_cat([comm_keep_cols, anti_same_cols], dim=0)
+        if (int(comm_keep_cols.numel()) > 0 and int(anti_same_cols.numel()) > 0)
+        else (comm_keep_cols if int(anti_same_cols.numel()) == 0 else anti_same_cols)
+    )
+    _profile_end(profile_stats, "pre_cat_sec", pre_cat_start, None)
+
+    n_comm_same = int(comm_keep_cols.numel())
+    n_anti_same = int(anti_same_cols.numel())
+    n_same_total = int(same_cols.numel())
+
+    same_gather_start = _profile_start(None) if profile_stats is not None else 0.0
+    same_x = x_mask_in.index_select(0, same_cols) if n_same_total > 0 else x_mask_in[:0]
+    same_z = z_mask_in.index_select(0, same_cols) if n_same_total > 0 else z_mask_in[:0]
+    anti_same_x = x_mask_in.index_select(0, anti_same_cols) if n_anti_same > 0 else x_mask_in[:0]
+    anti_same_z = z_mask_in.index_select(0, anti_same_cols) if n_anti_same > 0 else z_mask_in[:0]
+    _profile_end(profile_stats, "same_gather_sec", same_gather_start, None)
+
+    lookup_prep_start = _profile_start(device if str(device).startswith("cuda") else None) if profile_stats is not None else 0.0
+    anti_base_x = anti_same_x
+    anti_base_z = anti_same_z
+    if str(torch.device(device)) != str(anti_same_x.device):
+        anti_base_x = anti_same_x.to(device, non_blocking=True)
+        anti_base_z = anti_same_z.to(device, non_blocking=True)
+    _profile_end(profile_stats, "lookup_build_sec", lookup_prep_start, device if anti_base_x.device.type == "cuda" else None)
+
+    row_parts: List[Tensor] = []
+    col_parts: List[Tensor] = []
+    val_parts: List[Tensor] = []
+    novel_x_parts: List[Tensor] = []
+    novel_z_parts: List[Tensor] = []
+    novel_cache_parts: List[Tensor] = []
+    collision_cache_rows: List[Tensor] = []
+    collision_cache_vals: List[Tensor] = []
+    next_novel_row = int(n_same_total)
+
+    anti_terms = int(anti_rows.numel())
+    anti_chunks = int(math.ceil(float(max(anti_terms, 1)) / float(chunk_size))) if anti_terms > 0 else 0
+    for chunk_idx in range(anti_chunks):
+        start = int(chunk_idx * chunk_size)
+        end = int(min(start + int(chunk_size), anti_terms))
+        anti_rows_chunk = anti_rows[start:end]
+        h2d_anti_start = _profile_start(device) if profile_stats is not None else 0.0
+        anti_x_chunk = x_mask_in.index_select(0, anti_rows_chunk).to(device)
+        anti_z_chunk = z_mask_in.index_select(0, anti_rows_chunk).to(device)
+        if profile_stats is not None:
+            _profile_end(profile_stats, "h2d_anti_sec", h2d_anti_start, device)
+            profile_stats["h2d_anti_bytes"] = int(profile_stats["h2d_anti_bytes"]) + _tensor_nbytes(anti_x_chunk) + _tensor_nbytes(anti_z_chunk)
+
+        anti_backend_start = _profile_start(device) if profile_stats is not None else 0.0
+        sin_x, sin_z, sin_val = build_pauli_rotation_anti_sin(
+            gate=gate,
+            x_mask=anti_x_chunk,
+            z_mask=anti_z_chunk,
+            t_dtype=t_dtype,
+            device=device,
+        )
+        _profile_end(profile_stats, "anti_backend_sec", anti_backend_start, device)
+
+        sin_cols = anti_rows_chunk
+        sin_cache_contrib = None
+        if min_abs is not None:
+            coeff_chunk = coeffs_cache_mem.index_select(0, anti_rows_chunk)
+            sin_cache_contrib = coeff_chunk * sin_t_mem * sin_val.to(dtype=coeff_chunk.dtype, device=output_device)
+            sin_keep = sin_cache_contrib.abs() >= float(min_abs)
+            if not bool(sin_keep.all().item()):
+                keep_idx = torch.nonzero(sin_keep, as_tuple=False).flatten().to(torch.int64)
+                keep_idx_dev = keep_idx.to(sin_x.device)
+                sin_x = sin_x.index_select(0, keep_idx_dev)
+                sin_z = sin_z.index_select(0, keep_idx_dev)
+                sin_val = sin_val.index_select(0, keep_idx_dev)
+                sin_cols = sin_cols.index_select(0, keep_idx)
+                sin_cache_contrib = sin_cache_contrib.index_select(0, keep_idx)
+
+        if int(sin_cols.numel()) == 0:
+            continue
+
+        merge_start = _profile_start(device if anti_base_x.device.type == "cuda" else None) if profile_stats is not None else 0.0
+        merged_anti_x, merged_anti_z, row_local = merge_pauli_query_into_base(
+            base_x=anti_base_x,
+            base_z=anti_base_z,
+            query_x=sin_x,
+            query_z=sin_z,
+        )
+        _profile_end(profile_stats, "lookup_sec", merge_start, device if anti_base_x.device.type == "cuda" else None)
+
+        if str(torch.device(output_device)) != str(sin_val.device):
+            d2h_anti_start = _profile_start(device) if profile_stats is not None else 0.0
+            sin_val = sin_val.to(output_device)
+            row_local = row_local.to(output_device)
+            if profile_stats is not None:
+                _profile_end(profile_stats, "d2h_anti_sec", d2h_anti_start, device)
+                profile_stats["d2h_anti_bytes"] = (
+                    int(profile_stats["d2h_anti_bytes"])
+                    + _tensor_nbytes(sin_val)
+                    + _tensor_nbytes(row_local)
+                )
+
+        hit_mask = row_local.lt(n_anti_same)
+        if bool(hit_mask.any().item()):
+            hit_rows_global = row_local[hit_mask] + int(n_comm_same)
+            row_parts.append(hit_rows_global)
+            col_parts.append(sin_cols[hit_mask])
+            val_parts.append(sin_val[hit_mask])
+            if sin_cache_contrib is not None:
+                collision_cache_rows.append(hit_rows_global)
+                collision_cache_vals.append(sin_cache_contrib[hit_mask])
+
+        miss_mask = ~hit_mask
+        n_novel_local = int(merged_anti_x.shape[0]) - n_anti_same
+        if n_novel_local > 0:
+            novel_rows_global = torch.arange(
+                next_novel_row,
+                next_novel_row + n_novel_local,
+                dtype=torch.int64,
+                device=output_device,
+            )
+            next_novel_row += n_novel_local
+
+            if bool(miss_mask.any().item()):
+                local_novel_rows = row_local[miss_mask] - int(n_anti_same)
+                row_parts.append(novel_rows_global.index_select(0, local_novel_rows))
+                col_parts.append(sin_cols[miss_mask])
+                val_parts.append(sin_val[miss_mask])
+
+            novel_x_local = merged_anti_x[n_anti_same:]
+            novel_z_local = merged_anti_z[n_anti_same:]
+            if str(torch.device(output_device)) != str(novel_x_local.device):
+                d2h_anti_start = _profile_start(device) if profile_stats is not None else 0.0
+                novel_x_local = novel_x_local.to(output_device)
+                novel_z_local = novel_z_local.to(output_device)
+                if profile_stats is not None:
+                    _profile_end(profile_stats, "d2h_anti_sec", d2h_anti_start, device)
+                    profile_stats["d2h_anti_bytes"] = (
+                        int(profile_stats["d2h_anti_bytes"])
+                        + _tensor_nbytes(novel_x_local)
+                        + _tensor_nbytes(novel_z_local)
+                    )
+            novel_x_parts.append(novel_x_local)
+            novel_z_parts.append(novel_z_local)
+
+            if sin_cache_contrib is not None:
+                novel_cache_local = torch.zeros(
+                    (n_novel_local,),
+                    dtype=sin_cache_contrib.dtype,
+                    device=output_device,
+                )
+                if bool(miss_mask.any().item()):
+                    local_novel_rows = row_local[miss_mask] - int(n_anti_same)
+                    novel_cache_local.index_add_(0, local_novel_rows, sin_cache_contrib[miss_mask])
+                novel_cache_parts.append(novel_cache_local)
+
+    output_cat_start = _profile_start(None) if profile_stats is not None else 0.0
+    full_new_x = (
+        _destructive_cat([same_x, *novel_x_parts], dim=0)
+        if novel_x_parts
+        else same_x
+    )
+    full_new_z = (
+        _destructive_cat([same_z, *novel_z_parts], dim=0)
+        if novel_z_parts
+        else same_z
+    )
+
+    row_idx = _destructive_cat(row_parts, dim=0) if row_parts else torch.empty((0,), dtype=torch.int64, device=output_device)
+    col_idx = _destructive_cat(col_parts, dim=0) if col_parts else torch.empty((0,), dtype=torch.int64, device=output_device)
+    val = _destructive_cat(val_parts, dim=0) if val_parts else torch.empty((0,), dtype=t_dtype, device=output_device)
+
+    full_shape = (int(full_new_x.shape[0]), n_terms)
+    mat_sin = _make_sparse(row_idx, col_idx, val, full_shape, step_device, t_dtype)
+    full_step = TensorSparseStep(
+        mat_const=_make_empty_sparse(full_shape, step_device, t_dtype),
+        mat_cos=_make_empty_sparse(full_shape, step_device, t_dtype),
+        mat_sin=mat_sin,
+        param_idx=p_idx,
+        emb_idx=e_idx,
+        shape=full_shape,
+        same_cols=same_cols.to(step_device),
+        anti_same_pos=torch.arange(n_comm_same, n_same_total, dtype=torch.int64, device=step_device),
+    )
+
+    full_cache = None
+    if min_abs is not None:
+        cache_parts: List[Tensor] = []
+        if n_comm_same > 0:
+            cache_parts.append(coeffs_cache_mem.index_select(0, comm_keep_cols))
+        if n_anti_same > 0:
+            cache_parts.append(coeffs_cache_mem.index_select(0, anti_same_cols) * cos_t_mem)
+        same_cache = (
+            _destructive_cat(cache_parts, dim=0)
+            if cache_parts
+            else torch.empty((0,), dtype=coeffs_cache_mem.dtype, device=output_device)
+        )
+        if collision_cache_rows:
+            same_cache.index_add_(
+                0,
+                _destructive_cat(collision_cache_rows, dim=0),
+                _destructive_cat(collision_cache_vals, dim=0),
+            )
+        full_cache = (
+            _destructive_cat([same_cache, *novel_cache_parts], dim=0)
+            if novel_cache_parts
+            else same_cache
+        )
+    _profile_end(profile_stats, "output_cat_sec", output_cat_start, None)
+
+    truncate_start = _profile_start(None) if profile_stats is not None else 0.0
+    row_mask = _truncate_terms_mask(
+        full_new_x,
+        full_new_z,
+        max_weight=max_weight,
+        weight_x=weight_x,
+        weight_y=weight_y,
+        weight_z=weight_z,
+    )
+    if not bool(row_mask.all().item()):
+        out_idx = torch.nonzero(row_mask, as_tuple=False).flatten().to(torch.int64)
+        full_new_x = full_new_x.index_select(0, out_idx)
+        full_new_z = full_new_z.index_select(0, out_idx)
+        full_step = _filter_step_rows_cols(
+            full_step,
+            row_mask,
+            torch.ones((n_terms,), dtype=torch.bool, device=output_device),
+        )
+        if full_cache is not None:
+            full_cache = full_cache.index_select(0, out_idx)
+    _profile_end(profile_stats, "truncate_sec", truncate_start, None)
+
+    if profile_stats is not None:
+        _profile_end(profile_stats, "total_sec", total_start, device)
+        profile_stats["anti_terms"] = int(anti_terms)
+        profile_stats["same_terms"] = int(n_same_total)
+        profile_stats["novel_terms"] = int(full_new_x.shape[0]) - int(n_same_total)
+        print(
+            "[PPS Profile] "
+            f"gate={profile_stats['gate']} "
+            f"terms={profile_stats['n_terms']:,} "
+            f"anti={profile_stats['anti_terms']:,} "
+            f"same={profile_stats['same_terms']:,} "
+            f"novel={profile_stats['novel_terms']:,} "
+            f"chunks={profile_stats['outer_chunks']}"
+        )
+        print(
+            "[PPS Profile] "
+            f"h2d_scan={profile_stats['h2d_scan_sec']:.3f}s({_format_gib(int(profile_stats['h2d_scan_bytes']))}) "
+            f"anti_detect={profile_stats['anti_detect_sec']:.3f}s "
+            f"pre_cat={profile_stats['pre_cat_sec']:.3f}s "
+            f"same_gather={profile_stats['same_gather_sec']:.3f}s "
+            f"lookup_build={profile_stats['lookup_build_sec']:.3f}s"
+        )
+        print(
+            "[PPS Profile] "
+            f"h2d_anti={profile_stats['h2d_anti_sec']:.3f}s({_format_gib(int(profile_stats['h2d_anti_bytes']))}) "
+            f"anti_backend={profile_stats['anti_backend_sec']:.3f}s "
+            f"d2h_anti={profile_stats['d2h_anti_sec']:.3f}s({_format_gib(int(profile_stats['d2h_anti_bytes']))}) "
+            f"lookup={profile_stats['lookup_sec']:.3f}s "
+            f"output_cat={profile_stats['output_cat_sec']:.3f}s "
+            f"truncate={profile_stats['truncate_sec']:.3f}s "
+            f"total={profile_stats['total_sec']:.3f}s"
+        )
+
+    return full_new_x, full_new_z, full_step, full_cache
 
 
 def _process_step_chunked(
@@ -460,6 +1066,17 @@ def _process_step_chunked(
     then assembles the result back on CPU (or step_device).
     """
     n_terms = x_mask_in.shape[0]
+
+    if getattr(builder_fn, "__name__", "") == "build_pauli_rotation_step":
+        return _process_pauli_rotation_step_chunked_anti_only(
+            x_mask_in,
+            z_mask_in,
+            chunk_size,
+            device,
+            step_device,
+            output_device,
+            **kwargs,
+        )
     
     # Fast path: if small enough, run directly
     if n_terms <= chunk_size:
@@ -490,13 +1107,13 @@ def _process_step_chunked(
     same_cols_parts = []
     anti_same_pos_parts = []
     implicit_sin_parts = []
+    same_row_offsets = []
     last_step: Optional[TensorSparseStep] = None
     implicit_mode: Optional[bool] = None
     
     row_offset = 0
     col_offset = 0
     same_row_offset = 0
-    novel_row_offset = 0
     
     n_chunks = math.ceil(n_terms / chunk_size)
     
@@ -522,14 +1139,14 @@ def _process_step_chunked(
         if anti_pos is not None and anti_pos.numel() > 0:
             anti_pos_list.append(anti_pos.to("cpu") + int(r_off))
 
-    def _append_sparse_local(mat, indices_list, values_list, c_off, n_same_local, same_off, novel_off):
+    def _append_sparse_local(mat, indices_list, values_list, c_off, n_same_local, chunk_idx):
         if mat._nnz() == 0:
             return
         if not mat.is_coalesced():
             mat = mat.coalesce()
         idx = mat.indices().to("cpu")
         val = mat.values().to("cpu")
-        indices_list.append((idx, val, int(c_off), int(n_same_local), int(same_off), int(novel_off)))
+        indices_list.append((idx, val, int(c_off), int(n_same_local), int(chunk_idx)))
 
     for i in range(n_chunks):
         start = i * chunk_size
@@ -559,6 +1176,7 @@ def _process_step_chunked(
 
         if step_is_implicit:
             n_same_local = int(step.same_cols.numel())
+            same_row_offsets.append(int(same_row_offset))
             same_x_parts.append(nx_cpu[:n_same_local])
             same_z_parts.append(nz_cpu[:n_same_local])
             novel_x_parts.append(nx_cpu[n_same_local:])
@@ -583,12 +1201,10 @@ def _process_step_chunked(
                 sin_values,
                 col_offset,
                 n_same_local,
-                same_row_offset,
-                novel_row_offset,
+                i,
             )
             _append_implicit_same(step, same_cols_parts, anti_same_pos_parts, same_row_offset, col_offset)
             same_row_offset += n_same_local
-            novel_row_offset += int(nx.shape[0]) - n_same_local
         else:
             _append_sparse(step.mat_const, const_indices, const_values, row_offset, col_offset)
             _append_sparse(step.mat_cos, cos_indices, cos_values, row_offset, col_offset)
@@ -598,14 +1214,77 @@ def _process_step_chunked(
 
     # 4. Assemble Final Tensors
     if bool(implicit_mode):
-        x_parts = [*same_x_parts, *novel_x_parts]
-        z_parts = [*same_z_parts, *novel_z_parts]
+        full_same_x = _destructive_cat(same_x_parts, dim=0)
+        full_same_z = _destructive_cat(same_z_parts, dim=0)
+        sorted_same_keys, sorted_same_rows = _build_same_lookup(full_same_x, full_same_z)
+        total_same = int(full_same_x.shape[0])
+        global_novel_x_parts = []
+        global_novel_z_parts = []
+        global_novel_cache_parts = []
+        collision_cache_rows = []
+        collision_cache_vals = []
+        remapped_sin_indices = []
+        remapped_sin_values = []
+        next_novel_row = int(total_same)
+
+        for idx, val, c_off, n_same_local, chunk_idx in implicit_sin_parts:
+            local_idx = idx.clone()
+            local_rows = local_idx[0]
+            global_rows = torch.empty_like(local_rows)
+            same_mask_local = local_rows < int(n_same_local)
+            if bool(same_mask_local.any().item()):
+                global_rows[same_mask_local] = local_rows[same_mask_local] + int(same_row_offsets[chunk_idx])
+
+            if bool((~same_mask_local).any().item()):
+                local_novel_x = novel_x_parts[chunk_idx]
+                local_novel_z = novel_z_parts[chunk_idx]
+                novel_lookup_rows = _lookup_same_rows(sorted_same_keys, sorted_same_rows, local_novel_x, local_novel_z)
+                miss_mask_np = novel_lookup_rows < 0
+                local_novel_global = novel_lookup_rows.copy()
+
+                if bool(np.any(miss_mask_np)):
+                    miss_mask = torch.as_tensor(miss_mask_np, dtype=torch.bool, device=local_novel_x.device)
+                    miss_count = int(np.count_nonzero(miss_mask_np))
+                    local_novel_global[miss_mask_np] = np.arange(next_novel_row, next_novel_row + miss_count, dtype=np.int64)
+                    next_novel_row += miss_count
+                    global_novel_x_parts.append(local_novel_x[miss_mask])
+                    global_novel_z_parts.append(local_novel_z[miss_mask])
+                    if novel_cache_parts:
+                        global_novel_cache_parts.append(novel_cache_parts[chunk_idx][miss_mask])
+
+                if novel_cache_parts:
+                    hit_mask_np = ~miss_mask_np
+                    if bool(np.any(hit_mask_np)):
+                        hit_mask = torch.as_tensor(hit_mask_np, dtype=torch.bool, device=local_novel_x.device)
+                        collision_cache_rows.append(
+                            torch.as_tensor(novel_lookup_rows[hit_mask_np], dtype=torch.int64, device=local_novel_x.device)
+                        )
+                        collision_cache_vals.append(novel_cache_parts[chunk_idx][hit_mask])
+
+                novel_row_lookup = torch.as_tensor(local_novel_global, dtype=torch.int64, device=local_rows.device)
+                novel_pos = (local_rows[~same_mask_local] - int(n_same_local)).to(torch.int64)
+                global_rows[~same_mask_local] = novel_row_lookup.index_select(0, novel_pos)
+
+            local_idx[0] = global_rows
+            local_idx[1] += int(c_off)
+            remapped_sin_indices.append(local_idx)
+            remapped_sin_values.append(val)
+
+        x_parts = [full_same_x, *global_novel_x_parts]
+        z_parts = [full_same_z, *global_novel_z_parts]
         full_new_x = _destructive_cat(x_parts, dim=0)
         full_new_z = _destructive_cat(z_parts, dim=0)
+
         full_cache = None
-        if same_cache_parts or novel_cache_parts:
-            cache_merge = [*same_cache_parts, *novel_cache_parts]
-            full_cache = _destructive_cat(cache_merge, dim=0)
+        if same_cache_parts or global_novel_cache_parts:
+            full_cache = _destructive_cat([*same_cache_parts, *global_novel_cache_parts], dim=0)
+            if collision_cache_rows:
+                full_cache.index_add_(
+                    0,
+                    _destructive_cat(collision_cache_rows, dim=0),
+                    _destructive_cat(collision_cache_vals, dim=0),
+                )
+
         same_x_parts = same_z_parts = novel_x_parts = novel_z_parts = None
         same_cache_parts = novel_cache_parts = None
     else:
@@ -629,7 +1308,7 @@ def _process_step_chunked(
         
         return torch.sparse_coo_tensor(all_indices, all_values, size=shape, device=step_device)
 
-    full_shape = (same_row_offset + novel_row_offset, col_offset) if bool(implicit_mode) else (row_offset, col_offset)
+    full_shape = (int(full_new_x.shape[0]), col_offset) if bool(implicit_mode) else (row_offset, col_offset)
 
     mat_const = _concat_sparse(const_indices, const_values, full_shape)
     const_indices, const_values = None, None
@@ -638,22 +1317,6 @@ def _process_step_chunked(
     cos_indices, cos_values = None, None
 
     if bool(implicit_mode):
-        remapped_sin_indices = []
-        remapped_sin_values = []
-        total_same = int(same_row_offset)
-        for idx, val, c_off, n_same_local, same_off, novel_off in implicit_sin_parts:
-            local_idx = idx.clone()
-            local_rows = local_idx[0]
-            same_mask_local = local_rows < int(n_same_local)
-            if bool(same_mask_local.any().item()):
-                local_idx[0][same_mask_local] = local_rows[same_mask_local] + int(same_off)
-            if bool((~same_mask_local).any().item()):
-                local_idx[0][~same_mask_local] = (
-                    (local_rows[~same_mask_local] - int(n_same_local)) + total_same + int(novel_off)
-                )
-            local_idx[1] += int(c_off)
-            remapped_sin_indices.append(local_idx)
-            remapped_sin_values.append(val)
         mat_sin = _concat_sparse(remapped_sin_indices, remapped_sin_values, full_shape)
         implicit_sin_parts = None
     else:

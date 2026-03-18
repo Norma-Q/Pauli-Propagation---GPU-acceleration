@@ -676,6 +676,49 @@ def compile_expval_program(
     )
 
 
+def evaluate_expval_direct(
+    *,
+    circuit,
+    observables: Any,
+    thetas: Any,
+    preset: str = "cpu",
+    preset_overrides: Optional[Mapping[str, Any]] = None,
+    min_abs: Optional[float] = None,
+    show_progress: bool = True,
+    chunk_size: Optional[int] = None,
+) -> Tensor:
+    """Evaluate a single observable without building/storing per-step sparse matrices."""
+
+    if not _TORCH_AVAILABLE:
+        raise RuntimeError("PyTorch is required for tensor backend.")
+
+    obs_list = _normalize_observables(observables)
+    if len(obs_list) != 1:
+        raise NotImplementedError(
+            "Direct evaluate-only MVP currently supports exactly one observable."
+        )
+
+    cfg = resolve_preset(preset, overrides=preset_overrides)
+
+    from .tensor_eval_only_impl import evaluate_expval_direct_observable
+
+    return evaluate_expval_direct_observable(
+        circuit=circuit,
+        observable=obs_list[0],
+        thetas=thetas,
+        memory_device=str(cfg.memory_device),
+        compute_device=str(cfg.compute_device),
+        dtype=str(cfg.dtype),
+        min_abs=min_abs,
+        max_weight=int(cfg.max_weight),
+        weight_x=float(cfg.weight_x),
+        weight_y=float(cfg.weight_y),
+        weight_z=float(cfg.weight_z),
+        show_progress=bool(show_progress),
+        chunk_size=int(cfg.chunk_size if chunk_size is None else chunk_size),
+    )
+
+
 def build_quasi_sampler(
     *,
     n_qubits: int,
@@ -716,6 +759,7 @@ __all__ = [
     "CompiledTensorSurrogate",
     "resolve_preset",
     "compile_expval_program",
+    "evaluate_expval_direct",
     "build_quasi_sampler",
     "pennylane_expvals_small",
     "pennylane_sample_small",

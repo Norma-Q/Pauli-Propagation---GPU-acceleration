@@ -1,0 +1,30 @@
+{
+  "sweep_dir": "/home/quantum/ys_lee/Pauli-Propagation---GPU-acceleration/QAOA/artifacts/weight_sweep_smoke_full",
+  "summary_json": "/home/quantum/ys_lee/Pauli-Propagation---GPU-acceleration/QAOA/artifacts/weight_sweep_smoke_full/summary.json",
+  "analysis_summary_json": "/home/quantum/ys_lee/Pauli-Propagation---GPU-acceleration/QAOA/artifacts/weight_sweep_smoke_full/analysis/analysis_summary.json",
+  "use_step": "latest",
+  "score_weights": {
+    "lambda_iqr": 0.25,
+    "mu_terms": 0.2,
+    "nu_gpu": 0.2,
+    "xi_fail": 0.35
+  },
+  "ranking": [
+    {
+      "n_qubits": 8,
+      "weight_mode": "yz",
+      "max_weight": 2,
+      "n_runs_selected": 1,
+      "n_runs_expected": 1,
+      "fail_rate": 0.0,
+      "quality_ratio_median": 0.54375,
+      "quality_ratio_iqr": 0.0,
+      "quality_ratio_cv": 0.0,
+      "terms_after_zero_filter_median": 17.0,
+      "gpu_work_proxy_nnz_total_median": 3169.0,
+      "terms_norm": 0.0,
+      "gpu_norm": 0.0,
+      "score": 0.54375
+    }
+  ]
+}

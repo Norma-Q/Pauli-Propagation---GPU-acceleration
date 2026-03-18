@@ -22,7 +22,7 @@ try:
     from test_qaoa.qaoa_surrogate_common import (
         build_qaoa_circuit,
         build_maxcut_observable,
-        build_qaoa_theta_init_tqa,
+        build_qaoa_theta_init_flattened_tqa,
         expected_cut_from_sum_zz,
     )
 except ImportError:
@@ -30,7 +30,7 @@ except ImportError:
     from qaoa_surrogate_common import (
         build_qaoa_circuit,
         build_maxcut_observable,
-        build_qaoa_theta_init_tqa,
+        build_qaoa_theta_init_flattened_tqa,
         expected_cut_from_sum_zz,
     )
 
@@ -133,11 +133,12 @@ def main():
     DELTA_T = config.QAOA.delta_t
     STEPS = config.QAOA.steps
     LR = config.TRAINING.lr
+    MAX_WEIGHT = int(config.QAOA.max_weight)
     SEED = 42
+    FLATTEN_ALPHA = 0.5
     
     DEVICE = "cuda:0" if torch.cuda.is_available() else "cpu"
 
-    MAX_WEIGHT = 3
 
     torch.manual_seed(SEED)
     np.random.seed(SEED)
@@ -167,6 +168,7 @@ def main():
 
     n_edges = len(edges)
     print(f"Generated graph with {n_edges} edges.")
+    print(f"Using max_weight = {MAX_WEIGHT}.")
     #######################################################################
 
 
@@ -176,9 +178,16 @@ def main():
     circuit, n_params = build_qaoa_circuit(N_QUBITS, edges, P_LAYERS)
     zz_obj = build_maxcut_observable(N_QUBITS, edges)
 
-    # Initialize Parameters (TQA)
-    init_theta_np = build_qaoa_theta_init_tqa(p_layers=P_LAYERS, n_edges=n_edges, 
-                                              n_qubits=N_QUBITS, delta_t=DELTA_T, dtype=np.float64)
+    # Initialize Parameters (flattened TQA)
+    init_theta_np = build_qaoa_theta_init_flattened_tqa(
+        p_layers=P_LAYERS,
+        n_edges=n_edges,
+        n_qubits=N_QUBITS,
+        delta_t=DELTA_T,
+        flatten_alpha=FLATTEN_ALPHA,
+        dtype=np.float64,
+    )
+    print(f"Using flattened TQA initialization with flatten_alpha = {FLATTEN_ALPHA}.")
     
     # Convert to PyTorch Parameter
     initial_thetas = torch.nn.Parameter(torch.tensor(init_theta_np, dtype=torch.float64, device=DEVICE))
@@ -186,8 +195,9 @@ def main():
     # Compile Surrogate Program
     program = compile_expval_program(
         circuit=circuit, observables=[zz_obj], preset="hybrid",
-        preset_overrides={'max_weight': MAX_WEIGHT},
-                          parallel_compile=False)
+        preset_overrides={'max_weight': MAX_WEIGHT,
+                        'chunk_size': 25_000_000}, # For large graphs, we can adjust chunk size to balance memory and speed},
+                          parallel_compile=True)
     print("Program compiled successfully.")
 
     # [Optimization] Clear build-time memory artifacts
@@ -204,6 +214,9 @@ def main():
     with open(os.path.join(output_dir, "training_log.json"), "w") as f:
         json.dump({'initial_thetas': init_theta_np.tolist(),
                     'trained_thetas': trained_thetas.detach().cpu().numpy().tolist(),
+                    'init_strategy': 'flattened_tqa',
+                    'flatten_alpha': FLATTEN_ALPHA,
+                    'max_weight': MAX_WEIGHT,
                     'training_history': log_dict}, f, indent=2)
     visualize_and_save(log_dict, output_dir) 
     ############################################################################   

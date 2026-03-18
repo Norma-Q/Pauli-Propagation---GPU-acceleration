@@ -1,0 +1,27 @@
+[
+  {
+    "run_name": "qaoa_pps_q30_g01_p03_wmyz_mw1000000000",
+    "n_qubits": 30,
+    "p_layers": 3,
+    "graph_index": 1,
+    "target_step": "0",
+    "abs_eps": 0.5,
+    "converged": true,
+    "tail_window": 1,
+    "tail_max_abs_delta": 0.12633895874023438,
+    "tail_mean_abs_delta": 0.12633895874023438,
+    "stable_from_min_abs": 0.001,
+    "recommended_min_abs": 0.001,
+    "min_abs_values": [
+      0.001,
+      0.0005
+    ],
+    "expected_values": [
+      91.93568706512451,
+      92.06202602386475
+    ],
+    "pair_abs_deltas": [
+      0.12633895874023438
+    ]
+  }
+]

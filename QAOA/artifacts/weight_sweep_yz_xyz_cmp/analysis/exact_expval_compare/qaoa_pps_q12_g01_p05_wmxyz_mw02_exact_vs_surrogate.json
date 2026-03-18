@@ -1,0 +1,54 @@
+{
+  "run_name": "qaoa_pps_q12_g01_p05_wmxyz_mw02",
+  "n_qubits": 12,
+  "p_layers": 5,
+  "weight_mode": "xyz",
+  "max_weight": 2,
+  "match_tol": 0.001,
+  "steps": [
+    0,
+    5,
+    9
+  ],
+  "expval_comparison": [
+    {
+      "step": 0,
+      "checkpoint": "/home/quantum/ys_lee/Pauli-Propagation---GPU-acceleration/QAOA/artifacts/weight_sweep_yz_xyz_cmp/q12/runs/qaoa_pps_q12_g01_p05_wmxyz_mw02_steps/step_000000.pt",
+      "approx_sum_zz": 9.199692726135254,
+      "exact_sum_zz": 9.784169288646567,
+      "abs_error_sum_zz": 0.5844765625113126,
+      "rel_error_sum_zz": 0.05973696338119704,
+      "approx_expected_cut": 6.900153636932373,
+      "exact_expected_cut": 6.607915355676717,
+      "match_within_tol": false
+    },
+    {
+      "step": 5,
+      "checkpoint": "/home/quantum/ys_lee/Pauli-Propagation---GPU-acceleration/QAOA/artifacts/weight_sweep_yz_xyz_cmp/q12/runs/qaoa_pps_q12_g01_p05_wmxyz_mw02_steps/step_000005.pt",
+      "approx_sum_zz": -2.1377077102661133,
+      "exact_sum_zz": -1.5928416807455514,
+      "abs_error_sum_zz": 0.5448660295205618,
+      "rel_error_sum_zz": 0.34207167988316944,
+      "approx_expected_cut": 12.568853855133057,
+      "exact_expected_cut": 12.296420840372775,
+      "match_within_tol": false
+    },
+    {
+      "step": 9,
+      "checkpoint": "/home/quantum/ys_lee/Pauli-Propagation---GPU-acceleration/QAOA/artifacts/weight_sweep_yz_xyz_cmp/q12/runs/qaoa_pps_q12_g01_p05_wmxyz_mw02_steps/step_000009.pt",
+      "approx_sum_zz": -8.074711799621582,
+      "exact_sum_zz": -6.827755690779048,
+      "abs_error_sum_zz": 1.246956108842534,
+      "rel_error_sum_zz": 0.182630452130348,
+      "approx_expected_cut": 15.537355899810791,
+      "exact_expected_cut": 14.913877845389525,
+      "match_within_tol": false
+    }
+  ],
+  "summary": {
+    "mean_abs_error_sum_zz": 0.7920995669581362,
+    "max_abs_error_sum_zz": 1.246956108842534,
+    "n_match_within_tol": 0,
+    "n_total": 3
+  }
+}
