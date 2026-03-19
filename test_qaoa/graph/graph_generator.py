@@ -29,12 +29,12 @@ def save_graph_circle(n, edges, dir = None):
     plt.savefig(dir)
 
 e_list = []
-EDGE_PROB = 0.2 
+EDGE_PROB = 0.7
 SEED = 42
-q_list = [100]
+q_list = [10, 20, 30]
 for q in q_list:
     N_QUBITS = q
-    edges = make_erdos_renyi_graph(n_qubits = N_QUBITS, edge_prob=0.15, seed=SEED,
+    edges = make_erdos_renyi_graph(n_qubits = N_QUBITS, edge_prob=EDGE_PROB, seed=SEED,
                                    ensure_connected=True, max_tries=100)
     e_list.append(edges)
     save_graph_circle(N_QUBITS, edges, dir = f"/home/ubuntu/PPS-lab/test_qaoa/graph/Q{N_QUBITS}_renyi{str(EDGE_PROB)[2:]}.png")

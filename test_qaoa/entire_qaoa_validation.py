@@ -355,6 +355,22 @@ def _save_progress(
     _plot_validation(result_dir / "validation.png", rows, run_label)
 
 
+def _find_existing_validation_outputs(result_dir: Path) -> Tuple[Optional[Path], Optional[Path]]:
+    png_path = result_dir / "validation.png"
+    json_candidates = [
+        result_dir / "validation_progress.json",
+        result_dir / "validation.json",
+    ]
+    json_path = next((p for p in json_candidates if p.exists()), None)
+    if json_path is None:
+        extra_json = sorted(result_dir.glob("validation*.json"))
+        if extra_json:
+            json_path = extra_json[0]
+    if png_path.exists() and json_path is not None:
+        return png_path, json_path
+    return None, None
+
+
 def main() -> None:
     args = parse_args()
     config_path = Path(args.config).expanduser().resolve()
@@ -374,6 +390,11 @@ def main() -> None:
     )
     if not result_dir.exists():
         raise FileNotFoundError(f"result directory not found: {result_dir}")
+    existing_png, existing_json = _find_existing_validation_outputs(result_dir)
+    if existing_png is not None and existing_json is not None:
+        print(f"[skip] validation outputs already exist in {result_dir}")
+        print(f"[skip] found: {existing_png.name}, {existing_json.name}")
+        return
     if not graph_path.exists():
         raise FileNotFoundError(f"graph file not found: {graph_path}")
 

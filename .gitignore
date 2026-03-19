@@ -48,6 +48,8 @@ single_layer_qaoa_maxcut/
 multi_layer_qaoa_maxcut/
 multi_layer_qaoa_maxcut_initialization/
 initialization_comparison.ipynb
+mw_training_coeff_finetuning_results/
+paper_figures/
 
 generating_configfiles.py
 generating_shfiles.py
