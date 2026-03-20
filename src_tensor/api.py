@@ -104,7 +104,7 @@ DEFAULT_PRESETS: Dict[str, TensorSurrogatePreset] = {
         weight_x=1.0,
         weight_y=1.0,
         weight_z=1.0,
-        chunk_size=1_000_000,
+        chunk_size=20_000_000,
     ),
     "gpu_safe": TensorSurrogatePreset(
         memory_device="cpu",
@@ -114,7 +114,7 @@ DEFAULT_PRESETS: Dict[str, TensorSurrogatePreset] = {
         weight_x=1.0,
         weight_y=1.0,
         weight_z=1.0,
-        chunk_size=1_000_000,
+        chunk_size=20_000_000,
     )
 }
 

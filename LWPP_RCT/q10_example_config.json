@@ -1,0 +1,41 @@
+{
+  "DIRECTORY": {
+    "output_root": "/home/ubuntu/PPS-lab/LWPP_RCT/results_q10_example",
+    "graph_dir": "/home/ubuntu/PPS-lab/LWPP_RCT/graph"
+  },
+  "GRAPH": {
+    "n_qubits": 10,
+    "edge_prob": 0.2,
+    "graph_seed": 42,
+    "graph_per_run_seed": true,
+    "max_tries": 100,
+    "create_if_missing": true
+  },
+  "EXPERIMENT": {
+    "init_strategies": ["random"],
+    "run_seeds": [0, 1],
+    "p_layers_list": [3],
+    "delta_t": 1.2
+  },
+  "OPTIMIZER": {
+    "name": "Adam",
+    "lr": 0.01
+  },
+  "WARMUP": {
+    "steps": 50,
+    "mw_max_weight": 2
+  },
+  "COEFF_FINETUNING": {
+    "steps": 50,
+    "min_abs": 0.01,
+    "rebuild_interval": 25,
+    "max_weight_override": null
+  },
+  "RUNTIME": {
+    "device": "auto",
+    "chunk_size": 20000000,
+    "parallel_compile": false,
+    "log_every": 20,
+    "theta_save_stride": 1
+  }
+}
