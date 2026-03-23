@@ -319,10 +319,8 @@ def make_stage_compile_fn(
     parallel_compile: bool,
     max_weight_override: Optional[int],
     n_qubits: int,
-    preset_name: Optional[str] = None,
+    preset_name: str = "hybrid",
 ) -> Callable[..., Tuple[Any, Dict[str, Any]]]:
-    if preset_name is None:
-        preset_name = "hybrid" if str(device).startswith("cuda") else "cpu"
     effective_max_weight = None if max_weight_override is None else int(max_weight_override)
     max_weight_mode = "coefficient_only" if max_weight_override is None else "truncated"
 

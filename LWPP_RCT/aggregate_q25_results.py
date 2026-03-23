@@ -69,16 +69,16 @@ def aggregate_results_from_config(config_path: Path) -> Dict[str, Any]:
 
     for init_strategy in cfg["init_strategies"]:
         for p_layers in cfg["p_layers_list"]:
-            pattern = output_root / str(init_strategy)
-            artifact_paths = sorted(pattern.glob(f"seed_*/Q{int(cfg['n_qubits'])}_L{int(p_layers)}/artifacts.json"))
+            pattern = output_root / f"Q{int(cfg['n_qubits'])}_L{int(p_layers)}" / str(init_strategy)
+            artifact_paths = sorted(pattern.glob("seed_*/artifacts.json"))
             if len(artifact_paths) == 0:
                 continue
 
             records = [_load_artifacts(path) for path in artifact_paths]
             aggregate_payload = aggregate_group_records(records)
 
-            group_key = f"{init_strategy}/Q{int(cfg['n_qubits'])}_L{int(p_layers)}"
-            group_dir = aggregate_root / str(init_strategy) / f"Q{int(cfg['n_qubits'])}_L{int(p_layers)}"
+            group_key = f"Q{int(cfg['n_qubits'])}_L{int(p_layers)}/{init_strategy}"
+            group_dir = aggregate_root / f"Q{int(cfg['n_qubits'])}_L{int(p_layers)}" / str(init_strategy)
             group_dir.mkdir(parents=True, exist_ok=True)
 
             summary_payload = {

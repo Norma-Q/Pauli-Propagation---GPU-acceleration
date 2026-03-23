@@ -434,38 +434,38 @@ def main() -> None:
 
     runtime_device = choose_device(config["RUNTIME"]["device_requested"])
     finished_run_count = 0
-    for init_strategy in config["EXPERIMENT"]["init_strategies"]:
-        init_root = output_root / str(init_strategy)
-        init_root.mkdir(parents=True, exist_ok=True)
-        for run_seed in config["EXPERIMENT"]["run_seeds"]:
-            resolved_graph_seed = int(config["GRAPH"]["graph_seed"]) + int(run_seed) if bool(config["GRAPH"]["graph_per_run_seed"]) else int(config["GRAPH"]["graph_seed"])
-            graph_tag = f"_seed{int(run_seed):03d}" if bool(config["GRAPH"]["graph_per_run_seed"]) else ""
-            edges, source_graph_json, source_graph_png, graph_created = load_or_create_graph(
-                graph_dir=graph_dir,
-                n_qubits=int(config["GRAPH"]["n_qubits"]),
-                edge_prob=float(config["GRAPH"]["edge_prob"]),
-                seed=int(resolved_graph_seed),
-                graph_tag=str(graph_tag),
-                create_if_missing=bool(config["GRAPH"]["create_if_missing"]),
-                max_tries=int(config["GRAPH"]["max_tries"]),
-            )
-            print(
-                json.dumps(
-                    {
-                        "run_seed": int(run_seed),
-                        "graph_seed_used": int(resolved_graph_seed),
-                        "graph_json": str(source_graph_json),
-                        "graph_png": None if source_graph_png is None else str(source_graph_png),
-                        "graph_created": bool(graph_created),
-                        "n_edges": len(edges),
-                    },
-                    indent=2,
+    for p_layers in config["EXPERIMENT"]["p_layers_list"]:
+        layer_root = output_root / f"Q{int(config['GRAPH']['n_qubits'])}_L{int(p_layers)}"
+        layer_root.mkdir(parents=True, exist_ok=True)
+        for init_strategy in config["EXPERIMENT"]["init_strategies"]:
+            init_root = layer_root / str(init_strategy)
+            init_root.mkdir(parents=True, exist_ok=True)
+            for run_seed in config["EXPERIMENT"]["run_seeds"]:
+                resolved_graph_seed = int(config["GRAPH"]["graph_seed"]) + int(run_seed) if bool(config["GRAPH"]["graph_per_run_seed"]) else int(config["GRAPH"]["graph_seed"])
+                graph_tag = f"_seed{int(run_seed):03d}" if bool(config["GRAPH"]["graph_per_run_seed"]) else ""
+                edges, source_graph_json, source_graph_png, graph_created = load_or_create_graph(
+                    graph_dir=graph_dir,
+                    n_qubits=int(config["GRAPH"]["n_qubits"]),
+                    edge_prob=float(config["GRAPH"]["edge_prob"]),
+                    seed=int(resolved_graph_seed),
+                    graph_tag=str(graph_tag),
+                    create_if_missing=bool(config["GRAPH"]["create_if_missing"]),
+                    max_tries=int(config["GRAPH"]["max_tries"]),
                 )
-            )
-            seed_root = init_root / seed_tag(int(run_seed))
-            seed_root.mkdir(parents=True, exist_ok=True)
-            for p_layers in config["EXPERIMENT"]["p_layers_list"]:
-                run_dir = seed_root / f"Q{int(config['GRAPH']['n_qubits'])}_L{int(p_layers)}"
+                print(
+                    json.dumps(
+                        {
+                            "run_seed": int(run_seed),
+                            "graph_seed_used": int(resolved_graph_seed),
+                            "graph_json": str(source_graph_json),
+                            "graph_png": None if source_graph_png is None else str(source_graph_png),
+                            "graph_created": bool(graph_created),
+                            "n_edges": len(edges),
+                        },
+                        indent=2,
+                    )
+                )
+                run_dir = init_root / seed_tag(int(run_seed))
                 run_dir.mkdir(parents=True, exist_ok=True)
                 artifacts_path = run_dir / "artifacts.json"
                 if args.skip_existing and artifacts_path.exists():
