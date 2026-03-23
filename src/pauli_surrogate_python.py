@@ -491,7 +491,7 @@ CLIFFORD_MAPS = {
         ((0, 1), 1),   # Y -> Z
     ],
     'CNOT': [  # CNOT gate (control, target) - Verified with Pennylane
-        # Indexing: idx = control_pauli + 4 * target_pauli where I=0, X=1, Y=2, Z=3
+        # Indexing: idx = target_pauli + 4 * control_pauli where I=0, X=1, Y=2, Z=3
         # Format: ((new_control_x, new_control_z), (new_target_x, new_target_z)), sign
         (((0, 0), (0, 0)), 1),   # 0x00: II -> II
         (((0, 0), (1, 0)), 1),   # 0x01: IX -> IX
@@ -512,6 +512,86 @@ CLIFFORD_MAPS = {
     ],
 }
 
+_PAULI_IDX_TO_XZ = (
+    (0, 0),  # I
+    (1, 0),  # X
+    (1, 1),  # Y
+    (0, 1),  # Z
+)
+
+
+def _xz_to_two_qubit_pauli_idx(x: Union[int, np.ndarray], z: Union[int, np.ndarray]) -> Union[int, np.ndarray]:
+    """Map (x, z) bits to I=0, X=1, Y=2, Z=3."""
+    return (x + (z << 1)) ^ z
+
+
+def _apply_single_qubit_clifford_from_table(symbol: str, pstr: PauliString, q: int) -> Tuple[PauliString, int]:
+    """Apply a known single-qubit Clifford table entry to a Pauli string."""
+    xq, zq = get_local_pauli(pstr.x_mask, pstr.z_mask, q)
+    lookup_idx = xq + 2 * zq  # I=0, X=1, Z=2, Y=3
+
+    (new_xq, new_zq), sign = CLIFFORD_MAPS[symbol][lookup_idx]
+
+    bit = 1 << q
+    x_new = (pstr.x_mask & ~bit) | (new_xq << q)
+    z_new = (pstr.z_mask & ~bit) | (new_zq << q)
+    return PauliString(x_new, z_new), sign
+
+
+def _apply_two_qubit_clifford_from_table(
+    symbol: str,
+    pstr: PauliString,
+    control: int,
+    target: int,
+) -> Tuple[PauliString, int]:
+    """Apply a known two-qubit Clifford table entry to a Pauli string."""
+    xc, zc = get_local_pauli(pstr.x_mask, pstr.z_mask, control)
+    xt, zt = get_local_pauli(pstr.x_mask, pstr.z_mask, target)
+
+    control_pauli = _xz_to_two_qubit_pauli_idx(xc, zc)
+    target_pauli = _xz_to_two_qubit_pauli_idx(xt, zt)
+    lookup_idx = target_pauli + 4 * control_pauli
+
+    ((new_xc, new_zc), (new_xt, new_zt)), sign = CLIFFORD_MAPS[symbol][lookup_idx]
+
+    x_new = pstr.x_mask
+    z_new = pstr.z_mask
+
+    bc = 1 << control
+    x_new = (x_new & ~bc) | (new_xc << control)
+    z_new = (z_new & ~bc) | (new_zc << control)
+
+    bt = 1 << target
+    x_new = (x_new & ~bt) | (new_xt << target)
+    z_new = (z_new & ~bt) | (new_zt << target)
+
+    return PauliString(x_new, z_new), sign
+
+
+def _generate_cz_map() -> List[Tuple[Tuple[Tuple[int, int], Tuple[int, int]], int]]:
+    """Derive CZ conjugation from CZ = H(target) · CNOT · H(target)."""
+    table = []
+    for xc, zc in _PAULI_IDX_TO_XZ:
+        for xt, zt in _PAULI_IDX_TO_XZ:
+            pstr = PauliString((xc << 0) | (xt << 1), (zc << 0) | (zt << 1))
+            sign = 1
+
+            pstr, step_sign = _apply_single_qubit_clifford_from_table("H", pstr, 1)
+            sign *= step_sign
+            pstr, step_sign = _apply_two_qubit_clifford_from_table("CNOT", pstr, 0, 1)
+            sign *= step_sign
+            pstr, step_sign = _apply_single_qubit_clifford_from_table("H", pstr, 1)
+            sign *= step_sign
+
+            new_control = get_local_pauli(pstr.x_mask, pstr.z_mask, 0)
+            new_target = get_local_pauli(pstr.x_mask, pstr.z_mask, 1)
+            table.append(((new_control, new_target), sign))
+
+    return table
+
+
+CLIFFORD_MAPS["CZ"] = _generate_cz_map()
+
 # Precomputed single-qubit Clifford maps for vectorized updates
 _SINGLE_Q_CLIFFORD_ARRAYS = {
     sym: (
@@ -522,78 +602,32 @@ _SINGLE_Q_CLIFFORD_ARRAYS = {
     for sym in ("H", "S", "SX")
 }
 
-_CNOT_CLIFFORD_ARRAYS = (
-    np.array([m[0][0][0] for m in CLIFFORD_MAPS["CNOT"]], dtype=np.uint64),
-    np.array([m[0][0][1] for m in CLIFFORD_MAPS["CNOT"]], dtype=np.uint64),
-    np.array([m[0][1][0] for m in CLIFFORD_MAPS["CNOT"]], dtype=np.uint64),
-    np.array([m[0][1][1] for m in CLIFFORD_MAPS["CNOT"]], dtype=np.uint64),
-    np.array([m[1] for m in CLIFFORD_MAPS["CNOT"]], dtype=np.int8),
-)
+def _build_two_qubit_clifford_arrays(symbol: str) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    table = CLIFFORD_MAPS[symbol]
+    return (
+        np.array([m[0][0][0] for m in table], dtype=np.uint64),
+        np.array([m[0][0][1] for m in table], dtype=np.uint64),
+        np.array([m[0][1][0] for m in table], dtype=np.uint64),
+        np.array([m[0][1][1] for m in table], dtype=np.uint64),
+        np.array([m[1] for m in table], dtype=np.int8),
+    )
+
+
+_TWO_Q_CLIFFORD_ARRAYS = {
+    "CNOT": _build_two_qubit_clifford_arrays("CNOT"),
+    "CZ": _build_two_qubit_clifford_arrays("CZ"),
+}
 
 def apply_clifford(gate: CliffordGate, pstr: PauliString) -> Tuple[PauliString, int]:
     """Apply a Clifford gate to a Pauli string using lookup table"""
-    
-    if gate.symbol == 'CNOT':
-        # Two-qubit CNOT: use full lookup table
+
+    if gate.symbol in _TWO_Q_CLIFFORD_ARRAYS:
         assert len(gate.qubits) == 2
         control, target = gate.qubits
-        
-        # Extract local Paulis at control and target qubits
-        xc, zc = get_local_pauli(pstr.x_mask, pstr.z_mask, control)
-        xt, zt = get_local_pauli(pstr.x_mask, pstr.z_mask, target)
-        
-        # Lookup index: Pennylane convention is idx = target_pauli + 4 * control_pauli
-        # where I=0, X=1, Y=2, Z=3
-        # Convert (x,z) to pauli index: I=(0,0)→0, X=(1,0)→1, Y=(1,1)→2, Z=(0,1)→3
-        def xz_to_pauli_idx(x, z):
-            if x == 0 and z == 0:
-                return 0  # I
-            elif x == 1 and z == 0:
-                return 1  # X
-            elif x == 1 and z == 1:
-                return 2  # Y
-            else:  # x == 0 and z == 1
-                return 3  # Z
-        
-        control_pauli = xz_to_pauli_idx(xc, zc)
-        target_pauli = xz_to_pauli_idx(xt, zt)
-        lookup_idx = target_pauli + 4 * control_pauli
-        
-        # Get new Paulis and sign from lookup table
-        ((new_xc, new_zc), (new_xt, new_zt)), sign = CLIFFORD_MAPS['CNOT'][lookup_idx]
-        
-        # Build new Pauli string
-        x_new = pstr.x_mask
-        z_new = pstr.z_mask
-        
-        # Update control qubit
-        bc = 1 << control
-        x_new = (x_new & ~bc) | (new_xc << control)
-        z_new = (z_new & ~bc) | (new_zc << control)
-        
-        # Update target qubit
-        bt = 1 << target
-        x_new = (x_new & ~bt) | (new_xt << target)
-        z_new = (z_new & ~bt) | (new_zt << target)
-        
-        return PauliString(x_new, z_new), sign
-    
-    # Single-qubit Clifford
+        return _apply_two_qubit_clifford_from_table(gate.symbol, pstr, control, target)
+
     assert len(gate.qubits) == 1
-    q = gate.qubits[0]
-    
-    # Get local Pauli at qubit q
-    xq, zq = get_local_pauli(pstr.x_mask, pstr.z_mask, q)
-    lookup_idx = xq + 2 * zq  # I=0, X=1, Z=2, Y=3
-    
-    (new_xq, new_zq), sign = CLIFFORD_MAPS[gate.symbol][lookup_idx]
-    
-    # Update the Pauli string
-    bit = 1 << q
-    x_new = (pstr.x_mask & ~bit) | (new_xq << q)
-    z_new = (pstr.z_mask & ~bit) | (new_zq << q)
-    
-    return PauliString(x_new, z_new), sign
+    return _apply_single_qubit_clifford_from_table(gate.symbol, pstr, gate.qubits[0])
 
 
 def apply_single_qubit_clifford_batch(
@@ -726,19 +760,19 @@ def apply_single_qubit_clifford_batch_blocks(
     return new_psum
 
 
-def apply_cnot_batch_blocks(
+def apply_two_qubit_clifford_batch_blocks(
     gate: CliffordGate,
     psum: "PauliSum",
     n_blocks: int,
     thetas: Optional[np.ndarray] = None,
     min_abs: Optional[float] = None,
 ) -> "PauliSum":
-    """Apply a CNOT gate using block masks (supports >64 qubits)."""
+    """Apply a known two-qubit Clifford gate using block masks (supports >64 qubits)."""
     new_psum = PauliSum(psum.n_qubits)
-    assert gate.symbol == "CNOT" and len(gate.qubits) == 2
+    assert gate.symbol in _TWO_Q_CLIFFORD_ARRAYS and len(gate.qubits) == 2
 
     control, target = gate.qubits
-    nxc, nzc, nxt, nzt, sgn = _CNOT_CLIFFORD_ARRAYS
+    nxc, nzc, nxt, nzt, sgn = _TWO_Q_CLIFFORD_ARRAYS[gate.symbol]
 
     pstrs = list(psum.terms.keys())
     if not pstrs:
@@ -750,10 +784,8 @@ def apply_cnot_batch_blocks(
     xt = get_bit_from_blocks(x_blocks, target)
     zt = get_bit_from_blocks(z_blocks, target)
 
-    # Pennylane CNOT table index order: I=0, X=1, Y=2, Z=3
-    # Map (x,z) -> idx by swapping Y/Z relative to x + 2z
-    c_idx = (xc + (zc << np.uint64(1))) ^ zc
-    t_idx = (xt + (zt << np.uint64(1))) ^ zt
+    c_idx = _xz_to_two_qubit_pauli_idx(xc, zc)
+    t_idx = _xz_to_two_qubit_pauli_idx(xt, zt)
     lookup_idx = t_idx + (c_idx << np.uint64(2))
 
     new_xc = nxc[lookup_idx]
@@ -988,8 +1020,8 @@ def propagate_gate(
                 return apply_single_qubit_clifford_batch(gate, psum, thetas=thetas, min_abs=min_abs)
             return apply_single_qubit_clifford_batch_blocks(gate, psum, n_blocks, thetas=thetas, min_abs=min_abs)
 
-        if gate.symbol == "CNOT" and len(gate.qubits) == 2:
-            return apply_cnot_batch_blocks(gate, psum, n_blocks, thetas=thetas, min_abs=min_abs)
+        if gate.symbol in _TWO_Q_CLIFFORD_ARRAYS and len(gate.qubits) == 2:
+            return apply_two_qubit_clifford_batch_blocks(gate, psum, n_blocks, thetas=thetas, min_abs=min_abs)
 
         # Fallback scalar path for unknown Clifford
         new_psum = PauliSum(psum.n_qubits)
