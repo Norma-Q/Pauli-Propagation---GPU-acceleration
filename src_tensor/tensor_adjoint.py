@@ -140,13 +140,21 @@ def propagate_union_basis_psum(
 
 def adjoint_weights_on_zero(
     psum: TensorPauliSum,
-    thetas,
+    thetas=None,
     *,
     embedding=None,
     compute_device: str = "cuda",
     chunk_size: int = 1_000_000,
 ) -> Tensor:
-    """Compute w = M(theta, embedding)^T s for |0...0> expectation."""
+    """Compute w = M(theta, embedding)^T s for |0...0> expectation.
+    
+    Args:
+        psum: Tensor Pauli sum.
+        thetas: Optional trainable parameters. Can be None for embedding-only circuits.
+        embedding: Optional embedding parameters.
+        compute_device: Device for computation.
+        chunk_size: Chunk size for memory-efficient processing.
+    """
 
     if not _TORCH_AVAILABLE:
         raise RuntimeError("PyTorch is required for tensor backend.")

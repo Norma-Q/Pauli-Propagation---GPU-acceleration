@@ -264,6 +264,7 @@ def build_pauli_rotation_step(
 ) -> Tuple[Tensor, Tensor, TensorSparseStep, Optional[Tensor]]:
     _require_backend()
 
+    # [변경 사항] 게이트에서 두 종류의 인덱스를 모두 가져옵니다.
     p_idx = int(getattr(gate, "param_idx", -1))
     e_idx = int(getattr(gate, "embedding_idx", -1))
 
@@ -278,27 +279,83 @@ def build_pauli_rotation_step(
     # without changing the semantic meaning of step.param_idx used by evaluators.
     backend_p_idx = p_idx if p_idx >= 0 else (e_idx if e_idx >= 0 else -1)
 
-    is_multiword = x_mask.dim() == 2
-    if step_device is None:
-        step_device = "cpu" if device != "cpu" else device
+    # Exact compile for embedding-only rotations has shown degenerate behavior
+    # with the implicit backend path (same-cols/cos folding), yielding near-zero
+    # adjoint weights even when the PennyLane reference is non-zero.
+    #
+    # Keep the implicit path for theta-aware pruning, but route exact
+    # embedding-only compilation through the explicit sparse matrices so the
+    # runtime expval matches the exact reference semantics.
+    use_implicit_backend = not (
+        min_abs is None and e_idx >= 0 and p_idx < 0
+    )
 
+    is_multiword = x_mask.dim() == 2
     if is_multiword:
-        if not hasattr(_CPP_BACKEND, "build_pauli_rotation_step_implicit_mw_cpp"):
+        if use_implicit_backend and hasattr(_CPP_BACKEND, "build_pauli_rotation_step_implicit_mw_cpp"):
+            gx_words, gz_words = _gate_masks_words(gate, n_words=int(x_mask.shape[1]), device=x_mask.device)
+            (
+                new_x,
+                new_z,
+                same_cols,
+                anti_same_pos,
+                r2,
+                c2,
+                v2,
+                coeffs_cache_out,
+            ) = _CPP_BACKEND.build_pauli_rotation_step_implicit_mw_cpp(
+                gx_words,
+                gz_words,
+                backend_p_idx,
+                x_mask,
+                z_mask,
+                t_dtype,
+                min_abs,
+                coeffs_cache,
+                thetas_t,
+                int(max_weight),
+                float(weight_x),
+                float(weight_y),
+                float(weight_z),
+            )
+
+            if step_device is None:
+                step_device = "cpu" if device != "cpu" else device
+
+            n_out = int(new_x.shape[0])
+            n_in = int(x_mask.shape[0])
+            step = TensorSparseStep(
+                mat_const=_make_empty_sparse((n_out, n_in), step_device, t_dtype),
+                mat_cos=_make_empty_sparse((n_out, n_in), step_device, t_dtype),
+                mat_sin=_make_sparse(r2, c2, v2, (n_out, n_in), step_device, t_dtype),
+                param_idx=p_idx,
+                shape=(n_out, n_in),
+                emb_idx=e_idx,
+                same_cols=same_cols.to(step_device),
+                anti_same_pos=anti_same_pos.to(step_device),
+            )
+
+            out_cache: Optional[Tensor] = None
+            if min_abs is not None and coeffs_cache_out is not None:
+                out_cache = cast(Tensor, coeffs_cache_out)
+            return new_x, new_z, step, out_cache
+
+        if not hasattr(_CPP_BACKEND, "build_pauli_rotation_step_mw_cpp"):
             raise CPPBackendUnavailableError(
-                "Compiled backend does not expose the multiword implicit rotation API."
+                "Compiled backend does not expose multiword APIs."
             )
         gx_words, gz_words = _gate_masks_words(gate, n_words=int(x_mask.shape[1]), device=x_mask.device)
         (
             new_x,
             new_z,
-            same_cols,
-            anti_same_pos,
+            r0, c0, v0,
+            r1, c1, v1,
             r2, c2, v2,
             coeffs_cache_out,
-        ) = _CPP_BACKEND.build_pauli_rotation_step_implicit_mw_cpp(
+        ) = _CPP_BACKEND.build_pauli_rotation_step_mw_cpp(
             gx_words,
             gz_words,
-            backend_p_idx,
+            backend_p_idx,  # backend requires non-negative index for rotation steps
             x_mask,
             z_mask,
             t_dtype,
@@ -311,19 +368,63 @@ def build_pauli_rotation_step(
             float(weight_z),
         )
     else:
-        if not hasattr(_CPP_BACKEND, "build_pauli_rotation_step_implicit_cpp"):
-            raise CPPBackendUnavailableError(
-                "Compiled backend does not expose the implicit rotation API."
+        if use_implicit_backend and hasattr(_CPP_BACKEND, "build_pauli_rotation_step_implicit_cpp"):
+            gx, gz = _gate_masks(gate)
+            (
+                new_x,
+                new_z,
+                same_cols,
+                anti_same_pos,
+                r2,
+                c2,
+                v2,
+                coeffs_cache_out,
+            ) = _CPP_BACKEND.build_pauli_rotation_step_implicit_cpp(
+                int(gx),
+                int(gz),
+                backend_p_idx,
+                x_mask,
+                z_mask,
+                t_dtype,
+                min_abs,
+                coeffs_cache,
+                thetas_t,
+                int(max_weight),
+                float(weight_x),
+                float(weight_y),
+                float(weight_z),
             )
+
+            if step_device is None:
+                step_device = "cpu" if device != "cpu" else device
+
+            n_out = int(new_x.shape[0])
+            n_in = int(x_mask.shape[0])
+            step = TensorSparseStep(
+                mat_const=_make_empty_sparse((n_out, n_in), step_device, t_dtype),
+                mat_cos=_make_empty_sparse((n_out, n_in), step_device, t_dtype),
+                mat_sin=_make_sparse(r2, c2, v2, (n_out, n_in), step_device, t_dtype),
+                param_idx=p_idx,
+                shape=(n_out, n_in),
+                emb_idx=e_idx,
+                same_cols=same_cols.to(step_device),
+                anti_same_pos=anti_same_pos.to(step_device),
+            )
+
+            out_cache: Optional[Tensor] = None
+            if min_abs is not None and coeffs_cache_out is not None:
+                out_cache = cast(Tensor, coeffs_cache_out)
+            return new_x, new_z, step, out_cache
+
         gx, gz = _gate_masks(gate)
         (
             new_x,
             new_z,
-            same_cols,
-            anti_same_pos,
+            r0, c0, v0,
+            r1, c1, v1,
             r2, c2, v2,
             coeffs_cache_out,
-        ) = _CPP_BACKEND.build_pauli_rotation_step_implicit_cpp(
+        ) = _CPP_BACKEND.build_pauli_rotation_step_cpp(
             int(gx),
             int(gz),
             backend_p_idx,
@@ -339,97 +440,102 @@ def build_pauli_rotation_step(
             float(weight_z),
         )
 
+    if step_device is None:
+        step_device = "cpu" if device != "cpu" else device
+
+    work_device = new_x.device
+    n_out_backend = int(new_x.shape[0])
     n_in = int(x_mask.shape[0])
+
+    c0_w = c0.to(work_device, dtype=torch.int64)
+    c1_w = c1.to(work_device, dtype=torch.int64)
+    c2_w = c2.to(work_device, dtype=torch.int64)
+    r0_w = r0.to(work_device, dtype=torch.int64)
+    r1_w = r1.to(work_device, dtype=torch.int64)
+    r2_w = r2.to(work_device, dtype=torch.int64)
+    v2_w = v2.to(work_device)
+
+    same_backend_mask = torch.zeros((n_out_backend,), dtype=torch.bool, device=work_device)
+    if r0_w.numel() > 0:
+        same_backend_mask[r0_w] = True
+    if r1_w.numel() > 0:
+        same_backend_mask[r1_w] = True
+
+    same_backend_rows = torch.nonzero(same_backend_mask, as_tuple=False).flatten().to(torch.int64)
+    n_same = int(same_backend_rows.numel())
+    backend_to_same_pos = torch.full((n_out_backend,), -1, dtype=torch.int64, device=work_device)
+    if n_same > 0:
+        backend_to_same_pos[same_backend_rows] = torch.arange(n_same, dtype=torch.int64, device=work_device)
+
+    same_cols = torch.full((n_same,), -1, dtype=torch.int64, device=work_device)
+    if c0_w.numel() > 0:
+        pos0 = backend_to_same_pos.index_select(0, r0_w)
+        same_cols[pos0] = c0_w
+    if c1_w.numel() > 0:
+        pos1 = backend_to_same_pos.index_select(0, r1_w)
+        prev = same_cols.index_select(0, pos1)
+        if bool(((prev >= 0) & (prev != c1_w)).any().item()):
+            raise RuntimeError("Rotation same-branch row merged from multiple input cols; implicit one-to-one model violated.")
+        same_cols[pos1] = c1_w
+        anti_same_pos = pos1
+    else:
+        anti_same_pos = _empty_i64(work_device)
+
+    if n_same > 0 and bool((same_cols < 0).any().item()):
+        raise RuntimeError("Rotation same-branch reconstruction produced unassigned same rows.")
+
+    backend_to_final = backend_to_same_pos.clone()
+
+    novel_backend_rows = _empty_i64(work_device)
+    sin_row_final = _empty_i64(work_device)
+    if r2_w.numel() > 0:
+        sin_row_final = backend_to_final.index_select(0, r2_w)
+        novel_edge_mask = sin_row_final.lt(0)
+        if bool(novel_edge_mask.any().item()):
+            novel_row_mask = torch.zeros((n_out_backend,), dtype=torch.bool, device=work_device)
+            novel_row_mask[r2_w[novel_edge_mask]] = True
+            novel_row_mask &= backend_to_final.lt(0)
+            novel_backend_rows = torch.nonzero(novel_row_mask, as_tuple=False).flatten().to(torch.int64)
+            novel_pos_map = torch.full((n_out_backend,), -1, dtype=torch.int64, device=work_device)
+            novel_pos_map[novel_backend_rows] = torch.arange(
+                n_same,
+                n_same + int(novel_backend_rows.numel()),
+                dtype=torch.int64,
+                device=work_device,
+            )
+            sin_row_final = torch.where(
+                novel_edge_mask,
+                novel_pos_map.index_select(0, r2_w),
+                sin_row_final,
+            )
+
+    final_backend_rows = torch.cat([same_backend_rows, novel_backend_rows], dim=0)
+    new_x = new_x.index_select(0, final_backend_rows) if final_backend_rows.numel() > 0 else new_x[:0]
+    new_z = new_z.index_select(0, final_backend_rows) if final_backend_rows.numel() > 0 else new_z[:0]
+
     n_out = int(new_x.shape[0])
+    mat_const = _make_empty_sparse((n_out, n_in), step_device, t_dtype)
+    mat_cos = _make_empty_sparse((n_out, n_in), step_device, t_dtype)
+    mat_sin = _make_sparse(sin_row_final, c2_w, v2_w, (n_out, n_in), step_device, t_dtype)
+
+    # [중요] TensorSparseStep 생성 시, 2단계에서 정한 필드 순서 준수
+    # shape (기본값 없음) -> emb_idx (기본값 있음) 순서
     step = TensorSparseStep(
-        mat_const=_make_empty_sparse((n_out, n_in), step_device, t_dtype),
-        mat_cos=_make_empty_sparse((n_out, n_in), step_device, t_dtype),
-        mat_sin=_make_sparse(r2, c2, v2, (n_out, n_in), step_device, t_dtype),
+        mat_const=mat_const,
+        mat_cos=mat_cos,
+        mat_sin=mat_sin,
         param_idx=p_idx,
         shape=(n_out, n_in),
-        emb_idx=e_idx,
+        emb_idx=e_idx,  # 새로 추가된 인덱스 저장
         same_cols=same_cols.to(step_device),
         anti_same_pos=anti_same_pos.to(step_device),
     )
 
     out_cache: Optional[Tensor] = None
     if min_abs is not None and coeffs_cache_out is not None:
-        out_cache = cast(Tensor, coeffs_cache_out)
+        out_cache = cast(Tensor, coeffs_cache_out).index_select(0, final_backend_rows.to(cast(Tensor, coeffs_cache_out).device))
 
     return new_x, new_z, step, out_cache
-
-
-def build_pauli_rotation_anti_sin(
-    *,
-    gate,
-    x_mask: Tensor,
-    z_mask: Tensor,
-    t_dtype,
-    device: str,
-) -> Tuple[Tensor, Tensor, Tensor]:
-    _require_backend()
-
-    is_multiword = x_mask.dim() == 2
-    if is_multiword:
-        if not hasattr(_CPP_BACKEND, "build_pauli_rotation_anti_sin_mw_cpp"):
-            raise CPPBackendUnavailableError(
-                "Compiled backend does not expose the multiword anti-sin rotation API."
-            )
-        gx_words, gz_words = _gate_masks_words(gate, n_words=int(x_mask.shape[1]), device=x_mask.device)
-        return _CPP_BACKEND.build_pauli_rotation_anti_sin_mw_cpp(
-            gx_words,
-            gz_words,
-            t_dtype,
-            x_mask,
-            z_mask,
-        )
-
-    if not hasattr(_CPP_BACKEND, "build_pauli_rotation_anti_sin_cpp"):
-        raise CPPBackendUnavailableError(
-            "Compiled backend does not expose the anti-sin rotation API."
-        )
-    gx, gz = _gate_masks(gate)
-    return _CPP_BACKEND.build_pauli_rotation_anti_sin_cpp(
-        int(gx),
-        int(gz),
-        t_dtype,
-        x_mask,
-        z_mask,
-    )
-
-
-def merge_pauli_query_into_base(
-    *,
-    base_x: Tensor,
-    base_z: Tensor,
-    query_x: Tensor,
-    query_z: Tensor,
-) -> Tuple[Tensor, Tensor, Tensor]:
-    _require_backend()
-
-    is_multiword = base_x.dim() == 2
-    if is_multiword:
-        if not hasattr(_CPP_BACKEND, "merge_pauli_query_into_base_mw_cpp"):
-            raise CPPBackendUnavailableError(
-                "Compiled backend does not expose the multiword anti-only merge API."
-            )
-        return _CPP_BACKEND.merge_pauli_query_into_base_mw_cpp(
-            base_x,
-            base_z,
-            query_x,
-            query_z,
-        )
-
-    if not hasattr(_CPP_BACKEND, "merge_pauli_query_into_base_cpp"):
-        raise CPPBackendUnavailableError(
-            "Compiled backend does not expose the anti-only merge API."
-        )
-    return _CPP_BACKEND.merge_pauli_query_into_base_cpp(
-        base_x,
-        base_z,
-        query_x,
-        query_z,
-    )
 
 
 def build_depolarizing_step(
@@ -629,9 +735,6 @@ def compact_sparse_step_chunked(
 
         if keep_col_mask_dev is None:
             keep_col_mask_dev = torch.ones((int(step.shape[1]),), dtype=torch.bool, device=same_cols.device)
-
-        if n_same_old > 0:
-            keep_row_same = keep_row_same & keep_col_mask_dev.index_select(0, same_cols)
 
         col_cumsum = torch.cumsum(keep_col_mask_dev.to(torch.int64), dim=0) - 1
         kept_same_cols = same_cols[keep_row_same]

@@ -11,10 +11,8 @@ then walks steps backwards to remove any input columns that cannot reach them.
 from __future__ import annotations
 
 from typing import Any, List, Optional, Sequence, TYPE_CHECKING, Tuple, cast
-import os
 import math
-import numpy as np
-import time
+import os
 import torch.multiprocessing as mp
 
 torch: Any
@@ -38,9 +36,7 @@ from tqdm import tqdm
 
 from .tensor_propagate_impl import (
     build_clifford_step,
-    build_pauli_rotation_anti_sin,
     build_pauli_rotation_step,
-    merge_pauli_query_into_base,
     build_depolarizing_step,
     build_amplitude_damping_step,
     compact_sparse_step_chunked,
@@ -57,52 +53,18 @@ _PARALLEL_MIN_TERMS_HARD = 5_000_000
 _PARALLEL_CONSEC_STEPS_SOFT = 2
 
 
-def _env_flag_true(name: str) -> bool:
-    raw = str(os.environ.get(name, "")).strip().lower()
-    return raw not in ("", "0", "false", "no", "off")
+def _zero_filter_used_cols_mode() -> str:
+    # Stability-first default: force used-cols accumulation on CPU.
+    return "cpu"
 
 
-def _propagation_profile_enabled() -> bool:
-    return _env_flag_true("PPS_PROFILE_PROPAGATION")
-
-
-def _propagation_profile_min_terms() -> int:
-    raw = os.environ.get("PPS_PROFILE_MIN_TERMS", "1000000")
-    try:
-        return max(1, int(raw))
-    except Exception:
-        return 1_000_000
-
-
-def _profile_sync(device: Optional[str]) -> None:
-    if device is None or (not torch.cuda.is_available()) or (not str(device).startswith("cuda")):
-        return
-    try:
-        torch.cuda.synchronize(device)
-    except Exception:
-        pass
-
-
-def _profile_start(device: Optional[str]) -> float:
-    _profile_sync(device)
-    return time.perf_counter()
-
-
-def _profile_end(stats: Optional[dict], key: str, start_time: float, device: Optional[str]) -> None:
-    if stats is None:
-        return
-    _profile_sync(device)
-    stats[key] = float(stats.get(key, 0.0)) + (time.perf_counter() - start_time)
-
-
-def _tensor_nbytes(tensor: Optional[Tensor]) -> int:
-    if tensor is None:
-        return 0
-    return int(tensor.numel()) * int(tensor.element_size())
-
-
-def _format_gib(nbytes: int) -> str:
-    return f"{(float(nbytes) / (1024 ** 3)):.2f}GiB"
+def _zero_filter_compact_device(compute_device: str) -> str:
+    mode = str(os.environ.get("PPS_ZERO_FILTER_COMPACT_DEVICE", "auto")).strip().lower()
+    if mode == "cpu":
+        return "cpu"
+    if mode == "cuda":
+        return str(compute_device)
+    return str(compute_device)
 
 
 def _auto_parallel_threshold_from_device(compute_device: str) -> int:
@@ -148,183 +110,6 @@ def _make_sparse(row_idx, col_idx, values, shape, device, dtype):
     sp = torch.sparse_coo_tensor(indices, values, size=shape, device=device, dtype=dtype)
     # Memory-first default: avoid coalesce() (it can allocate large temporary buffers).
     return sp
-
-
-def _make_empty_sparse(shape, device, dtype):
-    return torch.sparse_coo_tensor(
-        torch.zeros((2, 0), dtype=torch.int64, device=device),
-        torch.zeros((0,), dtype=dtype, device=device),
-        size=shape,
-        device=device,
-        dtype=dtype,
-    )
-
-
-def _numpy_key_view(x_mask: Tensor, z_mask: Tensor) -> np.ndarray:
-    x_np = x_mask.detach().cpu().contiguous().numpy()
-    z_np = z_mask.detach().cpu().contiguous().numpy()
-    if x_np.ndim == 1:
-        flat = np.stack([x_np, z_np], axis=1)
-    else:
-        flat = np.concatenate([x_np, z_np], axis=1)
-    flat = np.ascontiguousarray(flat)
-    item_nbytes = int(flat.dtype.itemsize * flat.shape[1])
-    return flat.view(np.dtype((np.void, item_nbytes))).reshape(-1)
-
-
-def _build_same_lookup(x_mask: Tensor, z_mask: Tensor) -> Tuple[np.ndarray, np.ndarray]:
-    keys = _numpy_key_view(x_mask, z_mask)
-    order = np.argsort(keys)
-    return keys[order], order.astype(np.int64, copy=False)
-
-
-def _lookup_same_rows(sorted_keys: np.ndarray, sorted_rows: np.ndarray, x_mask: Tensor, z_mask: Tensor) -> np.ndarray:
-    keys = _numpy_key_view(x_mask, z_mask)
-    pos = np.searchsorted(sorted_keys, keys)
-    rows = np.full((keys.shape[0],), -1, dtype=np.int64)
-    valid = pos < sorted_keys.shape[0]
-    if np.any(valid):
-        valid_pos = pos[valid]
-        matched = sorted_keys[valid_pos] == keys[valid]
-        if np.any(matched):
-            matched_idx = np.nonzero(valid)[0][matched]
-            rows[matched_idx] = sorted_rows[valid_pos[matched]]
-    return rows
-
-
-def _lookup_same_rows_torch(same_x: Tensor, same_z: Tensor, query_x: Tensor, query_z: Tensor) -> Tensor:
-    if int(query_x.shape[0]) == 0:
-        return torch.empty((0,), dtype=torch.int64, device=same_x.device)
-
-    if same_x.dim() == 1:
-        same_keys = torch.stack([same_x, same_z], dim=1)
-        query_keys = torch.stack([query_x, query_z], dim=1)
-    else:
-        same_keys = torch.cat([same_x, same_z], dim=1)
-        query_keys = torch.cat([query_x, query_z], dim=1)
-
-    all_keys = torch.cat([same_keys, query_keys], dim=0)
-    _, inv = torch.unique(all_keys, dim=0, return_inverse=True, sorted=False)
-    inv = inv.to(torch.int64)
-    n_same = int(same_keys.shape[0])
-    same_inv = inv[:n_same]
-    query_inv = inv[n_same:]
-
-    keyid_to_row = torch.full(
-        (int(inv.max().item()) + 1,),
-        -1,
-        dtype=torch.int64,
-        device=same_x.device,
-    )
-    if n_same > 0:
-        same_rows = torch.arange(n_same, dtype=torch.int64, device=same_x.device)
-        keyid_to_row.index_put_((same_inv,), same_rows)
-    return keyid_to_row.index_select(0, query_inv)
-
-
-def _prepare_lookup_state(
-    same_x: Tensor,
-    same_z: Tensor,
-    *,
-    compute_device: str,
-) -> Tuple[Tensor, Tensor]:
-    if int(same_x.shape[0]) == 0:
-        return same_x, same_z
-    if (not torch.cuda.is_available()) or (not str(compute_device).startswith("cuda")):
-        return same_x, same_z
-    if same_x.device.type == "cuda" and same_z.device.type == "cuda":
-        return same_x, same_z
-    try:
-        return (
-            same_x.to(compute_device, non_blocking=True),
-            same_z.to(compute_device, non_blocking=True),
-        )
-    except RuntimeError:
-        return same_x, same_z
-
-
-def _popcount_u64(x: Tensor) -> Tensor:
-    count = torch.zeros_like(x, dtype=torch.int64)
-    for i in range(64):
-        count = count + torch.bitwise_and(torch.bitwise_right_shift(x, i), 1)
-    return count
-
-
-def _rotation_anti_local_rows(*, gate, x_mask: Tensor, z_mask: Tensor) -> Tensor:
-    if x_mask.dim() == 2:
-        n_words = int(x_mask.shape[1])
-        gx_words = torch.zeros((n_words,), dtype=torch.int64, device=x_mask.device)
-        gz_words = torch.zeros((n_words,), dtype=torch.int64, device=x_mask.device)
-        for q, p in zip(gate.qubits, gate.pauli):
-            qi = int(q)
-            w = qi // 63
-            b = qi % 63
-            bit = int(1) << b
-            if p == "X":
-                gx_words[w] |= bit
-            elif p == "Z":
-                gz_words[w] |= bit
-            elif p == "Y":
-                gx_words[w] |= bit
-                gz_words[w] |= bit
-        gx_t = gx_words.unsqueeze(0)
-        gz_t = gz_words.unsqueeze(0)
-        symp = _popcount_u64((torch.bitwise_and(x_mask, gz_t)) ^ (torch.bitwise_and(z_mask, gx_t))).sum(1) & 1
-    else:
-        gx = 0
-        gz = 0
-        for q, p in zip(gate.qubits, gate.pauli):
-            bit = 1 << int(q)
-            if p == "X":
-                gx |= bit
-            elif p == "Z":
-                gz |= bit
-            elif p == "Y":
-                gx |= bit
-                gz |= bit
-        gx_t = torch.scalar_tensor(int(gx), dtype=torch.int64, device=x_mask.device)
-        gz_t = torch.scalar_tensor(int(gz), dtype=torch.int64, device=x_mask.device)
-        symp = _popcount_u64((x_mask & gz_t) ^ (z_mask & gx_t)) & 1
-    return torch.nonzero(symp.eq(1), as_tuple=False).flatten().to(torch.int64)
-
-
-def _truncation_is_effective(
-    x_mask: Tensor,
-    *,
-    max_weight: int,
-    weight_x: float,
-    weight_y: float,
-    weight_z: float,
-) -> bool:
-    weights = (float(weight_x), float(weight_y), float(weight_z))
-    if any(w < 0.0 for w in weights):
-        return True
-    max_axis_weight = max(weights)
-    if max_axis_weight <= 0.0:
-        return False
-    n_words = int(x_mask.shape[1]) if x_mask.dim() == 2 else 1
-    max_possible_weight = float(n_words * 63) * max_axis_weight
-    return float(max_weight) < max_possible_weight
-
-
-def _truncate_terms_mask(x_mask: Tensor, z_mask: Tensor, *, max_weight: int, weight_x: float, weight_y: float, weight_z: float) -> Tensor:
-    if not _truncation_is_effective(
-        x_mask,
-        max_weight=max_weight,
-        weight_x=weight_x,
-        weight_y=weight_y,
-        weight_z=weight_z,
-    ):
-        return torch.ones((int(x_mask.shape[0]),), dtype=torch.bool, device=x_mask.device)
-    x_cnt = _popcount_u64(x_mask & (~z_mask)).to(torch.float64)
-    y_cnt = _popcount_u64(x_mask & z_mask).to(torch.float64)
-    z_cnt = _popcount_u64((~x_mask) & z_mask).to(torch.float64)
-    if x_mask.dim() == 2:
-        x_cnt = x_cnt.sum(1)
-        y_cnt = y_cnt.sum(1)
-        z_cnt = z_cnt.sum(1)
-    weighted = x_cnt * float(weight_x) + y_cnt * float(weight_y) + z_cnt * float(weight_z)
-    return weighted <= float(max_weight)
 
 
 def _parallel_propagate_worker(args: Tuple) -> Tuple[Tensor, Tensor, TensorSparseStep, Optional[Tensor]]:
@@ -557,8 +342,6 @@ def _filter_step_rows_cols(step: TensorSparseStep, row_mask: Tensor, col_mask: T
         same_cols_dev = step.same_cols
         keep_same = row_mask[: int(same_cols_dev.numel())].to(same_cols_dev.device)
         col_mask_dev = col_mask.to(same_cols_dev.device)
-        if same_cols_dev.numel() > 0:
-            keep_same = keep_same & col_mask_dev.index_select(0, same_cols_dev)
         col_map = torch.cumsum(col_mask_dev.to(torch.int64), dim=0) - 1
         kept_same_cols = same_cols_dev[keep_same]
         same_cols = col_map[kept_same_cols] if kept_same_cols.numel() > 0 else same_cols_dev[:0]
@@ -670,384 +453,348 @@ def _destructive_cat(tensor_list: List[Tensor], dim: int = 0) -> Tensor:
             out[tuple(idx)] = t
             
         offset += size
-    
+        
     return out
 
 
-def _process_pauli_rotation_step_chunked_anti_only(
-    x_mask_in: Tensor,
-    z_mask_in: Tensor,
-    chunk_size: int,
-    device: str,
-    step_device: str,
-    output_device: str = "cpu",
-    **kwargs,
-) -> Tuple[Tensor, Tensor, TensorSparseStep, Optional[Tensor]]:
-    gate = kwargs["gate"]
-    t_dtype = kwargs["t_dtype"]
-    min_abs = kwargs.get("min_abs")
-    coeffs_cache = kwargs.get("coeffs_cache")
-    thetas_t = kwargs.get("thetas_t")
-    max_weight = int(kwargs["max_weight"])
-    weight_x = float(kwargs["weight_x"])
-    weight_y = float(kwargs["weight_y"])
-    weight_z = float(kwargs["weight_z"])
+def _canonicalize_pauli_rows(x_mask: Tensor, z_mask: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
+    """Canonicalize Pauli rows and return (unique_x, unique_z, inverse_map).
 
-    n_terms = int(x_mask_in.shape[0])
-    outer_chunks = int(math.ceil(float(n_terms) / float(chunk_size)))
-    p_idx = int(getattr(gate, "param_idx", -1))
-    e_idx = int(getattr(gate, "embedding_idx", -1))
-    theta_idx = p_idx if p_idx >= 0 else (e_idx if e_idx >= 0 else -1)
-    profile_stats: Optional[dict[str, Any]] = None
-    total_start = 0.0
-    if _propagation_profile_enabled() and n_terms >= _propagation_profile_min_terms():
-        profile_stats = {
-            "gate": repr(gate),
-            "n_terms": int(n_terms),
-            "chunk_size": int(chunk_size),
-            "outer_chunks": int(outer_chunks),
-            "h2d_scan_sec": 0.0,
-            "h2d_scan_bytes": 0,
-            "anti_detect_sec": 0.0,
-            "pre_cat_sec": 0.0,
-            "same_gather_sec": 0.0,
-            "lookup_build_sec": 0.0,
-            "h2d_anti_sec": 0.0,
-            "h2d_anti_bytes": 0,
-            "anti_backend_sec": 0.0,
-            "d2h_anti_sec": 0.0,
-            "d2h_anti_bytes": 0,
-            "lookup_sec": 0.0,
-            "output_cat_sec": 0.0,
-            "truncate_sec": 0.0,
-        }
-        total_start = _profile_start(device)
+    `inverse_map` maps each old row index to the corresponding unique row index.
+    """
+    n_rows = int(x_mask.shape[0])
+    if n_rows == 0:
+        return x_mask, z_mask, torch.zeros((0,), dtype=torch.int64, device=x_mask.device)
 
-    if min_abs is not None:
-        if coeffs_cache is None or thetas_t is None:
-            raise RuntimeError("min_abs provided but coeffs_cache/thetas_t is None")
-        if theta_idx < 0:
-            raise RuntimeError("Rotation pruning requires a valid param_idx or embedding_idx")
-        coeffs_cache_mem = coeffs_cache if str(coeffs_cache.device) == str(torch.device(output_device)) else coeffs_cache.to(output_device)
-        theta_mem = thetas_t.index_select(
-            0,
-            torch.as_tensor([theta_idx], dtype=torch.int64, device=thetas_t.device),
-        )[0].to(dtype=coeffs_cache_mem.dtype, device=output_device)
-        cos_t_mem = torch.cos(theta_mem)
-        sin_t_mem = torch.sin(theta_mem)
+    if x_mask.dim() != z_mask.dim():
+        raise RuntimeError("x_mask/z_mask dim mismatch during row canonicalization")
+
+    # Build row keys as [x | z] so duplicates across chunk boundaries can be merged.
+    if x_mask.dim() == 1:
+        keys = torch.stack([x_mask, z_mask], dim=1)
     else:
-        coeffs_cache_mem = None
-        cos_t_mem = None
-        sin_t_mem = None
+        keys = torch.cat([x_mask, z_mask], dim=1)
 
-    anti_row_parts: List[Tensor] = []
-    comm_keep_parts: List[Tensor] = []
-    anti_same_col_parts: List[Tensor] = []
+    unique_keys, inverse = torch.unique(keys, dim=0, return_inverse=True)
+    if x_mask.dim() == 1:
+        unique_x = unique_keys[:, 0]
+        unique_z = unique_keys[:, 1]
+    else:
+        n_words = int(x_mask.shape[1])
+        unique_x = unique_keys[:, :n_words]
+        unique_z = unique_keys[:, n_words:]
 
-    for chunk_idx in range(outer_chunks):
-        start = int(chunk_idx * chunk_size)
-        end = int(min(start + int(chunk_size), n_terms))
-        chunk_len = int(end - start)
+    return unique_x, unique_z, inverse.to(torch.int64)
 
-        h2d_start = _profile_start(device) if profile_stats is not None else 0.0
-        x_chunk = x_mask_in[start:end].to(device)
-        z_chunk = z_mask_in[start:end].to(device)
-        if profile_stats is not None:
-            _profile_end(profile_stats, "h2d_scan_sec", h2d_start, device)
-            profile_stats["h2d_scan_bytes"] = int(profile_stats["h2d_scan_bytes"]) + _tensor_nbytes(x_chunk) + _tensor_nbytes(z_chunk)
 
-        anti_detect_start = _profile_start(device) if profile_stats is not None else 0.0
-        anti_local = _rotation_anti_local_rows(gate=gate, x_mask=x_chunk, z_mask=z_chunk).to(output_device)
-        _profile_end(profile_stats, "anti_detect_sec", anti_detect_start, device)
-        if int(anti_local.numel()) > 0:
-            anti_row_parts.append(anti_local + int(start))
+def _remap_sparse_rows(mat: Tensor, row_inverse: Tensor, new_n_rows: int) -> Tensor:
+    """Remap sparse matrix rows by row_inverse and coalesce duplicates."""
+    if mat._nnz() == 0:
+        return torch.sparse_coo_tensor(
+            torch.zeros((2, 0), dtype=torch.int64, device=mat.device),
+            torch.zeros((0,), dtype=mat.dtype, device=mat.device),
+            size=(int(new_n_rows), int(mat.shape[1])),
+            device=mat.device,
+            dtype=mat.dtype,
+        )
 
-        local_rows = torch.arange(chunk_len, dtype=torch.int64, device=output_device)
-        if min_abs is None:
-            keep_comm = torch.ones((chunk_len,), dtype=torch.bool, device=output_device)
-            if int(anti_local.numel()) > 0:
-                keep_comm[anti_local] = False
-                anti_same_col_parts.append(anti_local + int(start))
-            if bool(keep_comm.any().item()):
-                comm_keep_parts.append(local_rows[keep_comm] + int(start))
-        else:
-            coeff_chunk = coeffs_cache_mem[start:end]
-            keep_comm = coeff_chunk.abs() >= float(min_abs)
-            if int(anti_local.numel()) > 0:
-                keep_comm = keep_comm.clone()
-                keep_comm[anti_local] = False
-                anti_cos_keep = (coeff_chunk.index_select(0, anti_local) * cos_t_mem).abs() >= float(min_abs)
-                if bool(anti_cos_keep.any().item()):
-                    anti_same_col_parts.append(anti_local[anti_cos_keep] + int(start))
-            if bool(keep_comm.any().item()):
-                comm_keep_parts.append(local_rows[keep_comm] + int(start))
+    mat_c = mat.coalesce()
+    idx = mat_c.indices()
+    val = mat_c.values()
 
-    pre_cat_start = _profile_start(None) if profile_stats is not None else 0.0
-    anti_rows = _destructive_cat(anti_row_parts, dim=0) if anti_row_parts else torch.empty((0,), dtype=torch.int64, device=output_device)
-    comm_keep_cols = _destructive_cat(comm_keep_parts, dim=0) if comm_keep_parts else torch.empty((0,), dtype=torch.int64, device=output_device)
-    anti_same_cols = _destructive_cat(anti_same_col_parts, dim=0) if anti_same_col_parts else torch.empty((0,), dtype=torch.int64, device=output_device)
-    same_cols = (
-        _destructive_cat([comm_keep_cols, anti_same_cols], dim=0)
-        if (int(comm_keep_cols.numel()) > 0 and int(anti_same_cols.numel()) > 0)
-        else (comm_keep_cols if int(anti_same_cols.numel()) == 0 else anti_same_cols)
+    row_inverse_dev = row_inverse.to(idx.device)
+    new_row = row_inverse_dev.index_select(0, idx[0])
+    new_idx = torch.stack([new_row, idx[1]], dim=0)
+
+    remapped = torch.sparse_coo_tensor(
+        new_idx,
+        val,
+        size=(int(new_n_rows), int(mat.shape[1])),
+        device=mat.device,
+        dtype=mat.dtype,
     )
-    _profile_end(profile_stats, "pre_cat_sec", pre_cat_start, None)
+    return remapped.coalesce()
 
-    n_comm_same = int(comm_keep_cols.numel())
-    n_anti_same = int(anti_same_cols.numel())
-    n_same_total = int(same_cols.numel())
 
-    same_gather_start = _profile_start(None) if profile_stats is not None else 0.0
-    same_x = x_mask_in.index_select(0, same_cols) if n_same_total > 0 else x_mask_in[:0]
-    same_z = z_mask_in.index_select(0, same_cols) if n_same_total > 0 else z_mask_in[:0]
-    anti_same_x = x_mask_in.index_select(0, anti_same_cols) if n_anti_same > 0 else x_mask_in[:0]
-    anti_same_z = z_mask_in.index_select(0, anti_same_cols) if n_anti_same > 0 else z_mask_in[:0]
-    _profile_end(profile_stats, "same_gather_sec", same_gather_start, None)
+def _merge_rotation_anti_rows_only(
+    full_new_x: Tensor,
+    full_new_z: Tensor,
+    full_step: TensorSparseStep,
+    full_cache: Optional[Tensor],
+) -> Tuple[Tensor, Tensor, TensorSparseStep, Optional[Tensor]]:
+    """Merge only anti-commute-expanded rows for implicit Pauli-rotation steps.
 
-    lookup_prep_start = _profile_start(device if str(device).startswith("cuda") else None) if profile_stats is not None else 0.0
-    anti_base_x = anti_same_x
-    anti_base_z = anti_same_z
-    if str(torch.device(device)) != str(anti_same_x.device):
-        anti_base_x = anti_same_x.to(device, non_blocking=True)
-        anti_base_z = anti_same_z.to(device, non_blocking=True)
-    _profile_end(profile_stats, "lookup_build_sec", lookup_prep_start, device if anti_base_x.device.type == "cuda" else None)
+    This keeps same-branch rows fixed and only deduplicates novel rows against
+    anti-same rows and among novel rows.
+    """
+    if full_step.same_cols is None:
+        return full_new_x, full_new_z, full_step, full_cache
 
-    row_parts: List[Tensor] = []
-    col_parts: List[Tensor] = []
-    val_parts: List[Tensor] = []
-    novel_x_parts: List[Tensor] = []
-    novel_z_parts: List[Tensor] = []
-    novel_cache_parts: List[Tensor] = []
-    collision_cache_rows: List[Tensor] = []
-    collision_cache_vals: List[Tensor] = []
-    next_novel_row = int(n_same_total)
+    anti_pos = full_step.anti_same_pos
+    if anti_pos is None or anti_pos.numel() == 0:
+        return full_new_x, full_new_z, full_step, full_cache
 
-    anti_terms = int(anti_rows.numel())
-    anti_chunks = int(math.ceil(float(max(anti_terms, 1)) / float(chunk_size))) if anti_terms > 0 else 0
-    for chunk_idx in range(anti_chunks):
-        start = int(chunk_idx * chunk_size)
-        end = int(min(start + int(chunk_size), anti_terms))
-        anti_rows_chunk = anti_rows[start:end]
-        h2d_anti_start = _profile_start(device) if profile_stats is not None else 0.0
-        anti_x_chunk = x_mask_in.index_select(0, anti_rows_chunk).to(device)
-        anti_z_chunk = z_mask_in.index_select(0, anti_rows_chunk).to(device)
-        if profile_stats is not None:
-            _profile_end(profile_stats, "h2d_anti_sec", h2d_anti_start, device)
-            profile_stats["h2d_anti_bytes"] = int(profile_stats["h2d_anti_bytes"]) + _tensor_nbytes(anti_x_chunk) + _tensor_nbytes(anti_z_chunk)
+    n_rows = int(full_new_x.shape[0])
+    n_cols = int(full_step.shape[1])
+    n_same = int(full_step.same_cols.numel())
+    if n_rows <= n_same:
+        return full_new_x, full_new_z, full_step, full_cache
 
-        anti_backend_start = _profile_start(device) if profile_stats is not None else 0.0
-        sin_x, sin_z, sin_val = build_pauli_rotation_anti_sin(
-            gate=gate,
-            x_mask=anti_x_chunk,
-            z_mask=anti_z_chunk,
-            t_dtype=t_dtype,
-            device=device,
-        )
-        _profile_end(profile_stats, "anti_backend_sec", anti_backend_start, device)
+    anti_pos_cpu = anti_pos.to(dtype=torch.int64, device="cpu")
+    x_cpu = full_new_x if str(full_new_x.device) == "cpu" else full_new_x.to("cpu")
+    z_cpu = full_new_z if str(full_new_z.device) == "cpu" else full_new_z.to("cpu")
 
-        sin_cols = anti_rows_chunk
-        sin_cache_contrib = None
-        if min_abs is not None:
-            coeff_chunk = coeffs_cache_mem.index_select(0, anti_rows_chunk)
-            sin_cache_contrib = coeff_chunk * sin_t_mem * sin_val.to(dtype=coeff_chunk.dtype, device=output_device)
-            sin_keep = sin_cache_contrib.abs() >= float(min_abs)
-            if not bool(sin_keep.all().item()):
-                keep_idx = torch.nonzero(sin_keep, as_tuple=False).flatten().to(torch.int64)
-                keep_idx_dev = keep_idx.to(sin_x.device)
-                sin_x = sin_x.index_select(0, keep_idx_dev)
-                sin_z = sin_z.index_select(0, keep_idx_dev)
-                sin_val = sin_val.index_select(0, keep_idx_dev)
-                sin_cols = sin_cols.index_select(0, keep_idx)
-                sin_cache_contrib = sin_cache_contrib.index_select(0, keep_idx)
+    key_to_row = {}
+    if x_cpu.dim() == 1:
+        for r in anti_pos_cpu.tolist():
+            key = (int(x_cpu[r].item()), int(z_cpu[r].item()))
+            if key not in key_to_row:
+                key_to_row[key] = int(r)
+    else:
+        for r in anti_pos_cpu.tolist():
+            key = tuple(torch.cat([x_cpu[r], z_cpu[r]], dim=0).tolist())
+            if key not in key_to_row:
+                key_to_row[key] = int(r)
 
-        if int(sin_cols.numel()) == 0:
-            continue
+    row_map_cpu = torch.arange(n_rows, dtype=torch.int64, device="cpu")
+    keep_novel_rows: List[int] = []
+    next_row = int(n_same)
 
-        merge_start = _profile_start(device if anti_base_x.device.type == "cuda" else None) if profile_stats is not None else 0.0
-        merged_anti_x, merged_anti_z, row_local = merge_pauli_query_into_base(
-            base_x=anti_base_x,
-            base_z=anti_base_z,
-            query_x=sin_x,
-            query_z=sin_z,
-        )
-        _profile_end(profile_stats, "lookup_sec", merge_start, device if anti_base_x.device.type == "cuda" else None)
+    if x_cpu.dim() == 1:
+        for old_r in range(n_same, n_rows):
+            key = (int(x_cpu[old_r].item()), int(z_cpu[old_r].item()))
+            target = key_to_row.get(key)
+            if target is None:
+                key_to_row[key] = next_row
+                row_map_cpu[old_r] = next_row
+                keep_novel_rows.append(old_r)
+                next_row += 1
+            else:
+                row_map_cpu[old_r] = int(target)
+    else:
+        for old_r in range(n_same, n_rows):
+            key = tuple(torch.cat([x_cpu[old_r], z_cpu[old_r]], dim=0).tolist())
+            target = key_to_row.get(key)
+            if target is None:
+                key_to_row[key] = next_row
+                row_map_cpu[old_r] = next_row
+                keep_novel_rows.append(old_r)
+                next_row += 1
+            else:
+                row_map_cpu[old_r] = int(target)
 
-        if str(torch.device(output_device)) != str(sin_val.device):
-            d2h_anti_start = _profile_start(device) if profile_stats is not None else 0.0
-            sin_val = sin_val.to(output_device)
-            row_local = row_local.to(output_device)
-            if profile_stats is not None:
-                _profile_end(profile_stats, "d2h_anti_sec", d2h_anti_start, device)
-                profile_stats["d2h_anti_bytes"] = (
-                    int(profile_stats["d2h_anti_bytes"])
-                    + _tensor_nbytes(sin_val)
-                    + _tensor_nbytes(row_local)
-                )
+    new_n_rows = int(next_row)
+    if new_n_rows == n_rows:
+        return full_new_x, full_new_z, full_step, full_cache
 
-        hit_mask = row_local.lt(n_anti_same)
-        if bool(hit_mask.any().item()):
-            hit_rows_global = row_local[hit_mask] + int(n_comm_same)
-            row_parts.append(hit_rows_global)
-            col_parts.append(sin_cols[hit_mask])
-            val_parts.append(sin_val[hit_mask])
-            if sin_cache_contrib is not None:
-                collision_cache_rows.append(hit_rows_global)
-                collision_cache_vals.append(sin_cache_contrib[hit_mask])
+    keep_rows_cpu = torch.cat(
+        [
+            torch.arange(n_same, dtype=torch.int64, device="cpu"),
+            torch.as_tensor(keep_novel_rows, dtype=torch.int64, device="cpu"),
+        ],
+        dim=0,
+    )
+    keep_rows_dev = keep_rows_cpu.to(full_new_x.device)
 
-        miss_mask = ~hit_mask
-        n_novel_local = int(merged_anti_x.shape[0]) - n_anti_same
-        if n_novel_local > 0:
-            novel_rows_global = torch.arange(
-                next_novel_row,
-                next_novel_row + n_novel_local,
-                dtype=torch.int64,
-                device=output_device,
+    merged_x = full_new_x.index_select(0, keep_rows_dev)
+    merged_z = full_new_z.index_select(0, keep_rows_dev)
+
+    def _remap_sparse_rows_by_map(mat: Tensor, row_map: Tensor, out_rows: int, out_cols: int) -> Tensor:
+        if mat._nnz() == 0:
+            return torch.sparse_coo_tensor(
+                torch.zeros((2, 0), dtype=torch.int64, device=mat.device),
+                torch.zeros((0,), dtype=mat.dtype, device=mat.device),
+                size=(int(out_rows), int(out_cols)),
+                device=mat.device,
+                dtype=mat.dtype,
             )
-            next_novel_row += n_novel_local
+        mat_c = mat if mat.is_coalesced() else mat.coalesce()
+        idx = mat_c.indices()
+        val = mat_c.values()
+        row_map_dev = row_map.to(idx.device)
+        new_rows = row_map_dev.index_select(0, idx[0])
+        new_idx = torch.stack([new_rows, idx[1]], dim=0)
+        return torch.sparse_coo_tensor(
+            new_idx,
+            val,
+            size=(int(out_rows), int(out_cols)),
+            device=mat.device,
+            dtype=mat.dtype,
+        ).coalesce()
 
-            if bool(miss_mask.any().item()):
-                local_novel_rows = row_local[miss_mask] - int(n_anti_same)
-                row_parts.append(novel_rows_global.index_select(0, local_novel_rows))
-                col_parts.append(sin_cols[miss_mask])
-                val_parts.append(sin_val[miss_mask])
+    merged_step = TensorSparseStep(
+        mat_const=_remap_sparse_rows_by_map(full_step.mat_const, row_map_cpu, new_n_rows, n_cols),
+        mat_cos=_remap_sparse_rows_by_map(full_step.mat_cos, row_map_cpu, new_n_rows, n_cols),
+        mat_sin=_remap_sparse_rows_by_map(full_step.mat_sin, row_map_cpu, new_n_rows, n_cols),
+        param_idx=full_step.param_idx,
+        emb_idx=full_step.emb_idx,
+        shape=(new_n_rows, n_cols),
+        same_cols=full_step.same_cols,
+        anti_same_pos=full_step.anti_same_pos,
+    )
 
-            novel_x_local = merged_anti_x[n_anti_same:]
-            novel_z_local = merged_anti_z[n_anti_same:]
-            if str(torch.device(output_device)) != str(novel_x_local.device):
-                d2h_anti_start = _profile_start(device) if profile_stats is not None else 0.0
-                novel_x_local = novel_x_local.to(output_device)
-                novel_z_local = novel_z_local.to(output_device)
-                if profile_stats is not None:
-                    _profile_end(profile_stats, "d2h_anti_sec", d2h_anti_start, device)
-                    profile_stats["d2h_anti_bytes"] = (
-                        int(profile_stats["d2h_anti_bytes"])
-                        + _tensor_nbytes(novel_x_local)
-                        + _tensor_nbytes(novel_z_local)
-                    )
-            novel_x_parts.append(novel_x_local)
-            novel_z_parts.append(novel_z_local)
+    merged_cache = full_cache
+    if full_cache is not None:
+        row_map_cache = row_map_cpu.to(full_cache.device)
+        merged_cache = torch.zeros((new_n_rows,), dtype=full_cache.dtype, device=full_cache.device)
+        merged_cache.index_add_(0, row_map_cache, full_cache)
 
-            if sin_cache_contrib is not None:
-                novel_cache_local = torch.zeros(
-                    (n_novel_local,),
-                    dtype=sin_cache_contrib.dtype,
-                    device=output_device,
+    return merged_x, merged_z, merged_step, merged_cache
+
+
+def _validate_sparse_indices_bounds(mat: Tensor, shape: Tuple[int, int], name: str) -> None:
+    """Fail fast if sparse indices are outside declared shape bounds."""
+    if int(mat.shape[0]) != int(shape[0]) or int(mat.shape[1]) != int(shape[1]):
+        raise RuntimeError(
+            f"{name} shape mismatch: tensor shape={tuple(mat.shape)} declared shape={tuple(shape)}"
+        )
+    if mat._nnz() == 0:
+        return
+    mat_c = mat if mat.is_coalesced() else mat.coalesce()
+    idx = mat_c.indices()
+    rows = idx[0]
+    cols = idx[1]
+    max_row = int(rows.max().item())
+    max_col = int(cols.max().item())
+    if max_row >= int(shape[0]) or max_col >= int(shape[1]):
+        raise RuntimeError(
+            f"{name} index out of bounds: max_row={max_row} max_col={max_col} shape={tuple(shape)}"
+        )
+
+
+def _validate_assembled_step(
+    *,
+    full_new_x: Tensor,
+    full_new_z: Tensor,
+    full_step: TensorSparseStep,
+    full_cache: Optional[Tensor],
+    expected_input_cols: int,
+    stage: str,
+) -> None:
+    """Validate chunk/parallel-assembled outputs to avoid silent merge/index corruption."""
+    n_rows = int(full_step.shape[0])
+    n_cols = int(full_step.shape[1])
+
+    if int(full_new_x.shape[0]) != n_rows or int(full_new_z.shape[0]) != n_rows:
+        raise RuntimeError(
+            f"[{stage}] row mismatch: step_rows={n_rows} x_rows={int(full_new_x.shape[0])} z_rows={int(full_new_z.shape[0])}"
+        )
+    if full_new_x.shape != full_new_z.shape:
+        raise RuntimeError(
+            f"[{stage}] x/z shape mismatch: x_shape={tuple(full_new_x.shape)} z_shape={tuple(full_new_z.shape)}"
+        )
+    if n_cols != int(expected_input_cols):
+        raise RuntimeError(
+            f"[{stage}] input-col mismatch: step_cols={n_cols} expected_cols={int(expected_input_cols)}"
+        )
+
+    if full_cache is not None and int(full_cache.shape[0]) != n_rows:
+        raise RuntimeError(
+            f"[{stage}] coeff cache row mismatch: cache_rows={int(full_cache.shape[0])} step_rows={n_rows}"
+        )
+
+    if full_step.same_cols is not None:
+        n_same = int(full_step.same_cols.numel())
+        if n_same > n_rows:
+            raise RuntimeError(f"[{stage}] same_cols size exceeds row count: n_same={n_same} n_rows={n_rows}")
+        if n_same > 0:
+            same_cols = full_step.same_cols
+            max_same_col = int(same_cols.max().item())
+            if max_same_col >= n_cols:
+                raise RuntimeError(
+                    f"[{stage}] same_cols out of bounds: max_col={max_same_col} step_cols={n_cols}"
                 )
-                if bool(miss_mask.any().item()):
-                    local_novel_rows = row_local[miss_mask] - int(n_anti_same)
-                    novel_cache_local.index_add_(0, local_novel_rows, sin_cache_contrib[miss_mask])
-                novel_cache_parts.append(novel_cache_local)
+        anti = full_step.anti_same_pos
+        if anti is not None and anti.numel() > 0:
+            max_anti = int(anti.max().item())
+            if max_anti >= n_same:
+                raise RuntimeError(
+                    f"[{stage}] anti_same_pos out of bounds: max_pos={max_anti} n_same={n_same}"
+                )
 
-    output_cat_start = _profile_start(None) if profile_stats is not None else 0.0
-    full_new_x = (
-        _destructive_cat([same_x, *novel_x_parts], dim=0)
-        if novel_x_parts
-        else same_x
+    declared_shape = (n_rows, n_cols)
+    _validate_sparse_indices_bounds(full_step.mat_const, declared_shape, f"[{stage}] mat_const")
+    _validate_sparse_indices_bounds(full_step.mat_cos, declared_shape, f"[{stage}] mat_cos")
+    _validate_sparse_indices_bounds(full_step.mat_sin, declared_shape, f"[{stage}] mat_sin")
+
+
+def _implicit_step_to_explicit(step: TensorSparseStep) -> TensorSparseStep:
+    """Materialize implicit same-branch representation into explicit const/cos matrices."""
+    if step.same_cols is None:
+        return step
+
+    n_out, n_in = int(step.shape[0]), int(step.shape[1])
+    device = step.mat_sin.device
+    dtype = step.mat_sin.dtype
+
+    same_cols = step.same_cols.to(device)
+    n_same = int(same_cols.numel())
+
+    anti_mask = torch.zeros((n_same,), dtype=torch.bool, device=device)
+    if step.anti_same_pos is not None and step.anti_same_pos.numel() > 0:
+        anti_pos = step.anti_same_pos.to(device)
+        anti_mask[anti_pos] = True
+
+    rows = torch.arange(n_same, dtype=torch.int64, device=device)
+    ones = torch.ones((n_same,), dtype=dtype, device=device)
+
+    const_rows = rows[~anti_mask]
+    const_cols = same_cols[~anti_mask]
+    const_vals = ones[~anti_mask]
+
+    cos_rows = rows[anti_mask]
+    cos_cols = same_cols[anti_mask]
+    cos_vals = ones[anti_mask]
+
+    implicit_const = _make_sparse(const_rows, const_cols, const_vals, (n_out, n_in), device, dtype)
+    implicit_cos = _make_sparse(cos_rows, cos_cols, cos_vals, (n_out, n_in), device, dtype)
+
+    mat_const = (step.mat_const + implicit_const).coalesce() if step.mat_const._nnz() > 0 else implicit_const
+    mat_cos = (step.mat_cos + implicit_cos).coalesce() if step.mat_cos._nnz() > 0 else implicit_cos
+
+    return TensorSparseStep(
+        mat_const=mat_const,
+        mat_cos=mat_cos,
+        mat_sin=step.mat_sin,
+        param_idx=step.param_idx,
+        emb_idx=step.emb_idx,
+        shape=step.shape,
+        same_cols=None,
+        anti_same_pos=None,
     )
-    full_new_z = (
-        _destructive_cat([same_z, *novel_z_parts], dim=0)
-        if novel_z_parts
-        else same_z
-    )
 
-    row_idx = _destructive_cat(row_parts, dim=0) if row_parts else torch.empty((0,), dtype=torch.int64, device=output_device)
-    col_idx = _destructive_cat(col_parts, dim=0) if col_parts else torch.empty((0,), dtype=torch.int64, device=output_device)
-    val = _destructive_cat(val_parts, dim=0) if val_parts else torch.empty((0,), dtype=t_dtype, device=output_device)
 
-    full_shape = (int(full_new_x.shape[0]), n_terms)
-    mat_sin = _make_sparse(row_idx, col_idx, val, full_shape, step_device, t_dtype)
+def _canonicalize_rows_and_remap_step(
+    full_new_x: Tensor,
+    full_new_z: Tensor,
+    full_step: TensorSparseStep,
+    full_cache: Optional[Tensor],
+) -> Tuple[Tensor, Tensor, TensorSparseStep, Optional[Tensor]]:
+    """Merge duplicate Pauli rows and remap sparse step/cache consistently."""
+    unique_x, unique_z, row_inverse = _canonicalize_pauli_rows(full_new_x, full_new_z)
+    n_unique_rows = int(unique_x.shape[0])
+    if n_unique_rows == int(full_new_x.shape[0]):
+        return full_new_x, full_new_z, full_step, full_cache
+
+    if full_step.same_cols is not None:
+        full_step = _implicit_step_to_explicit(full_step)
     full_step = TensorSparseStep(
-        mat_const=_make_empty_sparse(full_shape, step_device, t_dtype),
-        mat_cos=_make_empty_sparse(full_shape, step_device, t_dtype),
-        mat_sin=mat_sin,
-        param_idx=p_idx,
-        emb_idx=e_idx,
-        shape=full_shape,
-        same_cols=same_cols.to(step_device),
-        anti_same_pos=torch.arange(n_comm_same, n_same_total, dtype=torch.int64, device=step_device),
+        mat_const=_remap_sparse_rows(full_step.mat_const, row_inverse, n_unique_rows),
+        mat_cos=_remap_sparse_rows(full_step.mat_cos, row_inverse, n_unique_rows),
+        mat_sin=_remap_sparse_rows(full_step.mat_sin, row_inverse, n_unique_rows),
+        param_idx=full_step.param_idx,
+        emb_idx=full_step.emb_idx,
+        shape=(n_unique_rows, int(full_step.shape[1])),
+        same_cols=None,
+        anti_same_pos=None,
     )
-
-    full_cache = None
-    if min_abs is not None:
-        cache_parts: List[Tensor] = []
-        if n_comm_same > 0:
-            cache_parts.append(coeffs_cache_mem.index_select(0, comm_keep_cols))
-        if n_anti_same > 0:
-            cache_parts.append(coeffs_cache_mem.index_select(0, anti_same_cols) * cos_t_mem)
-        same_cache = (
-            _destructive_cat(cache_parts, dim=0)
-            if cache_parts
-            else torch.empty((0,), dtype=coeffs_cache_mem.dtype, device=output_device)
-        )
-        if collision_cache_rows:
-            same_cache.index_add_(
-                0,
-                _destructive_cat(collision_cache_rows, dim=0),
-                _destructive_cat(collision_cache_vals, dim=0),
-            )
-        full_cache = (
-            _destructive_cat([same_cache, *novel_cache_parts], dim=0)
-            if novel_cache_parts
-            else same_cache
-        )
-    _profile_end(profile_stats, "output_cat_sec", output_cat_start, None)
-
-    truncate_start = _profile_start(None) if profile_stats is not None else 0.0
-    row_mask = _truncate_terms_mask(
-        full_new_x,
-        full_new_z,
-        max_weight=max_weight,
-        weight_x=weight_x,
-        weight_y=weight_y,
-        weight_z=weight_z,
-    )
-    if not bool(row_mask.all().item()):
-        out_idx = torch.nonzero(row_mask, as_tuple=False).flatten().to(torch.int64)
-        full_new_x = full_new_x.index_select(0, out_idx)
-        full_new_z = full_new_z.index_select(0, out_idx)
-        full_step = _filter_step_rows_cols(
-            full_step,
-            row_mask,
-            torch.ones((n_terms,), dtype=torch.bool, device=output_device),
-        )
-        if full_cache is not None:
-            full_cache = full_cache.index_select(0, out_idx)
-    _profile_end(profile_stats, "truncate_sec", truncate_start, None)
-
-    if profile_stats is not None:
-        _profile_end(profile_stats, "total_sec", total_start, device)
-        profile_stats["anti_terms"] = int(anti_terms)
-        profile_stats["same_terms"] = int(n_same_total)
-        profile_stats["novel_terms"] = int(full_new_x.shape[0]) - int(n_same_total)
-        print(
-            "[PPS Profile] "
-            f"gate={profile_stats['gate']} "
-            f"terms={profile_stats['n_terms']:,} "
-            f"anti={profile_stats['anti_terms']:,} "
-            f"same={profile_stats['same_terms']:,} "
-            f"novel={profile_stats['novel_terms']:,} "
-            f"chunks={profile_stats['outer_chunks']}"
-        )
-        print(
-            "[PPS Profile] "
-            f"h2d_scan={profile_stats['h2d_scan_sec']:.3f}s({_format_gib(int(profile_stats['h2d_scan_bytes']))}) "
-            f"anti_detect={profile_stats['anti_detect_sec']:.3f}s "
-            f"pre_cat={profile_stats['pre_cat_sec']:.3f}s "
-            f"same_gather={profile_stats['same_gather_sec']:.3f}s "
-            f"lookup_build={profile_stats['lookup_build_sec']:.3f}s"
-        )
-        print(
-            "[PPS Profile] "
-            f"h2d_anti={profile_stats['h2d_anti_sec']:.3f}s({_format_gib(int(profile_stats['h2d_anti_bytes']))}) "
-            f"anti_backend={profile_stats['anti_backend_sec']:.3f}s "
-            f"d2h_anti={profile_stats['d2h_anti_sec']:.3f}s({_format_gib(int(profile_stats['d2h_anti_bytes']))}) "
-            f"lookup={profile_stats['lookup_sec']:.3f}s "
-            f"output_cat={profile_stats['output_cat_sec']:.3f}s "
-            f"truncate={profile_stats['truncate_sec']:.3f}s "
-            f"total={profile_stats['total_sec']:.3f}s"
-        )
-
-    return full_new_x, full_new_z, full_step, full_cache
+    if full_cache is not None:
+        cache_dev = full_cache.device
+        row_inverse_dev = row_inverse.to(cache_dev)
+        merged_cache = torch.zeros((n_unique_rows,), dtype=full_cache.dtype, device=cache_dev)
+        merged_cache.index_add_(0, row_inverse_dev, full_cache)
+        full_cache = merged_cache
+    return unique_x, unique_z, full_step, full_cache
 
 
 def _process_step_chunked(
@@ -1066,17 +813,6 @@ def _process_step_chunked(
     then assembles the result back on CPU (or step_device).
     """
     n_terms = x_mask_in.shape[0]
-
-    if getattr(builder_fn, "__name__", "") == "build_pauli_rotation_step":
-        return _process_pauli_rotation_step_chunked_anti_only(
-            x_mask_in,
-            z_mask_in,
-            chunk_size,
-            device,
-            step_device,
-            output_device,
-            **kwargs,
-        )
     
     # Fast path: if small enough, run directly
     if n_terms <= chunk_size:
@@ -1107,13 +843,13 @@ def _process_step_chunked(
     same_cols_parts = []
     anti_same_pos_parts = []
     implicit_sin_parts = []
-    same_row_offsets = []
     last_step: Optional[TensorSparseStep] = None
     implicit_mode: Optional[bool] = None
     
     row_offset = 0
     col_offset = 0
     same_row_offset = 0
+    novel_row_offset = 0
     
     n_chunks = math.ceil(n_terms / chunk_size)
     
@@ -1139,14 +875,14 @@ def _process_step_chunked(
         if anti_pos is not None and anti_pos.numel() > 0:
             anti_pos_list.append(anti_pos.to("cpu") + int(r_off))
 
-    def _append_sparse_local(mat, indices_list, values_list, c_off, n_same_local, chunk_idx):
+    def _append_sparse_local(mat, indices_list, values_list, c_off, n_same_local, same_off, novel_off):
         if mat._nnz() == 0:
             return
         if not mat.is_coalesced():
             mat = mat.coalesce()
         idx = mat.indices().to("cpu")
         val = mat.values().to("cpu")
-        indices_list.append((idx, val, int(c_off), int(n_same_local), int(chunk_idx)))
+        indices_list.append((idx, val, int(c_off), int(n_same_local), int(same_off), int(novel_off)))
 
     for i in range(n_chunks):
         start = i * chunk_size
@@ -1176,7 +912,6 @@ def _process_step_chunked(
 
         if step_is_implicit:
             n_same_local = int(step.same_cols.numel())
-            same_row_offsets.append(int(same_row_offset))
             same_x_parts.append(nx_cpu[:n_same_local])
             same_z_parts.append(nz_cpu[:n_same_local])
             novel_x_parts.append(nx_cpu[n_same_local:])
@@ -1201,10 +936,12 @@ def _process_step_chunked(
                 sin_values,
                 col_offset,
                 n_same_local,
-                i,
+                same_row_offset,
+                novel_row_offset,
             )
             _append_implicit_same(step, same_cols_parts, anti_same_pos_parts, same_row_offset, col_offset)
             same_row_offset += n_same_local
+            novel_row_offset += int(nx.shape[0]) - n_same_local
         else:
             _append_sparse(step.mat_const, const_indices, const_values, row_offset, col_offset)
             _append_sparse(step.mat_cos, cos_indices, cos_values, row_offset, col_offset)
@@ -1214,77 +951,14 @@ def _process_step_chunked(
 
     # 4. Assemble Final Tensors
     if bool(implicit_mode):
-        full_same_x = _destructive_cat(same_x_parts, dim=0)
-        full_same_z = _destructive_cat(same_z_parts, dim=0)
-        sorted_same_keys, sorted_same_rows = _build_same_lookup(full_same_x, full_same_z)
-        total_same = int(full_same_x.shape[0])
-        global_novel_x_parts = []
-        global_novel_z_parts = []
-        global_novel_cache_parts = []
-        collision_cache_rows = []
-        collision_cache_vals = []
-        remapped_sin_indices = []
-        remapped_sin_values = []
-        next_novel_row = int(total_same)
-
-        for idx, val, c_off, n_same_local, chunk_idx in implicit_sin_parts:
-            local_idx = idx.clone()
-            local_rows = local_idx[0]
-            global_rows = torch.empty_like(local_rows)
-            same_mask_local = local_rows < int(n_same_local)
-            if bool(same_mask_local.any().item()):
-                global_rows[same_mask_local] = local_rows[same_mask_local] + int(same_row_offsets[chunk_idx])
-
-            if bool((~same_mask_local).any().item()):
-                local_novel_x = novel_x_parts[chunk_idx]
-                local_novel_z = novel_z_parts[chunk_idx]
-                novel_lookup_rows = _lookup_same_rows(sorted_same_keys, sorted_same_rows, local_novel_x, local_novel_z)
-                miss_mask_np = novel_lookup_rows < 0
-                local_novel_global = novel_lookup_rows.copy()
-
-                if bool(np.any(miss_mask_np)):
-                    miss_mask = torch.as_tensor(miss_mask_np, dtype=torch.bool, device=local_novel_x.device)
-                    miss_count = int(np.count_nonzero(miss_mask_np))
-                    local_novel_global[miss_mask_np] = np.arange(next_novel_row, next_novel_row + miss_count, dtype=np.int64)
-                    next_novel_row += miss_count
-                    global_novel_x_parts.append(local_novel_x[miss_mask])
-                    global_novel_z_parts.append(local_novel_z[miss_mask])
-                    if novel_cache_parts:
-                        global_novel_cache_parts.append(novel_cache_parts[chunk_idx][miss_mask])
-
-                if novel_cache_parts:
-                    hit_mask_np = ~miss_mask_np
-                    if bool(np.any(hit_mask_np)):
-                        hit_mask = torch.as_tensor(hit_mask_np, dtype=torch.bool, device=local_novel_x.device)
-                        collision_cache_rows.append(
-                            torch.as_tensor(novel_lookup_rows[hit_mask_np], dtype=torch.int64, device=local_novel_x.device)
-                        )
-                        collision_cache_vals.append(novel_cache_parts[chunk_idx][hit_mask])
-
-                novel_row_lookup = torch.as_tensor(local_novel_global, dtype=torch.int64, device=local_rows.device)
-                novel_pos = (local_rows[~same_mask_local] - int(n_same_local)).to(torch.int64)
-                global_rows[~same_mask_local] = novel_row_lookup.index_select(0, novel_pos)
-
-            local_idx[0] = global_rows
-            local_idx[1] += int(c_off)
-            remapped_sin_indices.append(local_idx)
-            remapped_sin_values.append(val)
-
-        x_parts = [full_same_x, *global_novel_x_parts]
-        z_parts = [full_same_z, *global_novel_z_parts]
+        x_parts = [*same_x_parts, *novel_x_parts]
+        z_parts = [*same_z_parts, *novel_z_parts]
         full_new_x = _destructive_cat(x_parts, dim=0)
         full_new_z = _destructive_cat(z_parts, dim=0)
-
         full_cache = None
-        if same_cache_parts or global_novel_cache_parts:
-            full_cache = _destructive_cat([*same_cache_parts, *global_novel_cache_parts], dim=0)
-            if collision_cache_rows:
-                full_cache.index_add_(
-                    0,
-                    _destructive_cat(collision_cache_rows, dim=0),
-                    _destructive_cat(collision_cache_vals, dim=0),
-                )
-
+        if same_cache_parts or novel_cache_parts:
+            cache_merge = [*same_cache_parts, *novel_cache_parts]
+            full_cache = _destructive_cat(cache_merge, dim=0)
         same_x_parts = same_z_parts = novel_x_parts = novel_z_parts = None
         same_cache_parts = novel_cache_parts = None
     else:
@@ -1308,7 +982,7 @@ def _process_step_chunked(
         
         return torch.sparse_coo_tensor(all_indices, all_values, size=shape, device=step_device)
 
-    full_shape = (int(full_new_x.shape[0]), col_offset) if bool(implicit_mode) else (row_offset, col_offset)
+    full_shape = (same_row_offset + novel_row_offset, col_offset) if bool(implicit_mode) else (row_offset, col_offset)
 
     mat_const = _concat_sparse(const_indices, const_values, full_shape)
     const_indices, const_values = None, None
@@ -1317,6 +991,22 @@ def _process_step_chunked(
     cos_indices, cos_values = None, None
 
     if bool(implicit_mode):
+        remapped_sin_indices = []
+        remapped_sin_values = []
+        total_same = int(same_row_offset)
+        for idx, val, c_off, n_same_local, same_off, novel_off in implicit_sin_parts:
+            local_idx = idx.clone()
+            local_rows = local_idx[0]
+            same_mask_local = local_rows < int(n_same_local)
+            if bool(same_mask_local.any().item()):
+                local_idx[0][same_mask_local] = local_rows[same_mask_local] + int(same_off)
+            if bool((~same_mask_local).any().item()):
+                local_idx[0][~same_mask_local] = (
+                    (local_rows[~same_mask_local] - int(n_same_local)) + total_same + int(novel_off)
+                )
+            local_idx[1] += int(c_off)
+            remapped_sin_indices.append(local_idx)
+            remapped_sin_values.append(val)
         mat_sin = _concat_sparse(remapped_sin_indices, remapped_sin_values, full_shape)
         implicit_sin_parts = None
     else:
@@ -1338,6 +1028,35 @@ def _process_step_chunked(
         shape=full_shape,
         same_cols=full_same_cols,
         anti_same_pos=full_anti_same_pos,
+    )
+
+    if getattr(builder_fn, "__name__", "") == "build_pauli_rotation_step" and full_step.same_cols is not None:
+        full_new_x, full_new_z, full_step, full_cache = _merge_rotation_anti_rows_only(
+            full_new_x,
+            full_new_z,
+            full_step,
+            full_cache,
+        )
+
+    gate = kwargs.get("gate", None)
+    gate_name = gate.__class__.__name__ if gate is not None else ""
+
+    # Deduplicate expanding-gate rows at chunk boundaries and keep step/cache remapping consistent.
+    if gate_name != "CliffordGate":
+        full_new_x, full_new_z, full_step, full_cache = _canonicalize_rows_and_remap_step(
+            full_new_x,
+            full_new_z,
+            full_step,
+            full_cache,
+        )
+
+    _validate_assembled_step(
+        full_new_x=full_new_x,
+        full_new_z=full_new_z,
+        full_step=full_step,
+        full_cache=full_cache,
+        expected_input_cols=n_terms,
+        stage="chunked",
     )
     
     return full_new_x, full_new_z, full_step, full_cache
@@ -1473,6 +1192,25 @@ def _process_step_parallel(
         shape=full_shape,
     )
 
+    gate = kwargs.get("gate", None)
+    gate_name = gate.__class__.__name__ if gate is not None else ""
+    if gate_name != "CliffordGate":
+        full_new_x, full_new_z, full_step, full_cache = _canonicalize_rows_and_remap_step(
+            full_new_x,
+            full_new_z,
+            full_step,
+            full_cache,
+        )
+
+    _validate_assembled_step(
+        full_new_x=full_new_x,
+        full_new_z=full_new_z,
+        full_step=full_step,
+        full_cache=full_cache,
+        expected_input_cols=n_terms,
+        stage="parallel",
+    )
+
     return full_new_x, full_new_z, full_step, full_cache
 
 
@@ -1561,7 +1299,6 @@ def propagate_surrogate_tensor(
 
     use_parallel = bool(parallel_compile) and len(selected_device_ids) > 1 and str(compute_device).startswith("cuda")
     parallel_started_logged = False
-    consecutive_soft_candidates = 0
 
     if use_parallel:
         devices = [f"cuda:{i}" for i in selected_device_ids]
@@ -1570,33 +1307,13 @@ def propagate_surrogate_tensor(
         manual_parallel_threshold = int(parallel_threshold) if int(parallel_threshold) > 0 else None
 
         def process_step_fn(builder_fn, x_mask, z_mask, chunk_size_local, **kwargs):
-            nonlocal parallel_started_logged, consecutive_soft_candidates
+            nonlocal parallel_started_logged
             n_terms_local = int(x_mask.shape[0])
 
-            if manual_parallel_threshold is not None:
-                use_parallel_this_step = n_terms_local >= manual_parallel_threshold
-                effective_parallel_threshold = manual_parallel_threshold
-            else:
-                current_alloc_gb = _current_vram_allocated_gb(primary_device)
-                hard_candidate = (
-                    current_alloc_gb >= _PARALLEL_HARD_VRAM_GB
-                    and n_terms_local >= _PARALLEL_MIN_TERMS_HARD
-                )
-                soft_candidate = (
-                    current_alloc_gb >= _PARALLEL_SOFT_VRAM_GB
-                    and n_terms_local >= _PARALLEL_MIN_TERMS_SOFT
-                )
-
-                if soft_candidate:
-                    consecutive_soft_candidates += 1
-                else:
-                    consecutive_soft_candidates = 0
-
-                use_parallel_this_step = bool(
-                    hard_candidate
-                    or (consecutive_soft_candidates >= _PARALLEL_CONSEC_STEPS_SOFT)
-                )
-                effective_parallel_threshold = _PARALLEL_MIN_TERMS_HARD
+            # Simplified trigger: terms >= max(2 * chunk_size, T_min)
+            t_min = manual_parallel_threshold if manual_parallel_threshold is not None else _PARALLEL_MIN_TERMS_HARD
+            effective_parallel_threshold = max(2 * int(chunk_size_local), int(t_min))
+            use_parallel_this_step = n_terms_local >= effective_parallel_threshold
 
             if use_parallel_this_step:
                 if not parallel_started_logged:
@@ -1834,9 +1551,14 @@ def zero_filter_tensor_backprop_with_keep_mask(
     row_mask = out_mask
     pbar = tqdm(reversed(range(len(steps))), total=len(steps), desc="zero-filter", dynamic_ncols=True)
 
-    # heuristic: small sparse workload is faster on CPU
-    cpu_nnz_threshold = 2_000_000
-    used_cols_chunk_size = 5_000_000
+    # used-cols accumulation is fixed to CPU for stability.
+    used_cols_mode = _zero_filter_used_cols_mode()
+    compact_device = _zero_filter_compact_device(compute_device)
+
+    if used_cols_mode != "auto":
+        print(f"[ZeroFilter] used-cols mode override: {used_cols_mode}")
+    if compact_device != str(compute_device):
+        print(f"[ZeroFilter] compaction device override: {compact_device}")
 
     for loop_idx, i in enumerate(pbar):
         old_step = steps[i]
@@ -1851,55 +1573,20 @@ def zero_filter_tensor_backprop_with_keep_mask(
         nnz_cos = int(mat_cos._nnz())
         nnz_sin = int(mat_sin._nnz())
         nnz_total = nnz_const + nnz_cos + nnz_sin
+        same_nnz = int(old_step.same_nnz())
 
-        same_nnz = old_step.same_nnz()
         if int(row_mask.sum().item()) == 0:
             col_mask = torch.zeros((n_cols,), dtype=torch.bool, device=row_mask.device)
         elif nnz_total == 0 and same_nnz == 0:
             col_mask = torch.zeros((n_cols,), dtype=torch.bool, device=row_mask.device)
         else:
-            use_gpu = (
-                ("cuda" in str(compute_device))
-                and torch.cuda.is_available()
-                and (nnz_total > cpu_nnz_threshold)
-            )
-            if use_gpu:
-                try:
-                    row_mask_d = row_mask.to(compute_device, non_blocking=True)
-                    col_mask_d = torch.zeros((n_cols,), dtype=torch.bool, device=compute_device)
-
-                    if same_nnz > 0:
-                        _accumulate_used_cols_same_chunked(
-                            old_step.same_cols,
-                            row_mask_d,
-                            col_mask_d,
-                            used_cols_chunk_size,
-                        )
-                    if nnz_const > 0:
-                        _accumulate_used_cols_chunked(mat_const, row_mask_d, col_mask_d, used_cols_chunk_size)
-                    if nnz_cos > 0:
-                        _accumulate_used_cols_chunked(mat_cos, row_mask_d, col_mask_d, used_cols_chunk_size)
-                    if nnz_sin > 0:
-                        _accumulate_used_cols_chunked(mat_sin, row_mask_d, col_mask_d, used_cols_chunk_size)
-
-                    col_mask = col_mask_d.to(row_mask.device, non_blocking=True)
-                except RuntimeError as e:
-                    print(f"Warning: GPU used-cols failed, fallback to CPU. Error: {e}")
-                    col_mask = _implicit_same_used_cols(old_step, row_mask, n_cols)
-                    if int(mat_const._nnz()) > 0:
-                        col_mask |= _sparse_used_cols(mat_const, row_mask, n_cols)
-                    if nnz_cos > 0:
-                        col_mask |= _sparse_used_cols(mat_cos, row_mask, n_cols)
-                    if nnz_sin > 0:
-                        col_mask |= _sparse_used_cols(mat_sin, row_mask, n_cols)
-            else:
-                col_mask = _implicit_same_used_cols(old_step, row_mask, n_cols)
-                if int(mat_const._nnz()) > 0:
-                    col_mask |= _sparse_used_cols(mat_const, row_mask, n_cols)
-                if nnz_cos > 0:
-                    col_mask |= _sparse_used_cols(mat_cos, row_mask, n_cols)
-                if nnz_sin > 0:
-                    col_mask |= _sparse_used_cols(mat_sin, row_mask, n_cols)
+            col_mask = _implicit_same_used_cols(old_step, row_mask, n_cols)
+            if int(mat_const._nnz()) > 0:
+                col_mask |= _sparse_used_cols(mat_const, row_mask, n_cols)
+            if nnz_cos > 0:
+                col_mask |= _sparse_used_cols(mat_cos, row_mask, n_cols)
+            if nnz_sin > 0:
+                col_mask |= _sparse_used_cols(mat_sin, row_mask, n_cols)
 
         if (loop_idx % 8 == 0) or (i == 0):
             pbar.set_postfix_str(
@@ -1922,7 +1609,7 @@ def zero_filter_tensor_backprop_with_keep_mask(
             step_for_compact,
             keep_row_mask=row_mask,
             keep_col_mask=col_mask,
-            device=compute_device,
+            device=compact_device,
             chunk_size=chunk_size,
         )
         del old_step, step_for_compact

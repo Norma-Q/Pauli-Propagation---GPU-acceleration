@@ -516,6 +516,33 @@ def _require_cudaq() -> Any:
     return cudaq
 
 
+def _cudaq_target_name(cudaq: Any) -> str:
+    target = cudaq.get_target()
+    target_name_attr = getattr(target, "name", None)
+    return str(target_name_attr or target)
+
+
+def _require_cudaq_gpu_target() -> Tuple[Any, str]:
+    cudaq = _require_cudaq()
+    active_target = _cudaq_target_name(cudaq)
+    if not active_target.startswith("nvidia"):
+        try:
+            cudaq.set_target("nvidia")
+        except Exception as exc:
+            raise RuntimeError(
+                "CUDA-Q exact branch is configured to require the NVIDIA GPU target, "
+                "but cudaq.set_target('nvidia') failed. "
+                "Check CUDA_VISIBLE_DEVICES, CUDA driver visibility, and CUDA-Q GPU support."
+            ) from exc
+        active_target = _cudaq_target_name(cudaq)
+
+    if not active_target.startswith("nvidia"):
+        raise RuntimeError(
+            f"CUDA-Q exact branch requires an NVIDIA GPU target, but active target is {active_target!r}."
+        )
+    return cudaq, active_target
+
+
 def central_difference_gradient(
     *,
     theta: np.ndarray,
@@ -540,7 +567,7 @@ def build_cudaq_exact_backend(
     edges: Sequence[Tuple[int, int]],
     p_layers: int,
 ) -> Dict[str, Any]:
-    cudaq = _require_cudaq()
+    cudaq, active_target = _require_cudaq_gpu_target()
     kernel, params = cudaq.make_kernel(list[float])
     q = kernel.qalloc(int(n_qubits))
 
@@ -583,6 +610,7 @@ def build_cudaq_exact_backend(
 
     return {
         "backend": "cudaq.observe",
+        "target": str(active_target),
         "kernel": kernel,
         "hamiltonian": hamiltonian,
         "evaluate_single": _evaluate_single,
@@ -602,7 +630,7 @@ def train_with_exact_optimizer_cudaq(
     stage_name: str,
     log_every: int,
 ) -> Tuple[List[Dict[str, Any]], np.ndarray, List[Dict[str, Any]], Dict[str, Any]]:
-    cudaq = _require_cudaq()
+    cudaq, active_target = _require_cudaq_gpu_target()
     exact_backend = build_cudaq_exact_backend(
         n_qubits=int(n_qubits),
         edges=edges,
@@ -615,6 +643,7 @@ def train_with_exact_optimizer_cudaq(
     optimizer.initial_parameters = [float(x) for x in np.asarray(start_thetas_np, dtype=np.float64).tolist()]
 
     call_rows: List[Dict[str, Any]] = []
+    live_log_every = max(1, min(int(log_every), 10))
 
     def objective(parameter_vector: Sequence[float]) -> Tuple[float, List[float]]:
         theta_np = np.asarray(parameter_vector, dtype=np.float64).reshape(-1)
@@ -633,9 +662,26 @@ def train_with_exact_optimizer_cudaq(
                 "sum_zz": float(current_sum_zz),
             }
         )
+        call_index = len(call_rows)
+        step_hint = max(0, call_index - 1)
+        if call_index == 1:
+            print(
+                f"[{stage_name}] initial "
+                f"sum<ZZ>={float(current_sum_zz):+.6f} "
+                f"E[cut]={expected_cut_from_sum_zz(float(current_sum_zz), int(n_edges)):.6f}"
+            )
+        elif (step_hint == 1) or (step_hint % int(live_log_every) == 0) or (step_hint >= int(steps)):
+            print(
+                f"[{stage_name}] live step~{step_hint:04d}/{int(steps)} "
+                f"sum<ZZ>={float(current_sum_zz):+.6f} "
+                f"E[cut]={expected_cut_from_sum_zz(float(current_sum_zz), int(n_edges)):.6f}"
+            )
         return current_sum_zz, grad.tolist()
 
-    print(f"[{stage_name}] CUDA-Q exact training for {int(steps)} steps")
+    print(
+        f"[{stage_name}] CUDA-Q exact training for {int(steps)} steps "
+        f"on target={str(exact_backend['target'])}"
+    )
     _, final_thetas_list = optimizer.optimize(2 * int(p_layers), objective)
     final_thetas_np = np.asarray(final_thetas_list, dtype=np.float64)
     final_sum_zz = float(objective_eval(final_thetas_np))
@@ -651,15 +697,17 @@ def train_with_exact_optimizer_cudaq(
                 "thetas": list(row["thetas"]),
             }
         )
-        if (step == 1) or (step % int(log_every) == 0) or (step == int(steps)):
-            print(
-                f"[{stage_name}] step={step:04d} "
-                f"sum<ZZ>={float(row['sum_zz']):+.6f} "
-                f"E[cut]={history[-1]['expected_cut']:.6f}"
-            )
+
+    if history:
+        print(
+            f"[{stage_name}] completed optimizer_steps={len(history):04d}/{int(steps)} "
+            f"sum<ZZ>={float(history[-1]['sum_zz']):+.6f} "
+            f"E[cut]={float(history[-1]['expected_cut']):.6f}"
+        )
 
     runtime = {
         "backend": "cudaq.observe",
+        "target": str(active_target),
         "gradient_method": "central_difference_manual",
         "optimizer": "cudaq.optimizers.Adam",
         "lr": float(lr),

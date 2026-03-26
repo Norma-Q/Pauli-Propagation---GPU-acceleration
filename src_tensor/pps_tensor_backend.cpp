@@ -5,13 +5,6 @@
 #include <pybind11/stl.h>
 #include <algorithm>
 #include <cmath>
-#include <functional>
-#include <stdexcept>
-#include <string>
-#include <tuple>
-#include <unordered_map>
-#include <utility>
-#include <vector>
 
 namespace py = pybind11;
 
@@ -53,281 +46,6 @@ static inline void require_2d_i64(const torch::Tensor& x, const char* name) {
   }
 }
 
-struct PauliKey1D {
-  int64_t x;
-  int64_t z;
-
-  bool operator==(const PauliKey1D& other) const noexcept {
-    return x == other.x && z == other.z;
-  }
-};
-
-struct PauliKey1DHash {
-  std::size_t operator()(const PauliKey1D& key) const noexcept {
-    std::size_t h1 = std::hash<int64_t>{}(key.x);
-    std::size_t h2 = std::hash<int64_t>{}(key.z);
-    return h1 ^ (h2 + 0x9e3779b97f4a7c15ULL + (h1 << 6) + (h1 >> 2));
-  }
-};
-
-struct PauliKeyMW {
-  std::vector<int64_t> words;
-
-  bool operator==(const PauliKeyMW& other) const noexcept {
-    return words == other.words;
-  }
-};
-
-struct PauliKeyMWHash {
-  std::size_t operator()(const PauliKeyMW& key) const noexcept {
-    std::size_t seed = 0;
-    for (int64_t word : key.words) {
-      std::size_t h = std::hash<int64_t>{}(word);
-      seed ^= h + 0x9e3779b97f4a7c15ULL + (seed << 6) + (seed >> 2);
-    }
-    return seed;
-  }
-};
-
-static std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>
-merge_rotation_same_and_sin_1d(const torch::Tensor& same_x,
-                               const torch::Tensor& same_z,
-                               const torch::Tensor& sin_x,
-                               const torch::Tensor& sin_z) {
-  require_1d_i64(same_x, "same_x");
-  require_1d_i64(same_z, "same_z");
-  require_1d_i64(sin_x, "sin_x");
-  require_1d_i64(sin_z, "sin_z");
-
-  auto device = same_x.device();
-  if (same_z.device() != device || sin_x.device() != device || sin_z.device() != device) {
-    throw std::runtime_error("merge_rotation_same_and_sin_1d expects all tensors on the same device");
-  }
-
-  auto opts_dev = torch::TensorOptions().dtype(torch::kInt64).device(device);
-  if (device.is_cuda()) {
-    auto same_keys = torch::stack({same_x, same_z}, 1);
-    auto sin_keys = torch::stack({sin_x, sin_z}, 1);
-    auto all_keys = torch::cat({same_keys, sin_keys}, 0);
-
-    py::module torch_mod = py::module::import("torch");
-    py::tuple uniq_out = torch_mod.attr("unique")(all_keys, py::arg("dim") = 0, py::arg("return_inverse") = true,
-                                                  py::arg("sorted") = false)
-                             .cast<py::tuple>();
-    auto uniq = uniq_out[0].cast<torch::Tensor>();
-    auto inv = uniq_out[1].cast<torch::Tensor>().to(torch::kInt64);
-
-    int64_t n_same = same_x.size(0);
-    auto same_inv = inv.slice(0, 0, n_same);
-    auto sin_inv = inv.slice(0, n_same);
-    auto keyid_to_row = torch::full({uniq.size(0)}, -1, opts_dev);
-    if (n_same > 0) {
-      auto same_rows = torch::arange(n_same, opts_dev);
-      keyid_to_row.index_put_({same_inv}, same_rows);
-    }
-    auto row_sin = keyid_to_row.index_select(0, sin_inv);
-    auto novel_key_mask = row_sin.lt(0);
-    if (!(novel_key_mask.any().item<bool>())) {
-      return {same_x, same_z, row_sin};
-    }
-
-    auto novel_key_ids =
-        torch_mod.attr("unique")(sin_inv.index({novel_key_mask}), py::arg("sorted") = false).cast<torch::Tensor>();
-    auto novel_rows = torch::arange(n_same, n_same + novel_key_ids.numel(), opts_dev);
-    keyid_to_row.index_put_({novel_key_ids}, novel_rows);
-    row_sin = keyid_to_row.index_select(0, sin_inv);
-
-    auto novel_keys = uniq.index_select(0, novel_key_ids);
-    auto new_x = torch::cat({same_x, novel_keys.select(1, 0)}, 0);
-    auto new_z = torch::cat({same_z, novel_keys.select(1, 1)}, 0);
-    return {new_x, new_z, row_sin};
-  }
-
-  auto opts_cpu = torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU);
-  auto same_x_cpu = same_x.contiguous().cpu();
-  auto same_z_cpu = same_z.contiguous().cpu();
-  auto sin_x_cpu = sin_x.contiguous().cpu();
-  auto sin_z_cpu = sin_z.contiguous().cpu();
-
-  const auto* same_x_ptr = same_x_cpu.data_ptr<int64_t>();
-  const auto* same_z_ptr = same_z_cpu.data_ptr<int64_t>();
-  const auto* sin_x_ptr = sin_x_cpu.data_ptr<int64_t>();
-  const auto* sin_z_ptr = sin_z_cpu.data_ptr<int64_t>();
-
-  int64_t n_same = same_x_cpu.size(0);
-  int64_t n_sin = sin_x_cpu.size(0);
-
-  std::unordered_map<PauliKey1D, int64_t, PauliKey1DHash> same_rows;
-  same_rows.reserve(static_cast<std::size_t>(std::max<int64_t>(1, (n_same + n_sin) * 2)));
-  for (int64_t i = 0; i < n_same; ++i) {
-    same_rows.emplace(PauliKey1D{same_x_ptr[i], same_z_ptr[i]}, i);
-  }
-
-  std::vector<int64_t> row_sin;
-  std::vector<int64_t> novel_x_vals;
-  std::vector<int64_t> novel_z_vals;
-  row_sin.reserve(static_cast<std::size_t>(n_sin));
-  novel_x_vals.reserve(static_cast<std::size_t>(n_sin));
-  novel_z_vals.reserve(static_cast<std::size_t>(n_sin));
-
-  int64_t next_row = n_same;
-  for (int64_t i = 0; i < n_sin; ++i) {
-    PauliKey1D key{sin_x_ptr[i], sin_z_ptr[i]};
-    auto insert_out = same_rows.emplace(key, next_row);
-    row_sin.push_back(insert_out.first->second);
-    if (insert_out.second) {
-      novel_x_vals.push_back(key.x);
-      novel_z_vals.push_back(key.z);
-      ++next_row;
-    }
-  }
-
-  auto row_sin_t = row_sin.empty()
-      ? torch::empty({0}, opts_dev)
-      : torch::tensor(row_sin, opts_cpu).to(device);
-
-  if (novel_x_vals.empty()) {
-    return {same_x, same_z, row_sin_t};
-  }
-
-  auto novel_x = torch::tensor(novel_x_vals, opts_cpu).to(device);
-  auto novel_z = torch::tensor(novel_z_vals, opts_cpu).to(device);
-  auto new_x = torch::cat({same_x, novel_x}, 0);
-  auto new_z = torch::cat({same_z, novel_z}, 0);
-  return {new_x, new_z, row_sin_t};
-}
-
-static std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>
-merge_rotation_same_and_sin_mw(const torch::Tensor& same_x,
-                               const torch::Tensor& same_z,
-                               const torch::Tensor& sin_x,
-                               const torch::Tensor& sin_z) {
-  require_2d_i64(same_x, "same_x");
-  require_2d_i64(same_z, "same_z");
-  require_2d_i64(sin_x, "sin_x");
-  require_2d_i64(sin_z, "sin_z");
-
-  auto device = same_x.device();
-  if (same_z.device() != device || sin_x.device() != device || sin_z.device() != device) {
-    throw std::runtime_error("merge_rotation_same_and_sin_mw expects all tensors on the same device");
-  }
-
-  auto opts_dev = torch::TensorOptions().dtype(torch::kInt64).device(device);
-  if (device.is_cuda()) {
-    auto same_keys = torch::cat({same_x, same_z}, 1);
-    auto sin_keys = torch::cat({sin_x, sin_z}, 1);
-    auto all_keys = torch::cat({same_keys, sin_keys}, 0);
-
-    py::module torch_mod = py::module::import("torch");
-    py::tuple uniq_out = torch_mod.attr("unique")(all_keys, py::arg("dim") = 0, py::arg("return_inverse") = true,
-                                                  py::arg("sorted") = false)
-                             .cast<py::tuple>();
-    auto uniq = uniq_out[0].cast<torch::Tensor>();
-    auto inv = uniq_out[1].cast<torch::Tensor>().to(torch::kInt64);
-
-    int64_t n_same = same_x.size(0);
-    int64_t n_words = same_x.size(1);
-    auto same_inv = inv.slice(0, 0, n_same);
-    auto sin_inv = inv.slice(0, n_same);
-    auto keyid_to_row = torch::full({uniq.size(0)}, -1, opts_dev);
-    if (n_same > 0) {
-      auto same_rows = torch::arange(n_same, opts_dev);
-      keyid_to_row.index_put_({same_inv}, same_rows);
-    }
-    auto row_sin = keyid_to_row.index_select(0, sin_inv);
-    auto novel_key_mask = row_sin.lt(0);
-    if (!(novel_key_mask.any().item<bool>())) {
-      return {same_x, same_z, row_sin};
-    }
-
-    auto novel_key_ids =
-        torch_mod.attr("unique")(sin_inv.index({novel_key_mask}), py::arg("sorted") = false).cast<torch::Tensor>();
-    auto novel_rows = torch::arange(n_same, n_same + novel_key_ids.numel(), opts_dev);
-    keyid_to_row.index_put_({novel_key_ids}, novel_rows);
-    row_sin = keyid_to_row.index_select(0, sin_inv);
-
-    auto novel_keys = uniq.index_select(0, novel_key_ids);
-    auto new_x = torch::cat({same_x, novel_keys.slice(1, 0, n_words)}, 0);
-    auto new_z = torch::cat({same_z, novel_keys.slice(1, n_words, 2 * n_words)}, 0);
-    return {new_x, new_z, row_sin};
-  }
-
-  auto opts_cpu = torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU);
-  auto same_x_cpu = same_x.contiguous().cpu();
-  auto same_z_cpu = same_z.contiguous().cpu();
-  auto sin_x_cpu = sin_x.contiguous().cpu();
-  auto sin_z_cpu = sin_z.contiguous().cpu();
-
-  auto same_x_acc = same_x_cpu.accessor<int64_t, 2>();
-  auto same_z_acc = same_z_cpu.accessor<int64_t, 2>();
-  auto sin_x_acc = sin_x_cpu.accessor<int64_t, 2>();
-  auto sin_z_acc = sin_z_cpu.accessor<int64_t, 2>();
-
-  int64_t n_same = same_x_cpu.size(0);
-  int64_t n_sin = sin_x_cpu.size(0);
-  int64_t n_words = same_x_cpu.size(1);
-
-  std::unordered_map<PauliKeyMW, int64_t, PauliKeyMWHash> same_rows;
-  same_rows.reserve(static_cast<std::size_t>(std::max<int64_t>(1, (n_same + n_sin) * 2)));
-  for (int64_t i = 0; i < n_same; ++i) {
-    PauliKeyMW key;
-    key.words.reserve(static_cast<std::size_t>(2 * n_words));
-    for (int64_t w = 0; w < n_words; ++w) {
-      key.words.push_back(same_x_acc[i][w]);
-    }
-    for (int64_t w = 0; w < n_words; ++w) {
-      key.words.push_back(same_z_acc[i][w]);
-    }
-    same_rows.emplace(std::move(key), i);
-  }
-
-  std::vector<int64_t> row_sin;
-  std::vector<int64_t> novel_x_vals;
-  std::vector<int64_t> novel_z_vals;
-  row_sin.reserve(static_cast<std::size_t>(n_sin));
-  novel_x_vals.reserve(static_cast<std::size_t>(n_sin * n_words));
-  novel_z_vals.reserve(static_cast<std::size_t>(n_sin * n_words));
-
-  int64_t next_row = n_same;
-  for (int64_t i = 0; i < n_sin; ++i) {
-    PauliKeyMW key;
-    key.words.reserve(static_cast<std::size_t>(2 * n_words));
-    for (int64_t w = 0; w < n_words; ++w) {
-      key.words.push_back(sin_x_acc[i][w]);
-    }
-    for (int64_t w = 0; w < n_words; ++w) {
-      key.words.push_back(sin_z_acc[i][w]);
-    }
-
-    auto insert_out = same_rows.emplace(key, next_row);
-    row_sin.push_back(insert_out.first->second);
-    if (insert_out.second) {
-      for (int64_t w = 0; w < n_words; ++w) {
-        novel_x_vals.push_back(key.words[static_cast<std::size_t>(w)]);
-      }
-      for (int64_t w = 0; w < n_words; ++w) {
-        novel_z_vals.push_back(key.words[static_cast<std::size_t>(n_words + w)]);
-      }
-      ++next_row;
-    }
-  }
-
-  auto row_sin_t = row_sin.empty()
-      ? torch::empty({0}, opts_dev)
-      : torch::tensor(row_sin, opts_cpu).to(device);
-
-  if (novel_x_vals.empty()) {
-    return {same_x, same_z, row_sin_t};
-  }
-
-  int64_t n_novel = static_cast<int64_t>(novel_x_vals.size()) / n_words;
-  auto novel_x = torch::tensor(novel_x_vals, opts_cpu).view({n_novel, n_words}).to(device);
-  auto novel_z = torch::tensor(novel_z_vals, opts_cpu).view({n_novel, n_words}).to(device);
-  auto new_x = torch::cat({same_x, novel_x}, 0);
-  auto new_z = torch::cat({same_z, novel_z}, 0);
-  return {new_x, new_z, row_sin_t};
-}
-
 static inline std::pair<int64_t, int64_t> word_bit(int64_t q) {
   if (q < 0) {
     throw std::runtime_error("qubit index must be >= 0");
@@ -351,25 +69,8 @@ torch::Tensor popcount_sum_words(const torch::Tensor& x) {
   return c;
 }
 
-bool truncation_is_effective(const torch::Tensor& x_mask, int64_t max_weight, double weight_x, double weight_y,
-                             double weight_z) {
-  if (weight_x < 0.0 || weight_y < 0.0 || weight_z < 0.0) {
-    return true;
-  }
-  double max_axis_weight = std::max({weight_x, weight_y, weight_z});
-  if (max_axis_weight <= 0.0) {
-    return false;
-  }
-  int64_t n_words = x_mask.dim() == 2 ? x_mask.size(1) : 1;
-  double max_possible_weight = static_cast<double>(n_words * kWordBits) * max_axis_weight;
-  return static_cast<double>(max_weight) < max_possible_weight;
-}
-
 torch::Tensor truncate_terms_mask(const torch::Tensor& x_mask, const torch::Tensor& z_mask, int64_t max_weight,
                                   double weight_x, double weight_y, double weight_z) {
-  if (!truncation_is_effective(x_mask, max_weight, weight_x, weight_y, weight_z)) {
-    return torch::ones({x_mask.size(0)}, torch::TensorOptions().dtype(torch::kBool).device(x_mask.device()));
-  }
   auto x_cnt = popcount_sum_words(x_mask & (~z_mask)).to(torch::kFloat64);
   auto y_cnt = popcount_sum_words(x_mask & z_mask).to(torch::kFloat64);
   auto z_cnt = popcount_sum_words((~x_mask) & z_mask).to(torch::kFloat64);
@@ -1163,42 +864,6 @@ build_pauli_rotation_step_mw_cpp(const torch::Tensor& gx_words, const torch::Ten
                          coeffs_cache_out);
 }
 
-static std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>
-build_pauli_rotation_anti_sin_cpp(int64_t gx, int64_t gz, const py::object& coeff_dtype_obj,
-                                  const torch::Tensor& x_mask, const torch::Tensor& z_mask) {
-  require_1d_i64(x_mask, "x_mask");
-  require_1d_i64(z_mask, "z_mask");
-  auto device = x_mask.device();
-  auto coeff_dtype = coerce_scalar_type(coeff_dtype_obj);
-
-  auto gx_t = torch::scalar_tensor(gx, torch::TensorOptions().dtype(torch::kInt64).device(device));
-  auto gz_t = torch::scalar_tensor(gz, torch::TensorOptions().dtype(torch::kInt64).device(device));
-
-  auto sin_x = x_mask ^ gx_t;
-  auto sin_z = z_mask ^ gz_t;
-  auto sin_sign = phase_sign_tensor(x_mask, z_mask, gx_t, gz_t).to(coeff_dtype);
-  return std::make_tuple(sin_x, sin_z, sin_sign);
-}
-
-static std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>
-build_pauli_rotation_anti_sin_mw_cpp(const torch::Tensor& gx_words, const torch::Tensor& gz_words,
-                                     const py::object& coeff_dtype_obj, const torch::Tensor& x_mask,
-                                     const torch::Tensor& z_mask) {
-  require_2d_i64(x_mask, "x_mask");
-  require_2d_i64(z_mask, "z_mask");
-  if (x_mask.sizes() != z_mask.sizes()) {
-    throw std::runtime_error("x_mask/z_mask shape mismatch");
-  }
-  auto coeff_dtype = coerce_scalar_type(coeff_dtype_obj);
-  auto gx_t = gx_words.unsqueeze(0);
-  auto gz_t = gz_words.unsqueeze(0);
-
-  auto sin_x = x_mask ^ gx_t;
-  auto sin_z = z_mask ^ gz_t;
-  auto sin_sign = phase_sign_tensor_mw(x_mask, z_mask, gx_words, gz_words).to(coeff_dtype);
-  return std::make_tuple(sin_x, sin_z, sin_sign);
-}
-
 static std::tuple<torch::Tensor, torch::Tensor,
                   torch::Tensor, torch::Tensor,
                   torch::Tensor, torch::Tensor, torch::Tensor,
@@ -1268,10 +933,43 @@ build_pauli_rotation_step_implicit_cpp(int64_t gx, int64_t gz, int64_t param_idx
   auto same_x = x_mask.index_select(0, same_idx);
   auto same_z = z_mask.index_select(0, same_idx);
   auto n_same = same_idx.numel();
-  auto merge_out = merge_rotation_same_and_sin_1d(same_x, same_z, sin_x, sin_z);
-  auto new_x = std::get<0>(merge_out);
-  auto new_z = std::get<1>(merge_out);
-  auto row_sin = std::get<2>(merge_out);
+
+  auto same_keys = torch::stack({same_x, same_z}, 1);
+  auto sin_keys = torch::stack({sin_x, sin_z}, 1);
+  auto all_keys = torch::cat({same_keys, sin_keys}, 0);
+
+  py::module torch_mod = py::module::import("torch");
+  py::tuple uniq_out = torch_mod.attr("unique")(all_keys, py::arg("dim") = 0, py::arg("return_inverse") = true,
+                                                  py::arg("sorted") = false)
+                           .cast<py::tuple>();
+  torch::Tensor uniq = uniq_out[0].cast<torch::Tensor>();
+  torch::Tensor inv = uniq_out[1].cast<torch::Tensor>();
+
+  auto same_inv = inv.slice(0, 0, n_same).to(torch::kInt64);
+  auto sin_inv = inv.slice(0, n_same).to(torch::kInt64);
+  auto n_uniq = uniq.size(0);
+
+  auto keyid_to_same = torch::full({n_uniq}, -1, torch::TensorOptions().dtype(torch::kInt64).device(device));
+  if (n_same > 0) {
+    keyid_to_same.index_put_({same_inv}, torch::arange(n_same, torch::TensorOptions().dtype(torch::kInt64).device(device)));
+  }
+
+  auto row_sin = keyid_to_same.index_select(0, sin_inv);
+  auto novel_mask = row_sin.lt(0);
+  torch::Tensor novel_key_ids = torch::zeros({0}, torch::TensorOptions().dtype(torch::kInt64).device(device));
+  if (sin_inv.numel() > 0 && novel_mask.any().item<bool>()) {
+    py::tuple novel_out = torch_mod.attr("unique")(sin_inv.index({novel_mask}), py::arg("sorted") = false,
+                                                    py::arg("return_inverse") = true)
+                             .cast<py::tuple>();
+    novel_key_ids = novel_out[0].cast<torch::Tensor>().to(torch::kInt64);
+    auto novel_inv = novel_out[1].cast<torch::Tensor>().to(torch::kInt64);
+    auto novel_rows = novel_inv + static_cast<int64_t>(n_same);
+    row_sin.index_put_({novel_mask}, novel_rows);
+  }
+
+  auto novel_keys = novel_key_ids.numel() > 0 ? uniq.index_select(0, novel_key_ids) : uniq.slice(0, 0, 0);
+  auto new_x = torch::cat({same_x, novel_keys.select(1, 0)}, 0);
+  auto new_z = torch::cat({same_z, novel_keys.select(1, 1)}, 0);
   auto anti_same_pos = torch::arange(n_same - cos_idx.numel(), n_same,
                                      torch::TensorOptions().dtype(torch::kInt64).device(device));
   auto val_sin = sin_sign.to(coeff_dtype);
@@ -1397,10 +1095,39 @@ build_pauli_rotation_step_implicit_mw_cpp(const torch::Tensor& gx_words, const t
   auto same_x = x_mask.index_select(0, same_idx);
   auto same_z = z_mask.index_select(0, same_idx);
   auto n_same = same_idx.numel();
-  auto merge_out = merge_rotation_same_and_sin_mw(same_x, same_z, sin_x, sin_z);
-  auto new_x = std::get<0>(merge_out);
-  auto new_z = std::get<1>(merge_out);
-  auto row_sin = std::get<2>(merge_out);
+  auto same_keys = torch::cat({same_x, same_z}, 1);
+  auto sin_keys = torch::cat({sin_x, sin_z}, 1);
+  auto all_keys = torch::cat({same_keys, sin_keys}, 0);
+
+  py::module torch_mod = py::module::import("torch");
+  py::tuple uniq_out = torch_mod.attr("unique")(all_keys, py::arg("dim") = 0, py::arg("return_inverse") = true,
+                                                  py::arg("sorted") = false)
+                           .cast<py::tuple>();
+  torch::Tensor uniq = uniq_out[0].cast<torch::Tensor>();
+  torch::Tensor inv = uniq_out[1].cast<torch::Tensor>();
+  auto same_inv = inv.slice(0, 0, n_same).to(torch::kInt64);
+  auto sin_inv = inv.slice(0, n_same).to(torch::kInt64);
+  auto n_uniq = uniq.size(0);
+  auto keyid_to_same = torch::full({n_uniq}, -1, torch::TensorOptions().dtype(torch::kInt64).device(device));
+  if (n_same > 0) {
+    keyid_to_same.index_put_({same_inv}, torch::arange(n_same, torch::TensorOptions().dtype(torch::kInt64).device(device)));
+  }
+  auto row_sin = keyid_to_same.index_select(0, sin_inv);
+  auto novel_mask = row_sin.lt(0);
+  torch::Tensor novel_key_ids = torch::zeros({0}, torch::TensorOptions().dtype(torch::kInt64).device(device));
+  if (sin_inv.numel() > 0 && novel_mask.any().item<bool>()) {
+    py::tuple novel_out = torch_mod.attr("unique")(sin_inv.index({novel_mask}), py::arg("sorted") = false,
+                                                    py::arg("return_inverse") = true)
+                             .cast<py::tuple>();
+    novel_key_ids = novel_out[0].cast<torch::Tensor>().to(torch::kInt64);
+    auto novel_inv = novel_out[1].cast<torch::Tensor>().to(torch::kInt64);
+    auto novel_rows = novel_inv + static_cast<int64_t>(n_same);
+    row_sin.index_put_({novel_mask}, novel_rows);
+  }
+  auto n_words = x_mask.size(1);
+  auto novel_keys = novel_key_ids.numel() > 0 ? uniq.index_select(0, novel_key_ids) : uniq.slice(0, 0, 0);
+  auto new_x = torch::cat({same_x, novel_keys.slice(1, 0, n_words)}, 0);
+  auto new_z = torch::cat({same_z, novel_keys.slice(1, n_words, 2 * n_words)}, 0);
   auto anti_same_pos = torch::arange(n_same - cos_idx.numel(), n_same,
                                      torch::TensorOptions().dtype(torch::kInt64).device(device));
   auto val_sin = sin_sign.to(coeff_dtype);
@@ -1882,23 +1609,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       py::arg("thetas_t") = py::none(), py::arg("max_weight"), py::arg("weight_x"), py::arg("weight_y"),
       py::arg("weight_z"));
 
-  m.def("build_pauli_rotation_anti_sin_cpp", &build_pauli_rotation_anti_sin_cpp,
-        py::arg("gx"), py::arg("gz"), py::arg("coeff_dtype"), py::arg("x_mask"), py::arg("z_mask"));
-
-  m.def("merge_pauli_query_into_base_cpp", &merge_rotation_same_and_sin_1d,
-        py::arg("base_x"), py::arg("base_z"), py::arg("query_x"), py::arg("query_z"));
-
   m.def("build_pauli_rotation_step_implicit_mw_cpp", &build_pauli_rotation_step_implicit_mw_cpp,
         py::arg("gx_words"), py::arg("gz_words"), py::arg("param_idx"), py::arg("x_mask"), py::arg("z_mask"),
         py::arg("coeff_dtype"), py::arg("min_abs") = py::none(), py::arg("coeffs_cache") = py::none(),
       py::arg("thetas_t") = py::none(), py::arg("max_weight"), py::arg("weight_x"), py::arg("weight_y"),
       py::arg("weight_z"));
-
-  m.def("build_pauli_rotation_anti_sin_mw_cpp", &build_pauli_rotation_anti_sin_mw_cpp,
-        py::arg("gx_words"), py::arg("gz_words"), py::arg("coeff_dtype"), py::arg("x_mask"), py::arg("z_mask"));
-
-  m.def("merge_pauli_query_into_base_mw_cpp", &merge_rotation_same_and_sin_mw,
-        py::arg("base_x"), py::arg("base_z"), py::arg("query_x"), py::arg("query_z"));
 
     m.def("build_depolarizing_step_cpp", &build_depolarizing_step_cpp,
       py::arg("qubit"), py::arg("px"), py::arg("py"), py::arg("pz"), py::arg("x_mask"), py::arg("z_mask"),
