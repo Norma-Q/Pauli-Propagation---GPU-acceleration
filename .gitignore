@@ -1,0 +1,59 @@
+.gitignore
+.venv/
+.env/
+
+# Python bytecode / caches
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.pytype/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Packaging / build outputs
+build/
+dist/
+*.egg-info/
+.eggs/
+.vscode
+.build
+src_tensor/pps_tensor_backend.cpp
+src_tensor/_pps_tensor_backend_candidate.so
+src_tensor/_pps_tensor_backend_local.so.bak
+##### files to be ignored for specific projects #####
+cudaq_sampling/
+test_qaoa/results/
+
+overleaf/
+
+QAOA/
+
+batch.ipynb
+embedding.ipynb
+QGAN_adaptability.ipynb
+benchmark_chunking.ipynb
+benchmark_cpu_vs_gpu_storage.ipynb
+
+batch_implementation_from_embedding.md
+embedding_implementation_from_scratch.md
+NPU_PPS_validation_demo.ipynb
+max_weight_truncation_analysis/
+
+single_layer_qaoa_maxcut/
+multi_layer_qaoa_maxcut/
+multi_layer_qaoa_maxcut_initialization/
+initialization_comparison.ipynb
+mw_training_coeff_finetuning_results/
+paper_figures/
+
+generating_configfiles.py
+generating_shfiles.py
+lightning_gpu_vs_cudaq_benchmark.ipynb
+QAOA_1layer_Analysis/
+
+# 캐시 삭제하고 싶으면 git rm -r --cached <file> 명령어 사용
