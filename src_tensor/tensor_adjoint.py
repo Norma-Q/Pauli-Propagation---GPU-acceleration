@@ -109,6 +109,7 @@ def propagate_union_basis_psum(
     parallel_compile: bool = False,
     parallel_threshold: int = -1,
     parallel_devices: Optional[Sequence[int]] = None,
+    profile: Optional[Dict[str, Any]] = None,
 ) -> Tuple[TensorPauliSum, UnionBasis]:
     """Build a TensorPauliSum using the ordered union of observable terms.
 
@@ -134,6 +135,7 @@ def propagate_union_basis_psum(
         parallel_compile=parallel_compile,
         parallel_threshold=parallel_threshold,
         parallel_devices=parallel_devices,
+        profile=profile,
     )
     return psum, basis
 

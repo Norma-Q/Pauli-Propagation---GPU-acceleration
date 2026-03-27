@@ -10,9 +10,10 @@ then walks steps backwards to remove any input columns that cannot reach them.
 
 from __future__ import annotations
 
-from typing import Any, List, Optional, Sequence, TYPE_CHECKING, Tuple, cast
+from typing import Any, Dict, List, Optional, Sequence, TYPE_CHECKING, Tuple, cast
 import math
 import os
+import time
 import torch.multiprocessing as mp
 
 torch: Any
@@ -67,6 +68,34 @@ def _zero_filter_compact_device(compute_device: str) -> str:
     return str(compute_device)
 
 
+def _rotation_anti_merge_mode() -> str:
+    # Default to "off": global canonicalize remains the authoritative dedup step,
+    # and the extra anti-merge pass can dominate runtime on modest chunk counts.
+    #
+    # Keep env overrides for experiments / safety valves:
+    # - off: skip the extra anti-merge pass and go straight to canonicalize.
+    # - lookup_only: useful when chunk count is large and peak CPU RAM around
+    #   canonicalize becomes the practical bottleneck.
+    # - full: legacy/debug mode; usually slower than lookup_only.
+    mode = str(os.environ.get("PPS_ROTATION_ANTI_MERGE_MODE", "off")).strip().lower()
+    if mode in {"full", "lookup_only", "off"}:
+        return mode
+    return "off"
+
+
+def _rotation_anti_merge_profile_enabled() -> bool:
+    value = str(os.environ.get("PPS_ROTATION_ANTI_MERGE_PROFILE", "0")).strip().lower()
+    return value not in {"", "0", "false", "no", "off"}
+
+
+def _rotation_canonicalize_keep_implicit_enabled() -> bool:
+    # Default to keeping implicit rotation structure through canonicalize when
+    # it is provably safe. This reduces unnecessary explicit materialization
+    # after anti-merge is skipped, while the downstream fallback path below
+    # still preserves correctness if the implicit layout cannot be kept.
+    value = str(os.environ.get("PPS_ROTATION_CANONICALIZE_KEEP_IMPLICIT", "1")).strip().lower()
+    return value not in {"", "0", "false", "no", "off"}
+
 def _auto_parallel_threshold_from_device(compute_device: str) -> int:
     if (not torch.cuda.is_available()) or (not str(compute_device).startswith("cuda")):
         return 1_000_000
@@ -112,13 +141,12 @@ def _make_sparse(row_idx, col_idx, values, shape, device, dtype):
     return sp
 
 
-def _parallel_propagate_worker(args: Tuple) -> Tuple[Tensor, Tensor, TensorSparseStep, Optional[Tensor]]:
+def _parallel_propagate_worker(args: Tuple) -> Tuple[Tensor, Tensor, TensorSparseStep, Optional[Tensor], Dict[str, Any]]:
     (
-        rank, devices, builder_fn, x_mask_chunk, z_mask_chunk,
+        device, builder_fn, x_mask_chunk, z_mask_chunk,
         chunk_size, step_device, output_device, kwargs
     ) = args
 
-    device = devices[rank]
     return _process_step_chunked(
         builder_fn,
         x_mask_chunk,
@@ -127,6 +155,7 @@ def _parallel_propagate_worker(args: Tuple) -> Tuple[Tensor, Tensor, TensorSpars
         device,
         step_device,
         output_device,
+        defer_postprocess=True,
         **kwargs,
     )
 
@@ -487,6 +516,53 @@ def _canonicalize_pauli_rows(x_mask: Tensor, z_mask: Tensor) -> Tuple[Tensor, Te
     return unique_x, unique_z, inverse.to(torch.int64)
 
 
+def _canonicalize_pauli_rows_stable(x_mask: Tensor, z_mask: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
+    """Canonicalize rows while preserving first-occurrence order."""
+    n_rows = int(x_mask.shape[0])
+    if n_rows == 0:
+        return x_mask, z_mask, torch.zeros((0,), dtype=torch.int64, device=x_mask.device)
+
+    if x_mask.dim() != z_mask.dim():
+        raise RuntimeError("x_mask/z_mask dim mismatch during stable row canonicalization")
+
+    if x_mask.dim() == 1:
+        keys = torch.stack([x_mask, z_mask], dim=1)
+    else:
+        keys = torch.cat([x_mask, z_mask], dim=1)
+
+    unique_keys_sorted, inverse_sorted = torch.unique(keys, dim=0, return_inverse=True)
+    n_unique = int(unique_keys_sorted.shape[0])
+    if n_unique == n_rows:
+        return x_mask, z_mask, torch.arange(n_rows, dtype=torch.int64, device=x_mask.device)
+
+    perm = torch.argsort(inverse_sorted, stable=True)
+    inverse_perm = inverse_sorted.index_select(0, perm)
+    is_first = torch.ones((int(perm.numel()),), dtype=torch.bool, device=perm.device)
+    if int(perm.numel()) > 1:
+        is_first[1:] = inverse_perm[1:] != inverse_perm[:-1]
+
+    first_pos_by_sorted_id = perm[is_first]
+    sorted_id_by_first = inverse_perm[is_first]
+    stable_order = torch.argsort(first_pos_by_sorted_id, stable=True)
+    kept_rows = first_pos_by_sorted_id.index_select(0, stable_order)
+    sorted_id_stable = sorted_id_by_first.index_select(0, stable_order)
+
+    sorted_to_stable = torch.empty((n_unique,), dtype=torch.int64, device=inverse_sorted.device)
+    sorted_to_stable[sorted_id_stable] = torch.arange(n_unique, dtype=torch.int64, device=inverse_sorted.device)
+    row_inverse = sorted_to_stable.index_select(0, inverse_sorted)
+
+    unique_keys = keys.index_select(0, kept_rows.to(keys.device))
+    if x_mask.dim() == 1:
+        unique_x = unique_keys[:, 0]
+        unique_z = unique_keys[:, 1]
+    else:
+        n_words = int(x_mask.shape[1])
+        unique_x = unique_keys[:, :n_words]
+        unique_z = unique_keys[:, n_words:]
+
+    return unique_x, unique_z, row_inverse
+
+
 def _remap_sparse_rows(mat: Tensor, row_inverse: Tensor, new_n_rows: int) -> Tensor:
     """Remap sparse matrix rows by row_inverse and coalesce duplicates."""
     if mat._nnz() == 0:
@@ -521,11 +597,12 @@ def _merge_rotation_anti_rows_only(
     full_new_z: Tensor,
     full_step: TensorSparseStep,
     full_cache: Optional[Tensor],
+    profile_entry: Optional[Dict[str, Any]] = None,
 ) -> Tuple[Tensor, Tensor, TensorSparseStep, Optional[Tensor]]:
     """Merge only anti-commute-expanded rows for implicit Pauli-rotation steps.
 
     This keeps same-branch rows fixed and only deduplicates novel rows against
-    anti-same rows and among novel rows.
+    anti-same rows. Legacy full dedup remains available via env toggle.
     """
     if full_step.same_cols is None:
         return full_new_x, full_new_z, full_step, full_cache
@@ -539,6 +616,24 @@ def _merge_rotation_anti_rows_only(
     n_same = int(full_step.same_cols.numel())
     if n_rows <= n_same:
         return full_new_x, full_new_z, full_step, full_cache
+
+    merge_mode = _rotation_anti_merge_mode()
+    if merge_mode == "off":
+        if profile_entry is not None:
+            anti_rows = int(anti_pos.numel())
+            profile_entry["anti_merge_mode"] = "off"
+            profile_entry["anti_merge_anti_same_rows"] = anti_rows
+            profile_entry["anti_merge_novel_rows"] = int(n_rows - n_same)
+            profile_entry["anti_merge_hits"] = 0
+            profile_entry["anti_merge_kept_novel"] = int(n_rows - n_same)
+            profile_entry["anti_merge_s"] = 0.0
+            profile_entry["anti_merge_remap_s"] = 0.0
+            profile_entry["anti_merge_changed"] = False
+        return full_new_x, full_new_z, full_step, full_cache
+
+    profile_enabled = _rotation_anti_merge_profile_enabled()
+    collect_stats = profile_enabled or (profile_entry is not None)
+    merge_t0 = time.perf_counter() if collect_stats else 0.0
 
     anti_pos_cpu = anti_pos.to(dtype=torch.int64, device="cpu")
     x_cpu = full_new_x if str(full_new_x.device) == "cpu" else full_new_x.to("cpu")
@@ -559,32 +654,55 @@ def _merge_rotation_anti_rows_only(
     row_map_cpu = torch.arange(n_rows, dtype=torch.int64, device="cpu")
     keep_novel_rows: List[int] = []
     next_row = int(n_same)
+    merge_hits = 0
+    anti_same_rows = int(anti_pos_cpu.numel())
+    novel_rows = int(n_rows - n_same)
 
     if x_cpu.dim() == 1:
         for old_r in range(n_same, n_rows):
             key = (int(x_cpu[old_r].item()), int(z_cpu[old_r].item()))
             target = key_to_row.get(key)
             if target is None:
-                key_to_row[key] = next_row
                 row_map_cpu[old_r] = next_row
                 keep_novel_rows.append(old_r)
+                if merge_mode == "full":
+                    key_to_row[key] = next_row
                 next_row += 1
             else:
                 row_map_cpu[old_r] = int(target)
+                merge_hits += 1
     else:
         for old_r in range(n_same, n_rows):
             key = tuple(torch.cat([x_cpu[old_r], z_cpu[old_r]], dim=0).tolist())
             target = key_to_row.get(key)
             if target is None:
-                key_to_row[key] = next_row
                 row_map_cpu[old_r] = next_row
                 keep_novel_rows.append(old_r)
+                if merge_mode == "full":
+                    key_to_row[key] = next_row
                 next_row += 1
             else:
                 row_map_cpu[old_r] = int(target)
+                merge_hits += 1
 
     new_n_rows = int(next_row)
+    merge_time_s = (time.perf_counter() - merge_t0) if collect_stats else 0.0
+    if profile_entry is not None:
+        profile_entry["anti_merge_mode"] = merge_mode
+        profile_entry["anti_merge_anti_same_rows"] = anti_same_rows
+        profile_entry["anti_merge_novel_rows"] = novel_rows
+        profile_entry["anti_merge_hits"] = int(merge_hits)
+        profile_entry["anti_merge_kept_novel"] = int(len(keep_novel_rows))
+        profile_entry["anti_merge_s"] = float(merge_time_s)
+        profile_entry["anti_merge_changed"] = bool(new_n_rows != n_rows)
     if new_n_rows == n_rows:
+        if profile_enabled:
+            print(
+                "[PPS AntiMerge] "
+                f"mode={merge_mode} anti_same_rows={anti_same_rows} novel_rows={novel_rows} "
+                f"merge_hits={merge_hits} kept_novel={len(keep_novel_rows)} "
+                f"merge_time_s={merge_time_s:.6f} remap_time_s=0.000000 changed=0"
+            )
         return full_new_x, full_new_z, full_step, full_cache
 
     keep_rows_cpu = torch.cat(
@@ -595,6 +713,7 @@ def _merge_rotation_anti_rows_only(
         dim=0,
     )
     keep_rows_dev = keep_rows_cpu.to(full_new_x.device)
+    remap_t0 = time.perf_counter() if collect_stats else 0.0
 
     merged_x = full_new_x.index_select(0, keep_rows_dev)
     merged_z = full_new_z.index_select(0, keep_rows_dev)
@@ -638,6 +757,17 @@ def _merge_rotation_anti_rows_only(
         row_map_cache = row_map_cpu.to(full_cache.device)
         merged_cache = torch.zeros((new_n_rows,), dtype=full_cache.dtype, device=full_cache.device)
         merged_cache.index_add_(0, row_map_cache, full_cache)
+
+    remap_time_s = (time.perf_counter() - remap_t0) if collect_stats else 0.0
+    if profile_entry is not None:
+        profile_entry["anti_merge_remap_s"] = float(remap_time_s)
+    if profile_enabled:
+        print(
+            "[PPS AntiMerge] "
+            f"mode={merge_mode} anti_same_rows={anti_same_rows} novel_rows={novel_rows} "
+            f"merge_hits={merge_hits} kept_novel={len(keep_novel_rows)} "
+            f"merge_time_s={merge_time_s:.6f} remap_time_s={remap_time_s:.6f} changed=1"
+        )
 
     return merged_x, merged_z, merged_step, merged_cache
 
@@ -769,11 +899,67 @@ def _canonicalize_rows_and_remap_step(
     full_new_z: Tensor,
     full_step: TensorSparseStep,
     full_cache: Optional[Tensor],
+    profile_entry: Optional[Dict[str, Any]] = None,
 ) -> Tuple[Tensor, Tensor, TensorSparseStep, Optional[Tensor]]:
     """Merge duplicate Pauli rows and remap sparse step/cache consistently."""
+    t0 = time.perf_counter() if profile_entry is not None else 0.0
+    rows_before = int(full_new_x.shape[0])
+
+    if full_step.same_cols is not None and _rotation_canonicalize_keep_implicit_enabled():
+        n_same = int(full_step.same_cols.numel())
+        unique_x, unique_z, row_inverse = _canonicalize_pauli_rows_stable(full_new_x, full_new_z)
+        n_unique_rows = int(unique_x.shape[0])
+        if profile_entry is not None:
+            profile_entry["canonicalize_rows_before"] = rows_before
+            profile_entry["canonicalize_rows_after"] = n_unique_rows
+            profile_entry["canonicalize_changed"] = bool(n_unique_rows != rows_before)
+            profile_entry["canonicalize_keep_implicit"] = True
+
+        if n_unique_rows == rows_before:
+            if profile_entry is not None:
+                profile_entry["canonicalize_s"] = time.perf_counter() - t0
+                profile_entry["canonicalize_implicit_preserved"] = True
+            return full_new_x, full_new_z, full_step, full_cache
+
+        expected_same = torch.arange(n_same, dtype=torch.int64, device=row_inverse.device)
+        same_identity_ok = bool(torch.equal(row_inverse[:n_same], expected_same))
+        if same_identity_ok:
+            remapped_step = TensorSparseStep(
+                mat_const=_remap_sparse_rows(full_step.mat_const, row_inverse, n_unique_rows),
+                mat_cos=_remap_sparse_rows(full_step.mat_cos, row_inverse, n_unique_rows),
+                mat_sin=_remap_sparse_rows(full_step.mat_sin, row_inverse, n_unique_rows),
+                param_idx=full_step.param_idx,
+                emb_idx=full_step.emb_idx,
+                shape=(n_unique_rows, int(full_step.shape[1])),
+                same_cols=full_step.same_cols,
+                anti_same_pos=full_step.anti_same_pos,
+            )
+            if full_cache is not None:
+                cache_dev = full_cache.device
+                row_inverse_dev = row_inverse.to(cache_dev)
+                merged_cache = torch.zeros((n_unique_rows,), dtype=full_cache.dtype, device=cache_dev)
+                merged_cache.index_add_(0, row_inverse_dev, full_cache)
+                full_cache = merged_cache
+            if profile_entry is not None:
+                profile_entry["canonicalize_s"] = time.perf_counter() - t0
+                profile_entry["canonicalize_implicit_preserved"] = True
+            return unique_x, unique_z, remapped_step, full_cache
+
+        if profile_entry is not None:
+            profile_entry["canonicalize_implicit_preserved"] = False
+            profile_entry["canonicalize_keep_implicit_fallback"] = True
+
     unique_x, unique_z, row_inverse = _canonicalize_pauli_rows(full_new_x, full_new_z)
     n_unique_rows = int(unique_x.shape[0])
+    if profile_entry is not None:
+        profile_entry["canonicalize_rows_before"] = rows_before
+        profile_entry["canonicalize_rows_after"] = n_unique_rows
+        profile_entry["canonicalize_changed"] = bool(n_unique_rows != rows_before)
+        profile_entry.setdefault("canonicalize_keep_implicit", False)
+        profile_entry.setdefault("canonicalize_implicit_preserved", False)
     if n_unique_rows == int(full_new_x.shape[0]):
+        if profile_entry is not None:
+            profile_entry["canonicalize_s"] = time.perf_counter() - t0
         return full_new_x, full_new_z, full_step, full_cache
 
     if full_step.same_cols is not None:
@@ -794,6 +980,8 @@ def _canonicalize_rows_and_remap_step(
         merged_cache = torch.zeros((n_unique_rows,), dtype=full_cache.dtype, device=cache_dev)
         merged_cache.index_add_(0, row_inverse_dev, full_cache)
         full_cache = merged_cache
+    if profile_entry is not None:
+        profile_entry["canonicalize_s"] = time.perf_counter() - t0
     return unique_x, unique_z, full_step, full_cache
 
 
@@ -805,15 +993,23 @@ def _process_step_chunked(
     device: str,
     step_device: str,
     output_device: str = "cpu",
+    defer_postprocess: bool = False,
     **kwargs
-) -> Tuple[Tensor, Tensor, TensorSparseStep, Optional[Tensor]]:
+) -> Tuple[Tensor, Tensor, TensorSparseStep, Optional[Tensor], Dict[str, Any]]:
     """
     Process a propagation step in chunks to avoid GPU OOM.
     Keeps the main masks on CPU, moves chunks to GPU for processing,
     then assembles the result back on CPU (or step_device).
     """
     n_terms = x_mask_in.shape[0]
-    
+    profile_entry: Dict[str, Any] = {
+        "assembly_mode": "direct" if n_terms <= chunk_size else "chunked",
+        "n_chunks": 1 if n_terms <= chunk_size else int(math.ceil(n_terms / chunk_size)),
+        "canonicalize_s": 0.0,
+        "anti_merge_s": 0.0,
+        "anti_merge_remap_s": 0.0,
+    }
+
     # Fast path: if small enough, run directly
     if n_terms <= chunk_size:
         x_gpu = x_mask_in.to(device)
@@ -823,7 +1019,8 @@ def _process_step_chunked(
             kwargs['coeffs_cache'] = kwargs['coeffs_cache'].to(device)
             
         new_x, new_z, step, cache = builder_fn(x_mask=x_gpu, z_mask=z_gpu, device=device, step_device=step_device, **kwargs)
-        return new_x.to(output_device), new_z.to(output_device), step, (cache.to(output_device) if cache is not None else None)
+        profile_entry["output_terms"] = int(new_x.shape[0])
+        return new_x.to(output_device), new_z.to(output_device), step, (cache.to(output_device) if cache is not None else None), profile_entry
 
     # Chunked processing
     new_x_parts = []
@@ -852,6 +1049,13 @@ def _process_step_chunked(
     novel_row_offset = 0
     
     n_chunks = math.ceil(n_terms / chunk_size)
+    shared_thetas_t = None
+    if "thetas_t" in kwargs and kwargs["thetas_t"] is not None:
+        theta_obj = kwargs["thetas_t"]
+        if torch is not None and isinstance(theta_obj, torch.Tensor):
+            shared_thetas_t = theta_obj.to(device)
+        else:
+            shared_thetas_t = theta_obj
     
     # Helper to offset and append sparse parts
     def _append_sparse(mat, indices_list, values_list, r_off, c_off):
@@ -883,7 +1087,6 @@ def _process_step_chunked(
         idx = mat.indices().to("cpu")
         val = mat.values().to("cpu")
         indices_list.append((idx, val, int(c_off), int(n_same_local), int(same_off), int(novel_off)))
-
     for i in range(n_chunks):
         start = i * chunk_size
         end = min(start + chunk_size, n_terms)
@@ -893,6 +1096,8 @@ def _process_step_chunked(
         z_chunk = z_mask_in[start:end].to(device)
         
         chunk_kwargs = kwargs.copy()
+        if shared_thetas_t is not None:
+            chunk_kwargs["thetas_t"] = shared_thetas_t
         if 'coeffs_cache' in chunk_kwargs and chunk_kwargs['coeffs_cache'] is not None:
             chunk_kwargs['coeffs_cache'] = chunk_kwargs['coeffs_cache'][start:end].to(device)
             
@@ -1030,25 +1235,30 @@ def _process_step_chunked(
         anti_same_pos=full_anti_same_pos,
     )
 
-    if getattr(builder_fn, "__name__", "") == "build_pauli_rotation_step" and full_step.same_cols is not None:
+    if (not defer_postprocess) and getattr(builder_fn, "__name__", "") == "build_pauli_rotation_step" and full_step.same_cols is not None:
         full_new_x, full_new_z, full_step, full_cache = _merge_rotation_anti_rows_only(
             full_new_x,
             full_new_z,
             full_step,
             full_cache,
+            profile_entry=profile_entry,
         )
 
     gate = kwargs.get("gate", None)
     gate_name = gate.__class__.__name__ if gate is not None else ""
 
     # Deduplicate expanding-gate rows at chunk boundaries and keep step/cache remapping consistent.
-    if gate_name != "CliffordGate":
+    if (not defer_postprocess) and gate_name != "CliffordGate":
         full_new_x, full_new_z, full_step, full_cache = _canonicalize_rows_and_remap_step(
             full_new_x,
             full_new_z,
             full_step,
             full_cache,
+            profile_entry=profile_entry,
         )
+
+    if defer_postprocess and profile_entry is not None:
+        profile_entry["defer_postprocess"] = True
 
     _validate_assembled_step(
         full_new_x=full_new_x,
@@ -1059,7 +1269,8 @@ def _process_step_chunked(
         stage="chunked",
     )
     
-    return full_new_x, full_new_z, full_step, full_cache
+    profile_entry["output_terms"] = int(full_new_x.shape[0])
+    return full_new_x, full_new_z, full_step, full_cache, profile_entry
 
 
 def _process_step_parallel(
@@ -1071,10 +1282,18 @@ def _process_step_parallel(
     step_device: str,
     output_device: str = "cpu",
     parallel_threshold: int = 1_000_000,
+    pools: Optional[List[Any]] = None,
     **kwargs,
-) -> Tuple[Tensor, Tensor, TensorSparseStep, Optional[Tensor]]:
+) -> Tuple[Tensor, Tensor, TensorSparseStep, Optional[Tensor], Dict[str, Any]]:
     n_terms = int(x_mask_in.shape[0])
     n_gpus = len(devices)
+    profile_entry: Dict[str, Any] = {
+        "assembly_mode": "parallel",
+        "n_chunks": int(n_gpus),
+        "canonicalize_s": 0.0,
+        "anti_merge_s": 0.0,
+        "anti_merge_remap_s": 0.0,
+    }
 
     if n_terms < int(parallel_threshold) or n_gpus < 2:
 
@@ -1089,22 +1308,35 @@ def _process_step_parallel(
             **kwargs,
         )
 
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
+    chunk_bounds: List[Tuple[int, int]] = []
+    base_chunk = n_terms // n_gpus
+    remainder = n_terms % n_gpus
+    start = 0
+    for i in range(n_gpus):
+        end = start + base_chunk + (1 if i < remainder else 0)
+        chunk_bounds.append((start, end))
+        start = end
 
-    input_indices_chunks = torch.chunk(torch.arange(n_terms), n_gpus)
+    shared_thetas_t = kwargs.get("thetas_t", None)
+    if torch is not None and isinstance(shared_thetas_t, torch.Tensor) and shared_thetas_t.device.type != "cpu":
+        # Send a CPU copy through multiprocessing, then let each worker move it
+        # once to its assigned GPU. Passing a cuda:0 tensor directly can cause
+        # mixed-device backend calls on non-primary workers.
+        shared_thetas_t = shared_thetas_t.cpu()
     worker_args = []
     for i in range(n_gpus):
+        start, end = chunk_bounds[i]
         worker_kwargs = kwargs.copy()
+        if shared_thetas_t is not None:
+            worker_kwargs["thetas_t"] = shared_thetas_t
         if "coeffs_cache" in kwargs and kwargs["coeffs_cache"] is not None:
-            worker_kwargs["coeffs_cache"] = kwargs["coeffs_cache"][input_indices_chunks[i]]
+            worker_kwargs["coeffs_cache"] = kwargs["coeffs_cache"][start:end]
         worker_args.append(
             (
-                i,
-                devices,
+                devices[i],
                 builder_fn,
-                x_mask_in[input_indices_chunks[i]],
-                z_mask_in[input_indices_chunks[i]],
+                x_mask_in[start:end],
+                z_mask_in[start:end],
                 chunk_size,
                 step_device,
                 output_device,
@@ -1112,37 +1344,152 @@ def _process_step_parallel(
             )
         )
 
-    ctx = mp.get_context("spawn")
-    with ctx.Pool(processes=n_gpus) as pool:
-        results = pool.map(_parallel_propagate_worker, worker_args)
+    if pools is None:
+        ctx = mp.get_context("spawn")
+        local_pools = [ctx.Pool(processes=1) for _ in range(n_gpus)]
+        try:
+            async_results = [
+                local_pools[i].apply_async(_parallel_propagate_worker, (worker_args[i],))
+                for i in range(n_gpus)
+            ]
+            results = [res.get() for res in async_results]
+        finally:
+            for local_pool in local_pools:
+                local_pool.close()
+            for local_pool in local_pools:
+                local_pool.join()
+    else:
+        async_results = [
+            pools[i].apply_async(_parallel_propagate_worker, (worker_args[i],))
+            for i in range(n_gpus)
+        ]
+        results = [res.get() for res in async_results]
 
     step_parts = [r[2] for r in results]
-    if any(s.same_cols is not None for s in step_parts):
-        return _process_step_chunked(
-            builder_fn,
-            x_mask_in,
-            z_mask_in,
-            chunk_size,
-            devices[0],
-            step_device,
-            output_device,
-            **kwargs,
-        )
+    if not step_parts:
+        raise RuntimeError("Parallel step assembly produced no worker results.")
 
-    new_x_parts = [r[0] for r in results]
-    new_z_parts = [r[1] for r in results]
-    cache_parts = [r[3] for r in results if r[3] is not None]
-    results = None
+    implicit_flags = [s.same_cols is not None for s in step_parts]
+    implicit_mode = bool(implicit_flags[0])
+    if any(bool(flag) != implicit_mode for flag in implicit_flags[1:]):
+        raise RuntimeError("Parallel step assembly cannot mix implicit and explicit step formats.")
 
-    full_new_x = _destructive_cat(new_x_parts, dim=0)
-    full_new_z = _destructive_cat(new_z_parts, dim=0)
-    full_cache = _destructive_cat(cache_parts, dim=0) if cache_parts else None
+    if implicit_mode:
+        same_x_parts: List[Tensor] = []
+        same_z_parts: List[Tensor] = []
+        novel_x_parts: List[Tensor] = []
+        novel_z_parts: List[Tensor] = []
+        same_cache_parts: List[Tensor] = []
+        novel_cache_parts: List[Tensor] = []
+        same_cols_parts: List[Tensor] = []
+        anti_same_pos_parts: List[Tensor] = []
+        implicit_sin_parts = []
+        same_row_offset = 0
+        novel_row_offset = 0
+        col_offset = 0
+
+        def _append_implicit_same(step, same_cols_list, anti_pos_list, r_off, c_off):
+            if step.same_cols is None or step.same_cols.numel() == 0:
+                return
+            same_cols_list.append(step.same_cols.to("cpu") + int(c_off))
+            anti_pos = step.anti_same_pos
+            if anti_pos is not None and anti_pos.numel() > 0:
+                anti_pos_list.append(anti_pos.to("cpu") + int(r_off))
+
+        def _append_sparse_local(mat, parts_list, c_off, n_same_local, same_off, novel_off):
+            if mat._nnz() == 0:
+                return
+            if not mat.is_coalesced():
+                mat = mat.coalesce()
+            idx = mat.indices().to("cpu")
+            val = mat.values().to("cpu")
+            parts_list.append((idx, val, int(c_off), int(n_same_local), int(same_off), int(novel_off)))
+
+        for nx, nz, step, cache, _worker_profile in results:
+            n_same_local = int(step.same_cols.numel()) if step.same_cols is not None else 0
+            same_x_parts.append(nx[:n_same_local])
+            same_z_parts.append(nz[:n_same_local])
+            novel_x_parts.append(nx[n_same_local:])
+            novel_z_parts.append(nz[n_same_local:])
+            if cache is not None:
+                same_cache_parts.append(cache[:n_same_local])
+                novel_cache_parts.append(cache[n_same_local:])
+            _append_sparse_local(
+                step.mat_sin,
+                implicit_sin_parts,
+                col_offset,
+                n_same_local,
+                same_row_offset,
+                novel_row_offset,
+            )
+            _append_implicit_same(step, same_cols_parts, anti_same_pos_parts, same_row_offset, col_offset)
+            same_row_offset += n_same_local
+            novel_row_offset += int(nx.shape[0]) - n_same_local
+            col_offset += int(step.shape[1])
+
+        full_new_x = _destructive_cat([*same_x_parts, *novel_x_parts], dim=0)
+        full_new_z = _destructive_cat([*same_z_parts, *novel_z_parts], dim=0)
+        full_cache = None
+        if same_cache_parts or novel_cache_parts:
+            full_cache = _destructive_cat([*same_cache_parts, *novel_cache_parts], dim=0)
+    else:
+        new_x_parts = [r[0] for r in results]
+        new_z_parts = [r[1] for r in results]
+        cache_parts = [r[3] for r in results if r[3] is not None]
+        full_new_x = _destructive_cat(new_x_parts, dim=0)
+        full_new_z = _destructive_cat(new_z_parts, dim=0)
+        full_cache = _destructive_cat(cache_parts, dim=0) if cache_parts else None
+
+    gate = kwargs.get("gate", None)
+    gate_name = gate.__class__.__name__ if gate is not None else ""
+    builder_name = getattr(builder_fn, "__name__", "")
+    parallel_canonicalize_done = False
+    row_inverse_fast: Optional[Tensor] = None
+
+    if (
+        implicit_mode
+        and gate_name != "CliffordGate"
+        and builder_name == "build_pauli_rotation_step"
+        and _rotation_anti_merge_mode() == "off"
+        and _rotation_canonicalize_keep_implicit_enabled()
+    ):
+        canonicalize_t0 = time.perf_counter() if profile_entry is not None else 0.0
+        rows_before = int(full_new_x.shape[0])
+        unique_x_fast, unique_z_fast, row_inverse_candidate = _canonicalize_pauli_rows_stable(full_new_x, full_new_z)
+        n_unique_rows_fast = int(unique_x_fast.shape[0])
+        if profile_entry is not None:
+            profile_entry["canonicalize_rows_before"] = rows_before
+            profile_entry["canonicalize_rows_after"] = n_unique_rows_fast
+            profile_entry["canonicalize_changed"] = bool(n_unique_rows_fast != rows_before)
+            profile_entry["canonicalize_keep_implicit"] = True
+        expected_same = torch.arange(int(same_row_offset), dtype=torch.int64, device=row_inverse_candidate.device)
+        same_identity_ok = bool(torch.equal(row_inverse_candidate[: int(same_row_offset)], expected_same))
+        if same_identity_ok:
+            if full_cache is not None and n_unique_rows_fast != rows_before:
+                cache_dev = full_cache.device
+                row_inverse_dev = row_inverse_candidate.to(cache_dev)
+                merged_cache = torch.zeros((n_unique_rows_fast,), dtype=full_cache.dtype, device=cache_dev)
+                merged_cache.index_add_(0, row_inverse_dev, full_cache)
+                full_cache = merged_cache
+            full_new_x = unique_x_fast
+            full_new_z = unique_z_fast
+            row_inverse_fast = row_inverse_candidate
+            parallel_canonicalize_done = True
+            if profile_entry is not None:
+                profile_entry["canonicalize_implicit_preserved"] = True
+                profile_entry["canonicalize_parallel_fastpath"] = True
+                profile_entry["canonicalize_s"] = time.perf_counter() - canonicalize_t0
+        else:
+            if profile_entry is not None:
+                profile_entry["canonicalize_implicit_preserved"] = False
+                profile_entry["canonicalize_keep_implicit_fallback"] = True
+                profile_entry["canonicalize_parallel_fastpath"] = False
 
     const_indices, const_values = [], []
     cos_indices, cos_values = [], []
     sin_indices, sin_values = [], []
     row_offset = 0
-    col_offset = 0
+    explicit_col_offset = 0
 
     def _append_sparse(mat, indices_list, values_list, r_off, c_off):
         if mat._nnz() > 0:
@@ -1156,12 +1503,20 @@ def _process_step_parallel(
             values_list.append(val)
 
     ref_step = step_parts[0]
-    for step in step_parts:
-        _append_sparse(step.mat_const, const_indices, const_values, row_offset, col_offset)
-        _append_sparse(step.mat_cos, cos_indices, cos_values, row_offset, col_offset)
-        _append_sparse(step.mat_sin, sin_indices, sin_values, row_offset, col_offset)
-        row_offset += int(step.shape[0])
-        col_offset += int(step.shape[1])
+    if implicit_mode:
+        for step in step_parts:
+            if step.mat_const._nnz() > 0 or step.mat_cos._nnz() > 0:
+                raise RuntimeError("Implicit parallel step unexpectedly contains explicit const/cos matrices.")
+        n_parallel_rows = int(full_new_x.shape[0]) if parallel_canonicalize_done else int(same_row_offset + novel_row_offset)
+        full_shape = (n_parallel_rows, col_offset)
+    else:
+        for step in step_parts:
+            _append_sparse(step.mat_const, const_indices, const_values, row_offset, explicit_col_offset)
+            _append_sparse(step.mat_cos, cos_indices, cos_values, row_offset, explicit_col_offset)
+            _append_sparse(step.mat_sin, sin_indices, sin_values, row_offset, explicit_col_offset)
+            row_offset += int(step.shape[0])
+            explicit_col_offset += int(step.shape[1])
+        full_shape = (row_offset, explicit_col_offset)
 
     def _concat_sparse(indices_list, values_list, shape, t_dtype):
         if not indices_list:
@@ -1177,11 +1532,35 @@ def _process_step_parallel(
         all_values = _destructive_cat(values_list, dim=0).to(step_device)
         return torch.sparse_coo_tensor(all_indices, all_values, size=shape, device=step_device)
 
-    full_shape = (row_offset, col_offset)
     t_dtype = kwargs["t_dtype"]
     mat_const = _concat_sparse(const_indices, const_values, full_shape, t_dtype)
     mat_cos = _concat_sparse(cos_indices, cos_values, full_shape, t_dtype)
-    mat_sin = _concat_sparse(sin_indices, sin_values, full_shape, t_dtype)
+    if implicit_mode:
+        remapped_sin_indices = []
+        remapped_sin_values = []
+        total_same = int(same_row_offset)
+        for idx, val, c_off, n_same_local, same_off, novel_off in implicit_sin_parts:
+            local_idx = idx.clone()
+            local_rows = local_idx[0]
+            same_mask_local = local_rows < int(n_same_local)
+            if bool(same_mask_local.any().item()):
+                local_idx[0][same_mask_local] = local_rows[same_mask_local] + int(same_off)
+            if bool((~same_mask_local).any().item()):
+                local_idx[0][~same_mask_local] = (
+                    (local_rows[~same_mask_local] - int(n_same_local)) + total_same + int(novel_off)
+                )
+            if row_inverse_fast is not None:
+                local_idx[0] = row_inverse_fast.index_select(0, local_idx[0].to(row_inverse_fast.device)).to(local_idx.device)
+            local_idx[1] += int(c_off)
+            remapped_sin_indices.append(local_idx)
+            remapped_sin_values.append(val)
+        mat_sin = _concat_sparse(remapped_sin_indices, remapped_sin_values, full_shape, t_dtype)
+        full_same_cols = _destructive_cat(same_cols_parts, dim=0).to(step_device) if same_cols_parts else None
+        full_anti_same_pos = _destructive_cat(anti_same_pos_parts, dim=0).to(step_device) if anti_same_pos_parts else None
+    else:
+        mat_sin = _concat_sparse(sin_indices, sin_values, full_shape, t_dtype)
+        full_same_cols = None
+        full_anti_same_pos = None
 
     full_step = TensorSparseStep(
         mat_const=mat_const,
@@ -1190,16 +1569,25 @@ def _process_step_parallel(
         param_idx=ref_step.param_idx,
         emb_idx=ref_step.emb_idx,
         shape=full_shape,
+        same_cols=full_same_cols,
+        anti_same_pos=full_anti_same_pos,
     )
 
-    gate = kwargs.get("gate", None)
-    gate_name = gate.__class__.__name__ if gate is not None else ""
-    if gate_name != "CliffordGate":
+    if builder_name == "build_pauli_rotation_step" and full_step.same_cols is not None:
+        full_new_x, full_new_z, full_step, full_cache = _merge_rotation_anti_rows_only(
+            full_new_x,
+            full_new_z,
+            full_step,
+            full_cache,
+            profile_entry=profile_entry,
+        )
+    if gate_name != "CliffordGate" and not parallel_canonicalize_done:
         full_new_x, full_new_z, full_step, full_cache = _canonicalize_rows_and_remap_step(
             full_new_x,
             full_new_z,
             full_step,
             full_cache,
+            profile_entry=profile_entry,
         )
 
     _validate_assembled_step(
@@ -1211,7 +1599,8 @@ def _process_step_parallel(
         stage="parallel",
     )
 
-    return full_new_x, full_new_z, full_step, full_cache
+    profile_entry["output_terms"] = int(full_new_x.shape[0])
+    return full_new_x, full_new_z, full_step, full_cache, profile_entry
 
 
 def propagate_surrogate_tensor(
@@ -1231,6 +1620,7 @@ def propagate_surrogate_tensor(
     parallel_compile: bool = False,
     parallel_threshold: int = -1,
     parallel_devices: Optional[Sequence[int]] = None,
+    profile: Optional[Dict[str, Any]] = None,
 ) -> TensorPauliSum:
     """Tensor-native propagation to a tensor PauliSum.
 
@@ -1299,15 +1689,17 @@ def propagate_surrogate_tensor(
 
     use_parallel = bool(parallel_compile) and len(selected_device_ids) > 1 and str(compute_device).startswith("cuda")
     parallel_started_logged = False
+    parallel_ctx = None
+    parallel_pools: Optional[List[Any]] = None
 
     if use_parallel:
         devices = [f"cuda:{i}" for i in selected_device_ids]
-        primary_device = str(compute_device) if ":" in str(compute_device) else "cuda:0"
+        parallel_ctx = mp.get_context("spawn")
 
         manual_parallel_threshold = int(parallel_threshold) if int(parallel_threshold) > 0 else None
 
         def process_step_fn(builder_fn, x_mask, z_mask, chunk_size_local, **kwargs):
-            nonlocal parallel_started_logged
+            nonlocal parallel_started_logged, parallel_pools
             n_terms_local = int(x_mask.shape[0])
 
             # Simplified trigger: terms >= max(2 * chunk_size, T_min)
@@ -1322,6 +1714,8 @@ def propagate_surrogate_tensor(
                         f"at terms={n_terms_local:,}."
                     )
                     parallel_started_logged = True
+                if parallel_pools is None:
+                    parallel_pools = [parallel_ctx.Pool(processes=1) for _ in devices]
                 return _process_step_parallel(
                     builder_fn,
                     x_mask,
@@ -1331,6 +1725,7 @@ def propagate_surrogate_tensor(
                     memory_device,
                     memory_device,
                     parallel_threshold=effective_parallel_threshold,
+                    pools=parallel_pools,
                     **kwargs,
                 )
 
@@ -1358,108 +1753,211 @@ def propagate_surrogate_tensor(
             )
 
     total_gates = len(circuit)
-    for gate in tqdm(reversed(circuit), total=total_gates, desc="propagate", dynamic_ncols=True):
-        gate_name = gate.__class__.__name__
+    propagate_stats: Optional[Dict[str, Any]] = None
+    if profile is not None:
+        propagate_stats = cast(Dict[str, Any], profile.setdefault("propagate", {}))
+        propagate_stats.setdefault("steps", [])
+        propagate_stats["total_gates"] = int(total_gates)
+    propagate_t0 = time.perf_counter() if profile is not None else 0.0
 
-        if gate_name == "CliffordGate":
-            new_x, new_z, step, coeffs_cache = process_step_fn(
-                build_clifford_step,
-                x_mask,
-                z_mask,
-                chunk_size,
-                gate=gate,
-                t_dtype=t_dtype,
-                min_abs=min_abs_internal,
-                coeffs_cache=coeffs_cache,
-                max_weight=max_weight,
-                weight_x=weight_x,
-                weight_y=weight_y,
-                weight_z=weight_z,
-            )
-            if min_mat_abs is not None and float(min_mat_abs) > 0.0:
-                step = _prune_step_by_abs(step, float(min_mat_abs))
-            steps.append(step)
-            x_mask, z_mask = new_x, new_z
-            continue
-
-        if gate_name == "PauliRotation":
-            new_x, new_z, step, coeffs_cache = process_step_fn(
-                build_pauli_rotation_step,
-                x_mask,
-                z_mask,
-                chunk_size,
-                gate=gate,
-                t_dtype=t_dtype,
-                min_abs=min_abs_internal,
-                coeffs_cache=coeffs_cache,
-                thetas_t=thetas_t,
-                max_weight=max_weight,
-                weight_x=weight_x,
-                weight_y=weight_y,
-                weight_z=weight_z,
-            )
-            if min_mat_abs is not None and float(min_mat_abs) > 0.0:
-                step = _prune_step_by_abs(step, float(min_mat_abs))
-            steps.append(step)
-            x_mask, z_mask = new_x, new_z
-            continue
-
-        if gate_name == "DepolarizingNoise":
-            new_x, new_z, step, coeffs_cache = process_step_fn(
-                build_depolarizing_step,
-                x_mask,
-                z_mask,
-                chunk_size,
-                gate=gate,
-                t_dtype=t_dtype,
-                min_abs=min_abs_internal,
-                coeffs_cache=coeffs_cache,
-                max_weight=max_weight,
-                weight_x=weight_x,
-                weight_y=weight_y,
-                weight_z=weight_z,
-            )
-            if min_mat_abs is not None and float(min_mat_abs) > 0.0:
-                step = _prune_step_by_abs(step, float(min_mat_abs))
-            steps.append(step)
-            x_mask, z_mask = new_x, new_z
-            continue
-
-        if gate_name == "AmplitudeDampingNoise":
-            new_x, new_z, step, coeffs_cache = process_step_fn(
-                build_amplitude_damping_step,
-                x_mask,
-                z_mask,
-                chunk_size,
-                gate=gate,
-                t_dtype=t_dtype,
-                min_abs=min_abs_internal,
-                coeffs_cache=coeffs_cache,
-                max_weight=max_weight,
-                weight_x=weight_x,
-                weight_y=weight_y,
-                weight_z=weight_z,
-            )
-            if min_mat_abs is not None and float(min_mat_abs) > 0.0:
-                step = _prune_step_by_abs(step, float(min_mat_abs))
-            steps.append(step)
-            x_mask, z_mask = new_x, new_z
-            continue
-
-        raise TypeError(
-            f"Unsupported gate type in propagate_surrogate_tensor: {gate_name}. "
-            "Expected CliffordGate, PauliRotation, DepolarizingNoise, or AmplitudeDampingNoise."
+    def _record_step(
+        *,
+        loop_idx: int,
+        gate_name: str,
+        n_terms_in: int,
+        new_x: Tensor,
+        step: TensorSparseStep,
+        step_profile: Dict[str, Any],
+        process_s: float,
+        prune_s: float,
+    ) -> None:
+        if propagate_stats is None:
+            return
+        cast(List[Dict[str, Any]], propagate_stats["steps"]).append(
+            {
+                **step_profile,
+                "propagate_step_index": int(loop_idx),
+                "circuit_gate_index": int(total_gates - 1 - loop_idx),
+                "gate_name": gate_name,
+                "input_terms": int(n_terms_in),
+                "output_terms": int(new_x.shape[0]),
+                "process_s": float(process_s),
+                "prune_s": float(prune_s),
+                "step_total_s": float(process_s + prune_s),
+                "step_rows": int(step.shape[0]),
+                "step_cols": int(step.shape[1]),
+            }
         )
 
-    psum = TensorPauliSum(
-        n_qubits=n_qubits,
-        x_mask=x_mask,
-        z_mask=z_mask,
-        coeff_init=coeff_init,
-        steps=steps,
-    )
+    try:
+        for loop_idx, gate in enumerate(tqdm(reversed(circuit), total=total_gates, desc="propagate", dynamic_ncols=True)):
+            gate_name = gate.__class__.__name__
+            n_terms_in = int(x_mask.shape[0])
 
-    return psum
+            if gate_name == "CliffordGate":
+                step_t0 = time.perf_counter() if profile is not None else 0.0
+                new_x, new_z, step, coeffs_cache, step_profile = process_step_fn(
+                    build_clifford_step,
+                    x_mask,
+                    z_mask,
+                    chunk_size,
+                    gate=gate,
+                    t_dtype=t_dtype,
+                    min_abs=min_abs_internal,
+                    coeffs_cache=coeffs_cache,
+                    max_weight=max_weight,
+                    weight_x=weight_x,
+                    weight_y=weight_y,
+                    weight_z=weight_z,
+                )
+                process_s = (time.perf_counter() - step_t0) if profile is not None else 0.0
+                prune_t0 = time.perf_counter() if profile is not None else 0.0
+                if min_mat_abs is not None and float(min_mat_abs) > 0.0:
+                    step = _prune_step_by_abs(step, float(min_mat_abs))
+                prune_s = (time.perf_counter() - prune_t0) if profile is not None else 0.0
+                steps.append(step)
+                x_mask, z_mask = new_x, new_z
+                _record_step(
+                    loop_idx=loop_idx,
+                    gate_name=gate_name,
+                    n_terms_in=n_terms_in,
+                    new_x=new_x,
+                    step=step,
+                    step_profile=step_profile,
+                    process_s=process_s,
+                    prune_s=prune_s,
+                )
+                continue
+
+            if gate_name == "PauliRotation":
+                step_t0 = time.perf_counter() if profile is not None else 0.0
+                new_x, new_z, step, coeffs_cache, step_profile = process_step_fn(
+                    build_pauli_rotation_step,
+                    x_mask,
+                    z_mask,
+                    chunk_size,
+                    gate=gate,
+                    t_dtype=t_dtype,
+                    min_abs=min_abs_internal,
+                    coeffs_cache=coeffs_cache,
+                    thetas_t=thetas_t,
+                    max_weight=max_weight,
+                    weight_x=weight_x,
+                    weight_y=weight_y,
+                    weight_z=weight_z,
+                )
+                process_s = (time.perf_counter() - step_t0) if profile is not None else 0.0
+                prune_t0 = time.perf_counter() if profile is not None else 0.0
+                if min_mat_abs is not None and float(min_mat_abs) > 0.0:
+                    step = _prune_step_by_abs(step, float(min_mat_abs))
+                prune_s = (time.perf_counter() - prune_t0) if profile is not None else 0.0
+                steps.append(step)
+                x_mask, z_mask = new_x, new_z
+                _record_step(
+                    loop_idx=loop_idx,
+                    gate_name=gate_name,
+                    n_terms_in=n_terms_in,
+                    new_x=new_x,
+                    step=step,
+                    step_profile=step_profile,
+                    process_s=process_s,
+                    prune_s=prune_s,
+                )
+                continue
+
+            if gate_name == "DepolarizingNoise":
+                step_t0 = time.perf_counter() if profile is not None else 0.0
+                new_x, new_z, step, coeffs_cache, step_profile = process_step_fn(
+                    build_depolarizing_step,
+                    x_mask,
+                    z_mask,
+                    chunk_size,
+                    gate=gate,
+                    t_dtype=t_dtype,
+                    min_abs=min_abs_internal,
+                    coeffs_cache=coeffs_cache,
+                    max_weight=max_weight,
+                    weight_x=weight_x,
+                    weight_y=weight_y,
+                    weight_z=weight_z,
+                )
+                process_s = (time.perf_counter() - step_t0) if profile is not None else 0.0
+                prune_t0 = time.perf_counter() if profile is not None else 0.0
+                if min_mat_abs is not None and float(min_mat_abs) > 0.0:
+                    step = _prune_step_by_abs(step, float(min_mat_abs))
+                prune_s = (time.perf_counter() - prune_t0) if profile is not None else 0.0
+                steps.append(step)
+                x_mask, z_mask = new_x, new_z
+                _record_step(
+                    loop_idx=loop_idx,
+                    gate_name=gate_name,
+                    n_terms_in=n_terms_in,
+                    new_x=new_x,
+                    step=step,
+                    step_profile=step_profile,
+                    process_s=process_s,
+                    prune_s=prune_s,
+                )
+                continue
+
+            if gate_name == "AmplitudeDampingNoise":
+                step_t0 = time.perf_counter() if profile is not None else 0.0
+                new_x, new_z, step, coeffs_cache, step_profile = process_step_fn(
+                    build_amplitude_damping_step,
+                    x_mask,
+                    z_mask,
+                    chunk_size,
+                    gate=gate,
+                    t_dtype=t_dtype,
+                    min_abs=min_abs_internal,
+                    coeffs_cache=coeffs_cache,
+                    max_weight=max_weight,
+                    weight_x=weight_x,
+                    weight_y=weight_y,
+                    weight_z=weight_z,
+                )
+                process_s = (time.perf_counter() - step_t0) if profile is not None else 0.0
+                prune_t0 = time.perf_counter() if profile is not None else 0.0
+                if min_mat_abs is not None and float(min_mat_abs) > 0.0:
+                    step = _prune_step_by_abs(step, float(min_mat_abs))
+                prune_s = (time.perf_counter() - prune_t0) if profile is not None else 0.0
+                steps.append(step)
+                x_mask, z_mask = new_x, new_z
+                _record_step(
+                    loop_idx=loop_idx,
+                    gate_name=gate_name,
+                    n_terms_in=n_terms_in,
+                    new_x=new_x,
+                    step=step,
+                    step_profile=step_profile,
+                    process_s=process_s,
+                    prune_s=prune_s,
+                )
+                continue
+
+            raise TypeError(
+                f"Unsupported gate type in propagate_surrogate_tensor: {gate_name}. "
+                "Expected CliffordGate, PauliRotation, DepolarizingNoise, or AmplitudeDampingNoise."
+            )
+
+        psum = TensorPauliSum(
+            n_qubits=n_qubits,
+            x_mask=x_mask,
+            z_mask=z_mask,
+            coeff_init=coeff_init,
+            steps=steps,
+        )
+        if propagate_stats is not None:
+            propagate_stats["total_s"] = time.perf_counter() - propagate_t0
+            propagate_stats["output_terms"] = int(x_mask.shape[0])
+
+        return psum
+    finally:
+        if parallel_pools is not None:
+            for parallel_pool in parallel_pools:
+                parallel_pool.close()
+            for parallel_pool in parallel_pools:
+                parallel_pool.join()
 
 
 def zero_filter_tensor(psum: TensorPauliSum) -> TensorPauliSum:
@@ -1491,6 +1989,7 @@ def zero_filter_tensor_backprop_with_keep_mask(
     psum: TensorPauliSum,
     compute_device: str = "cuda",
     chunk_size: int = 1_000_000,
+    profile: Optional[Dict[str, Any]] = None,
 ) -> Tuple[TensorPauliSum, Tensor]:
     """Back-propagating zero-filter.
 
@@ -1513,6 +2012,11 @@ def zero_filter_tensor_backprop_with_keep_mask(
     z_mask_src = psum.z_mask
     coeff_init_src = psum.coeff_init
     steps = list(psum.steps)
+    zero_filter_stats: Optional[Dict[str, Any]] = None
+    if profile is not None:
+        zero_filter_stats = cast(Dict[str, Any], profile.setdefault("zero_filter", {}))
+        zero_filter_stats.setdefault("steps", [])
+    zero_filter_t0 = time.perf_counter() if profile is not None else 0.0
 
     # Release references from input object early (consuming behavior).
     psum.steps = []
@@ -1527,6 +2031,11 @@ def zero_filter_tensor_backprop_with_keep_mask(
             coeff_init=coeff_init_src[keep_mask],
             steps=steps,
         )
+        if zero_filter_stats is not None:
+            zero_filter_stats["initial_terms"] = 0
+            zero_filter_stats["diagonal_terms"] = 0
+            zero_filter_stats["final_terms"] = 0
+            zero_filter_stats["total_s"] = time.perf_counter() - zero_filter_t0
         return filtered, keep_mask
 
     out_mask = _xmask_is_zero_rows(x_mask_src)
@@ -1537,6 +2046,9 @@ def zero_filter_tensor_backprop_with_keep_mask(
     pct = 100.0 * n_diag / n_total if n_total > 0 else 0.0
     print(f"[ZeroFilter] Initial pruning (diagonal terms only): {n_total:,} -> {n_diag:,} terms kept ({pct:.8f}%)")
     print(f"[ZeroFilter] Zero-filtering done. Starting back-propagation of keep mask through {len(steps)} steps...")
+    if zero_filter_stats is not None:
+        zero_filter_stats["initial_terms"] = int(n_total)
+        zero_filter_stats["diagonal_terms"] = int(n_diag)
 
     # Materialize filtered output masks once, then clear original references.
     x_mask_out = x_mask_src[out_mask]
@@ -1555,12 +2067,11 @@ def zero_filter_tensor_backprop_with_keep_mask(
     used_cols_mode = _zero_filter_used_cols_mode()
     compact_device = _zero_filter_compact_device(compute_device)
 
-    if used_cols_mode != "auto":
-        print(f"[ZeroFilter] used-cols mode override: {used_cols_mode}")
     if compact_device != str(compute_device):
         print(f"[ZeroFilter] compaction device override: {compact_device}")
 
     for loop_idx, i in enumerate(pbar):
+        step_t0 = time.perf_counter() if zero_filter_stats is not None else 0.0
         old_step = steps[i]
         n_cols = int(old_step.shape[1])
 
@@ -1577,9 +2088,12 @@ def zero_filter_tensor_backprop_with_keep_mask(
 
         if int(row_mask.sum().item()) == 0:
             col_mask = torch.zeros((n_cols,), dtype=torch.bool, device=row_mask.device)
+            used_cols_s = 0.0
         elif nnz_total == 0 and same_nnz == 0:
             col_mask = torch.zeros((n_cols,), dtype=torch.bool, device=row_mask.device)
+            used_cols_s = 0.0
         else:
+            used_cols_t0 = time.perf_counter() if zero_filter_stats is not None else 0.0
             col_mask = _implicit_same_used_cols(old_step, row_mask, n_cols)
             if int(mat_const._nnz()) > 0:
                 col_mask |= _sparse_used_cols(mat_const, row_mask, n_cols)
@@ -1587,6 +2101,7 @@ def zero_filter_tensor_backprop_with_keep_mask(
                 col_mask |= _sparse_used_cols(mat_cos, row_mask, n_cols)
             if nnz_sin > 0:
                 col_mask |= _sparse_used_cols(mat_sin, row_mask, n_cols)
+            used_cols_s = (time.perf_counter() - used_cols_t0) if zero_filter_stats is not None else 0.0
 
         if (loop_idx % 8 == 0) or (i == 0):
             pbar.set_postfix_str(
@@ -1605,6 +2120,7 @@ def zero_filter_tensor_backprop_with_keep_mask(
             anti_same_pos=old_step.anti_same_pos,
         )
 
+        compact_t0 = time.perf_counter() if zero_filter_stats is not None else 0.0
         steps[i] = compact_sparse_step_chunked(
             step_for_compact,
             keep_row_mask=row_mask,
@@ -1612,7 +2128,22 @@ def zero_filter_tensor_backprop_with_keep_mask(
             device=compact_device,
             chunk_size=chunk_size,
         )
+        compact_s = (time.perf_counter() - compact_t0) if zero_filter_stats is not None else 0.0
         del old_step, step_for_compact
+        if zero_filter_stats is not None:
+            cast(List[Dict[str, Any]], zero_filter_stats["steps"]).append(
+                {
+                    "zero_filter_step_index": int(loop_idx),
+                    "propagate_step_index": int(i),
+                    "rows_kept_in": int(row_mask.sum().item()),
+                    "cols_kept_out": int(col_mask.sum().item()),
+                    "nnz_total": int(nnz_total),
+                    "same_nnz": int(same_nnz),
+                    "used_cols_s": float(used_cols_s),
+                    "compact_s": float(compact_s),
+                    "step_total_s": float(time.perf_counter() - step_t0),
+                }
+            )
         row_mask = col_mask
 
     coeff_init = coeff_init_src[row_mask]
@@ -1625,6 +2156,9 @@ def zero_filter_tensor_backprop_with_keep_mask(
         coeff_init=coeff_init,
         steps=steps,
     )
+    if zero_filter_stats is not None:
+        zero_filter_stats["total_s"] = time.perf_counter() - zero_filter_t0
+        zero_filter_stats["final_terms"] = int(x_mask_out.shape[0])
     return filtered, row_mask
 
 
@@ -1632,6 +2166,7 @@ def zero_filter_tensor_backprop(
     psum: TensorPauliSum,
     compute_device: str = "cuda",
     chunk_size: int = 1_000_000,
+    profile: Optional[Dict[str, Any]] = None,
 ) -> TensorPauliSum:
     """Back-propagating zero-filter (prune rows/cols through sparse steps)."""
 
@@ -1639,6 +2174,7 @@ def zero_filter_tensor_backprop(
         psum,
         compute_device=compute_device,
         chunk_size=chunk_size,
+        profile=profile,
     )
     return filtered
 

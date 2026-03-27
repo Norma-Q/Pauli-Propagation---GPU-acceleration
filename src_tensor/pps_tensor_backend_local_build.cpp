@@ -236,6 +236,31 @@ static std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> apply_clifford(co
     return {new_x, new_z, coeff_sign};
   }
 
+  if (symbol == "CZ") {
+    int64_t c = qubits.at(0);
+    int64_t t = qubits.at(1);
+    if (c < 0 || c >= 63 || t < 0 || t >= 63) {
+      throw std::runtime_error("apply_clifford(1D) supports qubits in [0, 62]");
+    }
+    auto bit_c = torch::scalar_tensor(int64_t(1) << c, torch::TensorOptions().dtype(torch::kInt64).device(device));
+    auto bit_t = torch::scalar_tensor(int64_t(1) << t, torch::TensorOptions().dtype(torch::kInt64).device(device));
+
+    auto xc = torch::bitwise_right_shift(torch::bitwise_and(x_mask, bit_c), c).to(torch::kInt64);
+    auto zc = torch::bitwise_right_shift(torch::bitwise_and(z_mask, bit_c), c).to(torch::kInt64);
+    auto xt = torch::bitwise_right_shift(torch::bitwise_and(x_mask, bit_t), t).to(torch::kInt64);
+    auto zt = torch::bitwise_right_shift(torch::bitwise_and(z_mask, bit_t), t).to(torch::kInt64);
+    auto toggle_z = torch::bitwise_left_shift(xt.to(torch::kInt64), c) |
+                    torch::bitwise_left_shift(xc.to(torch::kInt64), t);
+    auto new_x = x_mask;
+    auto new_z = torch::bitwise_xor(z_mask, toggle_z);
+
+    auto neg_mask = torch::bitwise_and(torch::bitwise_and(xc, xt), torch::bitwise_xor(zc, zt)).ne(0);
+    auto ones = torch::ones_like(coeff_sign);
+    auto neg_ones = -torch::ones_like(coeff_sign);
+    coeff_sign = coeff_sign * torch::where(neg_mask, neg_ones, ones);
+    return {new_x, new_z, coeff_sign};
+  }
+
   return {x_mask, z_mask, coeff_sign};
 }
 
@@ -374,6 +399,44 @@ static std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> apply_clifford_mw
 
     coeff_sign = coeff_sign * sign;
     return {new_x, new_z, coeff_sign};
+  }
+
+  if (symbol == "CZ") {
+    int64_t c = qubits.at(0);
+    int64_t t = qubits.at(1);
+    auto [wc, bc] = word_bit(c);
+    auto [wt, bt] = word_bit(t);
+    if (wc >= n_words || wt >= n_words) {
+      throw std::runtime_error("CZ qubit index exceeds mask word dimension");
+    }
+
+    auto bit_c = torch::scalar_tensor(int64_t(1) << bc, opts_i64);
+    auto bit_t = torch::scalar_tensor(int64_t(1) << bt, opts_i64);
+
+    auto xc = torch::bitwise_and(x_mask.select(1, wc), bit_c).ne(0).to(torch::kInt64);
+    auto zc = torch::bitwise_and(z_mask.select(1, wc), bit_c).ne(0).to(torch::kInt64);
+    auto xt = torch::bitwise_and(x_mask.select(1, wt), bit_t).ne(0).to(torch::kInt64);
+    auto zt = torch::bitwise_and(z_mask.select(1, wt), bit_t).ne(0).to(torch::kInt64);
+    auto new_z = z_mask.clone();
+    if (wc == wt) {
+      auto toggle =
+          torch::bitwise_left_shift(xt.to(torch::kInt64), bc) | torch::bitwise_left_shift(xc.to(torch::kInt64), bt);
+      auto z_col = z_mask.select(1, wc);
+      new_z.select(1, wc).copy_(torch::bitwise_xor(z_col, toggle));
+    } else {
+      auto zc_col = z_mask.select(1, wc);
+      auto zt_col = z_mask.select(1, wt);
+      auto toggle_c = torch::bitwise_left_shift(xt.to(torch::kInt64), bc);
+      auto toggle_t = torch::bitwise_left_shift(xc.to(torch::kInt64), bt);
+      new_z.select(1, wc).copy_(torch::bitwise_xor(zc_col, toggle_c));
+      new_z.select(1, wt).copy_(torch::bitwise_xor(zt_col, toggle_t));
+    }
+
+    auto neg_mask = torch::bitwise_and(torch::bitwise_and(xc, xt), torch::bitwise_xor(zc, zt)).ne(0);
+    auto ones = torch::ones_like(coeff_sign);
+    auto neg_ones = -torch::ones_like(coeff_sign);
+    coeff_sign = coeff_sign * torch::where(neg_mask, neg_ones, ones);
+    return {x_mask, new_z, coeff_sign};
   }
 
   return {x_mask, z_mask, coeff_sign};

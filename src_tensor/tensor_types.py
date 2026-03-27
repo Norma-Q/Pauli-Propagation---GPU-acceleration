@@ -82,14 +82,6 @@ class TensorSparseStep:
             return 0
         return int(self.same_cols.numel())
 
-    def anti_same_nnz(self) -> int:
-        if self.anti_same_pos is None:
-            return 0
-        return int(self.anti_same_pos.numel())
-
-    def is_implicit_rotation(self) -> bool:
-        return self.same_cols is not None
-
     def to(self, device: Any) -> "TensorSparseStep":
         return TensorSparseStep(
             mat_const=self.mat_const.to(device),

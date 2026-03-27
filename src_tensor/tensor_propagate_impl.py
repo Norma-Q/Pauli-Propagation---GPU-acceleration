@@ -46,7 +46,6 @@ except Exception:  # pragma: no cover
     _CPP_BACKEND = cast(Any, None)
     _CPP_AVAILABLE = False
 
-
 class CPPBackendUnavailableError(RuntimeError):
     pass
 
@@ -192,7 +191,7 @@ def build_clifford_step(
         if not hasattr(_CPP_BACKEND, "build_clifford_step_mw_cpp"):
             raise CPPBackendUnavailableError(
                 "Compiled backend does not expose multiword APIs. Build/install a backend that includes "
-                "`build_clifford_step_mw_cpp` (see src_tensor/cpp_backend/build_local_backend.py)."
+                "`build_clifford_step_mw_cpp`."
             )
         new_x, new_z, row, col, val, coeffs_cache_out = _CPP_BACKEND.build_clifford_step_mw_cpp(
             symbol,
@@ -279,16 +278,11 @@ def build_pauli_rotation_step(
     # without changing the semantic meaning of step.param_idx used by evaluators.
     backend_p_idx = p_idx if p_idx >= 0 else (e_idx if e_idx >= 0 else -1)
 
-    # Exact compile for embedding-only rotations has shown degenerate behavior
-    # with the implicit backend path (same-cols/cos folding), yielding near-zero
-    # adjoint weights even when the PennyLane reference is non-zero.
-    #
-    # Keep the implicit path for theta-aware pruning, but route exact
-    # embedding-only compilation through the explicit sparse matrices so the
-    # runtime expval matches the exact reference semantics.
-    use_implicit_backend = not (
-        min_abs is None and e_idx >= 0 and p_idx < 0
-    )
+    # Use the same rotation compile policy for embedding-driven and param-driven
+    # gates. If the compiled implicit backend is available we prefer it; the
+    # explicit backend remains an automatic fallback when the implicit API is
+    # unavailable in the installed extension.
+    use_implicit_backend = True
 
     is_multiword = x_mask.dim() == 2
     if is_multiword:

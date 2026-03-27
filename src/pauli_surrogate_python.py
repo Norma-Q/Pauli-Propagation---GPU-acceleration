@@ -156,23 +156,6 @@ def commutes_gate(g1: 'Gate', g2: 'Gate') -> bool:
     return False
 
 
-def split_commuting_blocks(circuit: List['Gate']) -> List[List['Gate']]:
-    blocks: List[List[Gate]] = []
-    current: List[Gate] = []
-    for gate in circuit:
-        if not current:
-            current = [gate]
-            continue
-        if all(commutes_gate(gate, g) for g in current):
-            current.append(gate)
-        else:
-            blocks.append(current)
-            current = [gate]
-    if current:
-        blocks.append(current)
-    return blocks
-
-
 def build_commuting_depths(circuit: List['Gate']) -> List[List['Gate']]:
     """Group gates into commuting depth buckets.
 
@@ -196,18 +179,6 @@ def build_commuting_depths(circuit: List['Gate']) -> List[List['Gate']]:
         gate_depths.append(depth)
 
     return depths
-
-
-def build_param_depths(circuit: List['Gate']) -> Dict[int, int]:
-    """Map PauliRotation param_idx to commuting depth index."""
-    depths = build_commuting_depths(circuit)
-    param_depths: Dict[int, int] = {}
-    for depth_idx, depth in enumerate(depths):
-        for gate in depth:
-            if isinstance(gate, PauliRotation) and gate.param_idx >= 0:
-                param_depths[gate.param_idx] = depth_idx
-    return param_depths
-
 
 def pauli_product(p1: PauliString, p2: PauliString) -> Tuple[PauliString, int]:
     """

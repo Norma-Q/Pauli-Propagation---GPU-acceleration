@@ -23,6 +23,51 @@ torch = cast(Any, torch)
 from .tensor_types import TensorDAGGraph, TensorPauliSum, TensorSparseStep
 
 
+def _slice_sparse_rows_to_device(mat_storage: Tensor, start: int, end: int, target_device: Any) -> Tensor:
+    """Materialize a sparse row block on the target device without SparseCPU slicing.
+
+    PyTorch SparseCPU tensors do not support `mat[start:end]` because that path
+    relies on `aten::as_strided`. We therefore slice the coalesced COO indices
+    manually and rebuild the row block.
+    """
+    n_rows = int(max(0, end - start))
+    n_cols = int(mat_storage.shape[1])
+    if mat_storage._nnz() == 0 or n_rows == 0:
+        return torch.sparse_coo_tensor(
+            torch.zeros((2, 0), dtype=torch.int64, device=target_device),
+            torch.zeros((0,), dtype=mat_storage.dtype, device=target_device),
+            size=(n_rows, n_cols),
+            device=target_device,
+            dtype=mat_storage.dtype,
+        )
+
+    mat_c = mat_storage if mat_storage.is_coalesced() else mat_storage.coalesce()
+    indices = mat_c.indices()
+    values = mat_c.values()
+    row_idx = indices[0]
+    keep = (row_idx >= int(start)) & (row_idx < int(end))
+
+    if not bool(keep.any().item()):
+        return torch.sparse_coo_tensor(
+            torch.zeros((2, 0), dtype=torch.int64, device=target_device),
+            torch.zeros((0,), dtype=mat_storage.dtype, device=target_device),
+            size=(n_rows, n_cols),
+            device=target_device,
+            dtype=mat_storage.dtype,
+        )
+
+    local_indices = indices[:, keep].clone()
+    local_indices[0] -= int(start)
+    local_values = values[keep]
+    return torch.sparse_coo_tensor(
+        local_indices.to(target_device),
+        local_values.to(target_device),
+        size=(n_rows, n_cols),
+        device=target_device,
+        dtype=mat_storage.dtype,
+    )
+
+
 class TensorDAGEvaluator:
     """GPU-first evaluator using layered edge tensors."""
 
@@ -126,9 +171,7 @@ class TensorSparseEvaluator:
             result_parts = []
             for i in range(0, n_rows, self.chunk_size):
                 end = min(i + self.chunk_size, n_rows)
-                # Slice rows from storage tensor
-                # Note: PyTorch sparse slicing creates a view or copy of indices, relatively cheap
-                mat_chunk = mat_storage[i:end].to(vec_calc.device)
+                mat_chunk = _slice_sparse_rows_to_device(mat_storage, i, end, vec_calc.device)
                 # Result chunk
                 res_chunk = torch.sparse.mm(mat_chunk, vec_calc)
                 result_parts.append(res_chunk)
@@ -238,9 +281,7 @@ class TensorSparseEvaluator:
             
             for i in range(0, n_rows, self.chunk_size):
                 end = min(i + self.chunk_size, n_rows)
-                
-                # Slice M rows (CPU) -> GPU
-                mat_chunk = mat_storage[i:end].to(vec_calc.device)
+                mat_chunk = _slice_sparse_rows_to_device(mat_storage, i, end, vec_calc.device)
                 # Slice w rows (GPU)
                 vec_chunk = vec_calc[i:end]
                 

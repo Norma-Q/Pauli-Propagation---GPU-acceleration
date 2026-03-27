@@ -16,6 +16,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, TYPE_CHECKING, cast
 import numpy as np
+import os
+import time
 
 torch: Any
 try:
@@ -123,6 +125,7 @@ class CompiledTensorSurrogate:
     _obs_sparse_cache: Dict[Tuple[int, str, str], Tuple[Tensor, Tensor]] = field(default_factory=dict)
     _expval_evaluator: Optional[TensorSparseEvaluator] = None
     _diag_mask_cache: Dict[str, Tensor] = field(default_factory=dict)
+    compile_stats: Dict[str, Any] = field(default_factory=dict)
 
     def _validate_obs_index(self, obs_index: int) -> int:
         n_obs = len(self.observables)
@@ -623,6 +626,22 @@ def compile_expval_program(
     if not _TORCH_AVAILABLE:
         raise RuntimeError("PyTorch is required for tensor backend.")
 
+    profile_enabled = str(os.environ.get("PPS_COMPILE_PROFILE", "0")).strip().lower() not in {
+        "",
+        "0",
+        "false",
+        "no",
+        "off",
+    }
+    compile_stats: Optional[Dict[str, Any]] = None
+    compile_t0 = time.perf_counter() if profile_enabled else 0.0
+    if profile_enabled:
+        compile_stats = {
+            "enabled": True,
+            "propagate": {"steps": []},
+            "zero_filter": {"steps": []},
+        }
+
     obs_list = _normalize_observables(observables)
     cfg = resolve_preset(preset, overrides=preset_overrides)
 
@@ -643,6 +662,7 @@ def compile_expval_program(
         parallel_compile=parallel_compile,
         parallel_threshold=int(parallel_threshold),
         parallel_devices=parallel_devices,
+        profile=compile_stats,
     )
 
 
@@ -657,8 +677,44 @@ def compile_expval_program(
         psum_union,
         compute_device=str(cfg.compute_device),
         chunk_size=int(cfg.chunk_size),
+        profile=compile_stats,
     )
     basis = _shrink_union_basis(basis, keep_mask_in)
+
+    if compile_stats is not None:
+        compile_total_s = time.perf_counter() - compile_t0
+        propagate_stats = cast(Dict[str, Any], compile_stats.get("propagate", {}))
+        zero_filter_stats = cast(Dict[str, Any], compile_stats.get("zero_filter", {}))
+        propagate_steps = cast(List[Dict[str, Any]], propagate_stats.get("steps", []))
+        zero_filter_steps = cast(List[Dict[str, Any]], zero_filter_stats.get("steps", []))
+
+        canonicalize_total_s = float(sum(float(s.get("canonicalize_s", 0.0)) for s in propagate_steps))
+        anti_merge_total_s = float(sum(float(s.get("anti_merge_s", 0.0)) for s in propagate_steps))
+        process_total_s = float(sum(float(s.get("process_s", 0.0)) for s in propagate_steps))
+        zero_filter_step_total_s = float(sum(float(s.get("step_total_s", 0.0)) for s in zero_filter_steps))
+
+        compile_stats["summary"] = {
+            "compile_total_s": compile_total_s,
+            "propagate_total_s": float(propagate_stats.get("total_s", process_total_s)),
+            "propagate_process_total_s": process_total_s,
+            "canonicalize_total_s": canonicalize_total_s,
+            "anti_merge_total_s": anti_merge_total_s,
+            "zero_filter_total_s": float(zero_filter_stats.get("total_s", zero_filter_step_total_s)),
+            "zero_filter_step_total_s": zero_filter_step_total_s,
+            "n_propagate_steps": len(propagate_steps),
+            "n_zero_filter_steps": len(zero_filter_steps),
+            "propagated_terms": n_terms_prop,
+            "final_terms": int(psum_union.x_mask.shape[0]),
+        }
+        summary = cast(Dict[str, Any], compile_stats["summary"])
+        print(
+            "[PPS Profile] "
+            f"compile_s={summary['compile_total_s']:.6f} "
+            f"propagate_s={summary['propagate_total_s']:.6f} "
+            f"canonicalize_s={summary['canonicalize_total_s']:.6f} "
+            f"anti_merge_s={summary['anti_merge_total_s']:.6f} "
+            f"zero_filter_s={summary['zero_filter_total_s']:.6f}"
+        )
 
     return CompiledTensorSurrogate(
         circuit=list(circuit),
@@ -668,6 +724,7 @@ def compile_expval_program(
         preset_name=str(preset),
         preset=cfg,
         _V0_cache={},
+        compile_stats=({} if compile_stats is None else compile_stats),
     )
 
 
