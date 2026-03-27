@@ -38,6 +38,8 @@ embedding.ipynb
 QGAN_adaptability.ipynb
 benchmark_chunking.ipynb
 benchmark_cpu_vs_gpu_storage.ipynb
+test.ipynb
+CZ_validation.ipynb
 
 batch_implementation_from_embedding.md
 embedding_implementation_from_scratch.md
@@ -57,6 +59,7 @@ lightning_gpu_vs_cudaq_benchmark.ipynb
 QAOA_1layer_Analysis/
 
 LWPP*/
+AGENTS.md
+.agents/
 
 # 캐시 삭제하고 싶으면 git rm -r --cached <file> 명령어 사용
-
