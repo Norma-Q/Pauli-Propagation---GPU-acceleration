@@ -23,6 +23,51 @@ torch = cast(Any, torch)
 from .tensor_types import TensorDAGGraph, TensorPauliSum, TensorSparseStep
 
 
+def _slice_sparse_rows_to_device(mat_storage: Tensor, start: int, end: int, target_device: Any) -> Tensor:
+    """Materialize a sparse row block on the target device without SparseCPU slicing.
+
+    PyTorch SparseCPU tensors do not support `mat[start:end]` because that path
+    relies on `aten::as_strided`. We therefore slice the coalesced COO indices
+    manually and rebuild the row block.
+    """
+    n_rows = int(max(0, end - start))
+    n_cols = int(mat_storage.shape[1])
+    if mat_storage._nnz() == 0 or n_rows == 0:
+        return torch.sparse_coo_tensor(
+            torch.zeros((2, 0), dtype=torch.int64, device=target_device),
+            torch.zeros((0,), dtype=mat_storage.dtype, device=target_device),
+            size=(n_rows, n_cols),
+            device=target_device,
+            dtype=mat_storage.dtype,
+        )
+
+    mat_c = mat_storage if mat_storage.is_coalesced() else mat_storage.coalesce()
+    indices = mat_c.indices()
+    values = mat_c.values()
+    row_idx = indices[0]
+    keep = (row_idx >= int(start)) & (row_idx < int(end))
+
+    if not bool(keep.any().item()):
+        return torch.sparse_coo_tensor(
+            torch.zeros((2, 0), dtype=torch.int64, device=target_device),
+            torch.zeros((0,), dtype=mat_storage.dtype, device=target_device),
+            size=(n_rows, n_cols),
+            device=target_device,
+            dtype=mat_storage.dtype,
+        )
+
+    local_indices = indices[:, keep].clone()
+    local_indices[0] -= int(start)
+    local_values = values[keep]
+    return torch.sparse_coo_tensor(
+        local_indices.to(target_device),
+        local_values.to(target_device),
+        size=(n_rows, n_cols),
+        device=target_device,
+        dtype=mat_storage.dtype,
+    )
+
+
 class TensorDAGEvaluator:
     """GPU-first evaluator using layered edge tensors."""
 
@@ -71,6 +116,8 @@ def _step_to_device(step: TensorSparseStep, device: str) -> TensorSparseStep:
         param_idx=step.param_idx,
         emb_idx=step.emb_idx,
         shape=step.shape,
+        same_cols=None if step.same_cols is None else step.same_cols.to(device),
+        anti_same_pos=None if step.anti_same_pos is None else step.anti_same_pos.to(device),
     )
 
 
@@ -84,10 +131,10 @@ class TensorSparseEvaluator:
         self.compute_device = compute_device
         self.chunk_size = chunk_size if chunk_size is not None else 1_000_000
 
-    def evaluate_coeffs(self, thetas, embedding=None) -> Tensor:
+    def evaluate_coeffs(self, thetas, embedding=None, coeff_init: Optional[Tensor] = None) -> Tensor:
         """Return coefficient vector after applying all sparse steps with gradient control."""
         psum = self.psum
-        v = psum.coeff_init
+        v = psum.coeff_init if coeff_init is None else coeff_init
         
         # 벡터는 연산 장치에 상주
         v = v.to(self.compute_device)
@@ -124,14 +171,36 @@ class TensorSparseEvaluator:
             result_parts = []
             for i in range(0, n_rows, self.chunk_size):
                 end = min(i + self.chunk_size, n_rows)
-                # Slice rows from storage tensor
-                # Note: PyTorch sparse slicing creates a view or copy of indices, relatively cheap
-                mat_chunk = mat_storage[i:end].to(vec_calc.device)
+                mat_chunk = _slice_sparse_rows_to_device(mat_storage, i, end, vec_calc.device)
                 # Result chunk
                 res_chunk = torch.sparse.mm(mat_chunk, vec_calc)
                 result_parts.append(res_chunk)
             
             return torch.cat(result_parts, dim=0)
+
+        def _apply_implicit_same(step: TensorSparseStep, vec_calc: Tensor, cos_t: Tensor) -> Optional[Tensor]:
+            if step.same_cols is None:
+                return None
+            same_cols = step.same_cols.to(vec_calc.device)
+            out = torch.zeros((step.shape[0], vec_calc.shape[1]), dtype=vec_calc.dtype, device=vec_calc.device)
+            n_same = int(same_cols.numel())
+            if n_same == 0:
+                return out
+            # Defensive guard: if backend-produced same_cols is inconsistent,
+            # fallback to the general sparse path (return None).
+            if n_same > int(step.shape[0]) or n_same > int(vec_calc.shape[0]):
+                return None
+            if torch.any(same_cols < 0) or torch.any(same_cols >= int(vec_calc.shape[0])):
+                return None
+            same_vals = vec_calc.index_select(0, same_cols)
+            if step.anti_same_pos is not None and step.anti_same_pos.numel() > 0:
+                anti_pos = step.anti_same_pos.to(vec_calc.device)
+                if torch.any(anti_pos < 0) or torch.any(anti_pos >= n_same):
+                    return None
+                same_vals = same_vals.clone()
+                same_vals[anti_pos] = cos_t * same_vals.index_select(0, anti_pos)
+            out[:n_same] = same_vals
+            return out
 
         for i, step in enumerate(psum.steps):
             # [수정] 파라미터 결정 로직: emb_idx가 우선순위를 가짐
@@ -150,9 +219,13 @@ class TensorSparseEvaluator:
                 cos_t = torch.ones((), dtype=v.dtype, device=v.device)
                 sin_t = torch.zeros((), dtype=v.dtype, device=v.device)
 
-            v_next = _chunked_mm(step.mat_const, v)
+            implicit_same = _apply_implicit_same(step, v, cos_t)
+            if implicit_same is not None:
+                v_next = implicit_same
+            else:
+                v_next = _chunked_mm(step.mat_const, v)
 
-            if step.mat_cos._nnz() > 0:
+            if implicit_same is None and step.mat_cos._nnz() > 0:
                 v_next = v_next + cos_t * _chunked_mm(step.mat_cos, v)
             if step.mat_sin._nnz() > 0:
                 v_next = v_next + sin_t * _chunked_mm(step.mat_sin, v)
@@ -174,9 +247,13 @@ class TensorSparseEvaluator:
 
         w = w.to(self.compute_device)
 
-        thetas_t = torch.as_tensor(thetas, dtype=w.dtype, device=w.device)
-        if thetas_t.numel() == 0:
+        # Handle optional thetas (None for embedding-only circuits)
+        if thetas is None:
             thetas_t = torch.zeros(1, dtype=w.dtype, device=w.device)
+        else:
+            thetas_t = torch.as_tensor(thetas, dtype=w.dtype, device=w.device)
+            if thetas_t.numel() == 0:
+                thetas_t = torch.zeros(1, dtype=w.dtype, device=w.device)
 
         if embedding is not None:
             embedding_t = torch.as_tensor(embedding, dtype=w.dtype, device=w.device)
@@ -204,9 +281,7 @@ class TensorSparseEvaluator:
             
             for i in range(0, n_rows, self.chunk_size):
                 end = min(i + self.chunk_size, n_rows)
-                
-                # Slice M rows (CPU) -> GPU
-                mat_chunk = mat_storage[i:end].to(vec_calc.device)
+                mat_chunk = _slice_sparse_rows_to_device(mat_storage, i, end, vec_calc.device)
                 # Slice w rows (GPU)
                 vec_chunk = vec_calc[i:end]
                 
@@ -217,7 +292,33 @@ class TensorSparseEvaluator:
                     y_acc = term
                 else:
                     y_acc += term
+            if y_acc is None:
+                return torch.zeros((mat_storage.shape[1], vec_calc.shape[1]), dtype=vec_calc.dtype, device=vec_calc.device)
             return y_acc
+
+        def _apply_implicit_same_T(step: TensorSparseStep, vec_calc: Tensor, cos_t: Tensor) -> Optional[Tensor]:
+            if step.same_cols is None:
+                return None
+            same_cols = step.same_cols.to(vec_calc.device)
+            out = torch.zeros((step.shape[1], vec_calc.shape[1]), dtype=vec_calc.dtype, device=vec_calc.device)
+            n_same = int(same_cols.numel())
+            if n_same == 0:
+                return out
+            # Defensive guard: if backend-produced same_cols is inconsistent,
+            # fallback to the general sparse-transpose path (return None).
+            if n_same > int(vec_calc.shape[0]):
+                return None
+            if torch.any(same_cols < 0) or torch.any(same_cols >= int(step.shape[1])):
+                return None
+            same_block = vec_calc[:n_same]
+            if step.anti_same_pos is not None and step.anti_same_pos.numel() > 0:
+                anti_pos = step.anti_same_pos.to(vec_calc.device)
+                if torch.any(anti_pos < 0) or torch.any(anti_pos >= n_same):
+                    return None
+                same_block = same_block.clone()
+                same_block[anti_pos] = cos_t.view(1, -1) * same_block.index_select(0, anti_pos)
+            out.index_add_(0, same_cols, same_block)
+            return out
 
         # 2. 역순 전파 루프
         for rev_i, step in enumerate(reversed(psum.steps)):
@@ -234,9 +335,13 @@ class TensorSparseEvaluator:
                 cos_t = torch.ones(batch_size, dtype=w.dtype, device=w.device)
                 sin_t = torch.zeros(batch_size, dtype=w.dtype, device=w.device)
 
-            w_next = _chunked_mm_T(step.mat_const, w)
+            implicit_same = _apply_implicit_same_T(step, w, cos_t)
+            if implicit_same is not None:
+                w_next = implicit_same
+            else:
+                w_next = _chunked_mm_T(step.mat_const, w)
 
-            if step.mat_cos._nnz() > 0:
+            if implicit_same is None and step.mat_cos._nnz() > 0:
                 w_next = w_next + cos_t.view(1, -1) * _chunked_mm_T(step.mat_cos, w)
             if step.mat_sin._nnz() > 0:
                 w_next = w_next + sin_t.view(1, -1) * _chunked_mm_T(step.mat_sin, w)

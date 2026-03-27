@@ -1,0 +1,12 @@
+DIRECTORY:
+  config_path: /home/ubuntu/PPS-lab/test_qaoa/config
+QAOA:
+  delta_t: 0.8
+  lr: 0.05
+  max_weight: 3
+  n_layers: 9
+  n_qubits: 45
+  steps: 150
+TRAINING:
+  lr: 0.05
+  steps: 150

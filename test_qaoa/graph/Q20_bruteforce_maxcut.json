@@ -1,0 +1,12 @@
+{
+  "source_graph_json": "/home/ubuntu/PPS-lab/test_qaoa/graph/Q20_edges.json",
+  "cache_path": "/home/ubuntu/PPS-lab/test_qaoa/graph/Q20_bruteforce_maxcut.json",
+  "n_qubits": 20,
+  "n_edges": 135,
+  "edges_signature": "95cac9af7381a68fe7c164a463db4a84bfb8881d0f7b62a41f8a874a4e4f77a5",
+  "best_cut": 86,
+  "best_expected_cut": 86.0,
+  "best_sum_zz": -37.0,
+  "n_optimal_assignments": 2,
+  "representative_code": 291067
+}

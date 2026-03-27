@@ -7,6 +7,7 @@ import json
 import sys
 
 import numpy as np
+import torch
 
 _THIS_DIR = Path(__file__).resolve().parent
 _REPO_ROOT = _THIS_DIR.parent
@@ -17,6 +18,25 @@ from src.pauli_surrogate_python import CliffordGate, PauliRotation, PauliSum
 
 
 Edge = Tuple[int, int]
+
+
+def choose_device(raw: str) -> str:
+    if raw == "auto":
+        return "cuda" if torch.cuda.is_available() else "cpu"
+    return str(raw)
+
+
+def default_cpu_exact_overrides() -> Dict[str, object]:
+    return {
+        "build_device": "cpu",
+        "step_device": "cpu",
+        "stream_device": "cpu",
+        "dtype": "float64",
+        "max_weight": 1_000_000_000,
+        "max_xy": 1_000_000_000,
+        "offload_steps": False,
+        "offload_back": False,
+    }
 
 
 @dataclass(frozen=True)
@@ -168,16 +188,40 @@ def build_qaoa_circuit(n_qubits: int, edges: Sequence[Edge], p_layers: int):
     return circuit, param_idx
 
 
-def tqa_init_qaoa_params(p: int, delta_t: float, dtype=np.float64) -> QAOAParams:
-    if int(p) < 1:
-        raise ValueError("p must be >= 1")
-    if not (float(delta_t) > 0.0):
+def tqa_init_qaoa_params(p_layers: int, delta_t: float, dtype=np.float64) -> QAOAParams:
+    if int(p_layers) < 1:
+        raise ValueError("p_layers must be >= 1")
+    if float(delta_t) <= 0.0:
         raise ValueError("delta_t must be > 0")
-    i = np.arange(1, int(p) + 1, dtype=dtype)
-    pp = dtype(p)
-    gammas = (i / pp) * dtype(delta_t)
-    betas = (dtype(1.0) - (i / pp)) * dtype(delta_t)
+    i = np.arange(1, int(p_layers) + 1, dtype=dtype)
+    p = dtype(p_layers)
+    gammas = (i / p) * dtype(delta_t)
+    betas = -(dtype(1.0) - (i / p)) * dtype(delta_t)
+
     return QAOAParams(gammas=gammas, betas=betas)
+
+
+def flattened_tqa_init_qaoa_params(
+    p_layers: int,
+    delta_t: float,
+    flatten_alpha: float = 0.5,
+    dtype=np.float64,
+) -> QAOAParams:
+    if not (0.0 <= float(flatten_alpha) <= 1.0):
+        raise ValueError("flatten_alpha must lie in [0, 1].")
+
+    tqa_params = tqa_init_qaoa_params(
+        p_layers=int(p_layers),
+        delta_t=float(delta_t),
+        dtype=dtype,
+    )
+    gamma_mean = np.mean(tqa_params.gammas, dtype=dtype)
+    beta_mean = np.mean(tqa_params.betas, dtype=dtype)
+    alpha = dtype(flatten_alpha)
+
+    gammas = (dtype(1.0) - alpha) * gamma_mean + alpha * tqa_params.gammas
+    betas = (dtype(1.0) - alpha) * beta_mean + alpha * tqa_params.betas
+    return QAOAParams(gammas=gammas.astype(dtype, copy=False), betas=betas.astype(dtype, copy=False))
 
 
 def build_qaoa_theta_init_tqa(
@@ -187,7 +231,28 @@ def build_qaoa_theta_init_tqa(
     delta_t: float,
     dtype=np.float64,
 ) -> np.ndarray:
-    params = tqa_init_qaoa_params(p=int(p_layers), delta_t=float(delta_t), dtype=dtype)
+    params = tqa_init_qaoa_params(p_layers=int(p_layers), delta_t=float(delta_t), dtype=dtype)
+    thetas: List[float] = []
+    for l in range(int(p_layers)):
+        thetas.append(float(params.gammas[l]))
+        thetas.append(float(params.betas[l]))
+    return np.asarray(thetas, dtype=dtype)
+
+
+def build_qaoa_theta_init_flattened_tqa(
+    p_layers: int,
+    n_edges: int,
+    n_qubits: int,
+    delta_t: float,
+    flatten_alpha: float = 0.5,
+    dtype=np.float64,
+) -> np.ndarray:
+    params = flattened_tqa_init_qaoa_params(
+        p_layers=int(p_layers),
+        delta_t=float(delta_t),
+        flatten_alpha=float(flatten_alpha),
+        dtype=dtype,
+    )
     thetas: List[float] = []
     for l in range(int(p_layers)):
         thetas.append(float(params.gammas[l]))

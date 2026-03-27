@@ -13,11 +13,18 @@ _REPO_ROOT = _THIS_DIR.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from qaoa_surrogate_common import (
-    load_edges_json,
-    make_qaoa_problem_dict,
-    make_ring_chord_graph,
-)
+try:
+    from .qaoa_surrogate_common import (
+        load_edges_json,
+        make_qaoa_problem_dict,
+        make_ring_chord_graph,
+    )
+except ImportError:
+    from qaoa_surrogate_common import (
+        load_edges_json,
+        make_qaoa_problem_dict,
+        make_ring_chord_graph,
+    )
 
 
 def parse_args() -> argparse.Namespace:

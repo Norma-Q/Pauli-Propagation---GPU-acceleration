@@ -13,9 +13,11 @@ with conservative precision defaults.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, TYPE_CHECKING, cast
 import numpy as np
+import os
+import time
 
 torch: Any
 try:
@@ -39,8 +41,27 @@ from .tensor_adjoint import (
     expvals_from_w_and_coeff_matrix,
     propagate_union_basis_psum,
 )
+from .tensor_eval import TensorSparseEvaluator
 from .tensor_sampler import TensorSparseSampler
 from .tensor_types import TensorPauliSum
+
+
+def _expvals_parallel_worker(args: Tuple) -> Tensor:
+    from .tensor_adjoint import adjoint_weights_on_zero
+
+    (
+        rank, devices, psum_union, thetas, embedding_chunk, chunk_size
+    ) = args
+
+    device = devices[rank]
+    w_chunk = adjoint_weights_on_zero(
+        psum_union,
+        thetas,
+        embedding=embedding_chunk,
+        compute_device=device,
+        chunk_size=chunk_size,
+    )
+    return w_chunk.cpu()
 
 
 @dataclass(frozen=True)
@@ -65,7 +86,7 @@ DEFAULT_PRESETS: Dict[str, TensorSurrogatePreset] = {
         weight_x=1.0,
         weight_y=1.0,
         weight_z=1.0,
-        chunk_size=1_000_000,
+        chunk_size=10_000_000,
     ),
     "gpu": TensorSurrogatePreset(
         memory_device="cuda",
@@ -75,7 +96,7 @@ DEFAULT_PRESETS: Dict[str, TensorSurrogatePreset] = {
         weight_x=1.0,
         weight_y=1.0,
         weight_z=1.0,
-        chunk_size=1_000_000_000,
+        chunk_size=10_000_000,
     ),
     "hybrid": TensorSurrogatePreset(
         memory_device="cpu",
@@ -85,18 +106,8 @@ DEFAULT_PRESETS: Dict[str, TensorSurrogatePreset] = {
         weight_x=1.0,
         weight_y=1.0,
         weight_z=1.0,
-        chunk_size=1_000_000,
+        chunk_size=25_000_000,
     ),
-    "gpu_safe": TensorSurrogatePreset(
-        memory_device="cpu",
-        compute_device="cuda",
-        dtype="float64",
-        max_weight=1_000_000_000,
-        weight_x=1.0,
-        weight_y=1.0,
-        weight_z=1.0,
-        chunk_size=1_000_000,
-    )
 }
 
 
@@ -110,7 +121,17 @@ class CompiledTensorSurrogate:
     observables: List[Any]
     preset_name: str
     preset: TensorSurrogatePreset
-    _V0_cache: Dict[Tuple[str, str], Tensor]
+    _V0_cache: Dict[Tuple[str, str], Tensor] = field(default_factory=dict)
+    _obs_sparse_cache: Dict[Tuple[int, str, str], Tuple[Tensor, Tensor]] = field(default_factory=dict)
+    _expval_evaluator: Optional[TensorSparseEvaluator] = None
+    _diag_mask_cache: Dict[str, Tensor] = field(default_factory=dict)
+    compile_stats: Dict[str, Any] = field(default_factory=dict)
+
+    def _validate_obs_index(self, obs_index: int) -> int:
+        n_obs = len(self.observables)
+        if obs_index < 0 or obs_index >= n_obs:
+            raise IndexError(f"obs_index={obs_index} is out of range for {n_obs} observables")
+        return int(obs_index)
 
     def _get_V0(self, *, device: str, dtype: Any) -> Tensor:
         key = (str(device), str(dtype))
@@ -125,13 +146,65 @@ class CompiledTensorSurrogate:
             self._V0_cache[key] = V0
         return V0
 
+    def _get_obs_sparse_terms(self, *, obs_index: int, device: Any, dtype: Any) -> Tuple[Tensor, Tensor]:
+        key = (int(obs_index), str(device), str(dtype))
+        cached = self._obs_sparse_cache.get(key)
+        if cached is not None:
+            return cached
+
+        obs = self.observables[int(obs_index)]
+        idx_list: List[int] = []
+        coeff_list: List[float] = []
+        for p, c in obs.terms.items():
+            i = self.basis.index.get(p)
+            if i is None:
+                continue
+            c_f = float(c)
+            if c_f == 0.0:
+                continue
+            idx_list.append(int(i))
+            coeff_list.append(c_f)
+
+        idx_t = torch.as_tensor(idx_list, dtype=torch.long, device=device)
+        coeff_t = torch.as_tensor(coeff_list, dtype=dtype, device=device)
+        self._obs_sparse_cache[key] = (idx_t, coeff_t)
+        return idx_t, coeff_t
+
+    def _get_expval_evaluator(self) -> TensorSparseEvaluator:
+        evaluator = self._expval_evaluator
+        if evaluator is None:
+            evaluator = TensorSparseEvaluator(
+                self.psum_union,
+                compute_device=self.preset.compute_device,
+                chunk_size=self.preset.chunk_size,
+            )
+            self._expval_evaluator = evaluator
+        return evaluator
+
+    def _get_diag_mask(self, *, device: Any) -> Tensor:
+        key = str(device)
+        cached = self._diag_mask_cache.get(key)
+        if cached is not None:
+            return cached
+        diag_mask = (self.psum_union.x_mask == 0) if self.psum_union.x_mask.dim() == 1 else (self.psum_union.x_mask == 0).all(dim=1)
+        diag_mask = diag_mask.to(device=device)
+        self._diag_mask_cache[key] = diag_mask
+        return diag_mask
+
     def expvals(
         self,
-        thetas: Any,
+        thetas: Any = None,
         *,
         embedding: Any = None,
+        parallel: bool = False,
     ) -> Tensor:
-        """Evaluate expectation values with optional data priors (embedding)."""
+        """Evaluate expectation values with optional data priors (embedding).
+        
+        Args:
+            thetas: Optional trainable parameters. Can be None for embedding-only circuits.
+            embedding: Optional embedding (generative) parameters.
+            parallel: Use multi-GPU evaluation if available.
+        """
         if not _TORCH_AVAILABLE:
             raise RuntimeError("PyTorch is required for tensor backend.")
 
@@ -141,14 +214,44 @@ class CompiledTensorSurrogate:
             if embedding.ndim == 1:
                 embedding = embedding.unsqueeze(0)
         
-        # adjoint_weights_on_zero는 이제 (Batch, Num_Paulis)를 반환하도록 2단계에서 수정할 것입니다.
-        w = adjoint_weights_on_zero(
-            self.psum_union,
-            thetas,
-            embedding=embedding,
-            compute_device=self.preset.compute_device,
-            chunk_size=self.preset.chunk_size,
+        num_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
+        use_parallel = (
+            parallel
+            and embedding is not None
+            and embedding.shape[0] > 1
+            and num_gpus > 1
         )
+
+        if use_parallel:
+            devices = [f"cuda:{i}" for i in range(num_gpus)]
+            embedding_chunks = torch.chunk(embedding, num_gpus)
+            worker_args = [
+                (
+                    i,
+                    devices,
+                    self.psum_union,
+                    thetas,
+                    embedding_chunks[i],
+                    self.preset.chunk_size,
+                )
+                for i in range(num_gpus)
+            ]
+
+            import torch.multiprocessing as mp
+
+            ctx = mp.get_context("spawn")
+            with ctx.Pool(processes=num_gpus) as pool:
+                w_chunks_cpu = pool.map(_expvals_parallel_worker, worker_args)
+
+            w = torch.cat(w_chunks_cpu, dim=0)
+        else:
+            w = adjoint_weights_on_zero(
+                self.psum_union,
+                thetas,
+                embedding=embedding,
+                compute_device=self.preset.compute_device,
+                chunk_size=self.preset.chunk_size,
+            )
         
         V0 = self._get_V0(device=str(w.device), dtype=w.dtype)
         
@@ -163,10 +266,24 @@ class CompiledTensorSurrogate:
         *,
         obs_index: int = 0,
     ) -> Tensor:
-        vals = self.expvals(thetas)
-        if obs_index < 0 or obs_index >= int(vals.shape[0]):
-            raise IndexError(f"obs_index={obs_index} is out of range for {int(vals.shape[0])} observables")
-        return vals[obs_index]
+        if not _TORCH_AVAILABLE:
+            raise RuntimeError("PyTorch is required for tensor backend.")
+
+        obs_index = self._validate_obs_index(obs_index)
+
+        coeff_init = torch.zeros_like(self.psum_union.coeff_init)
+        idx_t, coeff_t = self._get_obs_sparse_terms(
+            obs_index=obs_index,
+            device=coeff_init.device,
+            dtype=coeff_init.dtype,
+        )
+        if idx_t.numel() > 0:
+            coeff_init.index_copy_(0, idx_t, coeff_t)
+
+        evaluator = self._get_expval_evaluator()
+        coeff_out = evaluator.evaluate_coeffs(thetas, coeff_init=coeff_init)
+        diag_mask = self._get_diag_mask(device=coeff_out.device)
+        return torch.sum(coeff_out[diag_mask])
 
     def expvals_pennylane(self, thetas: Any, *, max_qubits: int = 20) -> Tensor:
         """Reference expvals via PennyLane (small circuits only)."""
@@ -490,6 +607,9 @@ def compile_expval_program(
     build_thetas: Any = None,
     build_min_abs: Optional[float] = None,
     build_min_mat_abs: Optional[float] = None,
+    parallel_compile: bool = False,
+    parallel_threshold: int = -1,
+    parallel_devices: Optional[Sequence[int]] = None,
 ) -> CompiledTensorSurrogate:
     """Compile a reusable expval program with fixed memory-first flow.
 
@@ -505,6 +625,22 @@ def compile_expval_program(
 
     if not _TORCH_AVAILABLE:
         raise RuntimeError("PyTorch is required for tensor backend.")
+
+    profile_enabled = str(os.environ.get("PPS_COMPILE_PROFILE", "0")).strip().lower() not in {
+        "",
+        "0",
+        "false",
+        "no",
+        "off",
+    }
+    compile_stats: Optional[Dict[str, Any]] = None
+    compile_t0 = time.perf_counter() if profile_enabled else 0.0
+    if profile_enabled:
+        compile_stats = {
+            "enabled": True,
+            "propagate": {"steps": []},
+            "zero_filter": {"steps": []},
+        }
 
     obs_list = _normalize_observables(observables)
     cfg = resolve_preset(preset, overrides=preset_overrides)
@@ -523,6 +659,10 @@ def compile_expval_program(
         min_abs=build_min_abs,
         min_mat_abs=build_min_mat_abs,
         chunk_size=int(cfg.chunk_size),
+        parallel_compile=parallel_compile,
+        parallel_threshold=int(parallel_threshold),
+        parallel_devices=parallel_devices,
+        profile=compile_stats,
     )
 
 
@@ -537,8 +677,44 @@ def compile_expval_program(
         psum_union,
         compute_device=str(cfg.compute_device),
         chunk_size=int(cfg.chunk_size),
+        profile=compile_stats,
     )
     basis = _shrink_union_basis(basis, keep_mask_in)
+
+    if compile_stats is not None:
+        compile_total_s = time.perf_counter() - compile_t0
+        propagate_stats = cast(Dict[str, Any], compile_stats.get("propagate", {}))
+        zero_filter_stats = cast(Dict[str, Any], compile_stats.get("zero_filter", {}))
+        propagate_steps = cast(List[Dict[str, Any]], propagate_stats.get("steps", []))
+        zero_filter_steps = cast(List[Dict[str, Any]], zero_filter_stats.get("steps", []))
+
+        canonicalize_total_s = float(sum(float(s.get("canonicalize_s", 0.0)) for s in propagate_steps))
+        anti_merge_total_s = float(sum(float(s.get("anti_merge_s", 0.0)) for s in propagate_steps))
+        process_total_s = float(sum(float(s.get("process_s", 0.0)) for s in propagate_steps))
+        zero_filter_step_total_s = float(sum(float(s.get("step_total_s", 0.0)) for s in zero_filter_steps))
+
+        compile_stats["summary"] = {
+            "compile_total_s": compile_total_s,
+            "propagate_total_s": float(propagate_stats.get("total_s", process_total_s)),
+            "propagate_process_total_s": process_total_s,
+            "canonicalize_total_s": canonicalize_total_s,
+            "anti_merge_total_s": anti_merge_total_s,
+            "zero_filter_total_s": float(zero_filter_stats.get("total_s", zero_filter_step_total_s)),
+            "zero_filter_step_total_s": zero_filter_step_total_s,
+            "n_propagate_steps": len(propagate_steps),
+            "n_zero_filter_steps": len(zero_filter_steps),
+            "propagated_terms": n_terms_prop,
+            "final_terms": int(psum_union.x_mask.shape[0]),
+        }
+        summary = cast(Dict[str, Any], compile_stats["summary"])
+        print(
+            "[PPS Profile] "
+            f"compile_s={summary['compile_total_s']:.6f} "
+            f"propagate_s={summary['propagate_total_s']:.6f} "
+            f"canonicalize_s={summary['canonicalize_total_s']:.6f} "
+            f"anti_merge_s={summary['anti_merge_total_s']:.6f} "
+            f"zero_filter_s={summary['zero_filter_total_s']:.6f}"
+        )
 
     return CompiledTensorSurrogate(
         circuit=list(circuit),
@@ -548,6 +724,7 @@ def compile_expval_program(
         preset_name=str(preset),
         preset=cfg,
         _V0_cache={},
+        compile_stats=({} if compile_stats is None else compile_stats),
     )
 
 
