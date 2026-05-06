@@ -41,8 +41,6 @@ benchmark_cpu_vs_gpu_storage.ipynb
 test.ipynb
 CZ_validation.ipynb
 
-batch_implementation_from_embedding.md
-embedding_implementation_from_scratch.md
 NPU_PPS_validation_demo.ipynb
 max_weight_truncation_analysis/
 

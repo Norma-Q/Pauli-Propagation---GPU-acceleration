@@ -70,7 +70,7 @@ This repo includes a helper script that creates a clean conda env and installs t
 
 ```bash
 git clone <this-repo>
-cd Pauli-propagation-surrogate
+cd Pauli-Propagation---GPU-acceleration
 
 ./scripts/create_tutorial_conda_env.sh pps-tutorial
 conda activate pps-tutorial
@@ -106,7 +106,7 @@ Setup/installation instructions are intentionally centralized in this README.
 `Tutorial/README_TUTORIAL.md` focuses on notebook scope/order and feature usage mapping.
 
 ```bash
-cd Pauli-propagation-surrogate
+cd Pauli-Propagation---GPU-acceleration
 jupyter lab
 ```
 
@@ -118,25 +118,24 @@ Run all cells in order to confirm:
 
 **Important:** Make sure the correct kernel (conda environment) is selected in Jupyter.
 
-Recommended order: see `Tutorial/README.md`.
+Recommended order: see `Tutorial/README_TUTORIAL.md`.
 
 ## Embedding & Batch Input Support
 
-This repo supports feeding **data priors** (embedding angles) into circuits and evaluating **batched** expectation values on GPU.
+This repo supports feeding embedding data into circuits and evaluating **batched** expectation values on GPU.
 
-### Data embedding (priors) + stop-gradient
-- Use `PauliRotation(..., embedding_idx=...)` to mark gates driven by input data `priors`.
-- At runtime call `program.expvals(thetas, priors=priors)`.
-- Priors are detached inside PPS, so gradients flow through `thetas` but not through `priors`.
-- Implementation notes: [embedding_implementation_from_scratch.md](embedding_implementation_from_scratch.md)
+### Data embedding + stop-gradient
+- Use `PauliRotation(..., embedding_idx=...)` to mark gates driven by input data.
+- At runtime call `program.expvals(thetas, embedding=embedding)`.
+- Embedding inputs are treated separately from trainable `thetas`, so training flows through the model parameters while data is passed in as runtime input.
+- See `Tutorial/04_embedding_batched_inputs_basics.ipynb` for end-to-end examples.
 
-### Batched priors: `(Batch, N_Prior)`
-- `program.expvals(thetas, priors=priors_batch)` accepts `priors_batch` shaped `(Batch, N_Prior)` and returns `(Batch, Num_Observables)`.
-- Implementation notes: [batch_implementation_from_embedding.md](batch_implementation_from_embedding.md)
+### Batched embedding input: `(Batch, N_Embedding)`
+- `program.expvals(thetas, embedding=embedding_batch)` accepts `embedding_batch` shaped `(Batch, N_Embedding)` and returns `(Batch, Num_Observables)`.
+- Multi-example embedding usage is demonstrated in `Tutorial/04_embedding_batched_inputs_basics.ipynb`.
 
 ### Verification notebooks
-- Embedding examples: [embedding.ipynb](embedding.ipynb)
-- Batch + PennyLane cross-check: [batch.ipynb](batch.ipynb)
+- Embedding + batch examples: `Tutorial/04_embedding_batched_inputs_basics.ipynb`
 
 ## Quick Concepts (glossary-style)
 - **Pauli String**: A tensor product like $X \otimes I \otimes Z \otimes X$ that defines a measurement basis for an observable term.
@@ -151,7 +150,7 @@ This repo supports feeding **data priors** (embedding angles) into circuits and 
 
 ## Project Structure
 ```
-Pauli-propagation-surrogate/
+Pauli-Propagation---GPU-acceleration/
 ├── README.md                    # This file
 ├── requirements-tutorial.txt    # Tutorial dependency pins
 ├── scripts/
@@ -168,6 +167,7 @@ If you plan to distribute wheels, you will need to add standard packaging metada
 ## Notes
 - Run notebooks from the **repo root** so `src/` and `src_tensor/` are importable.
 - If you change Python/PyTorch versions, the compiled extension may stop importing.
+- High-level API presets currently available in `src_tensor.api` are `cpu`, `gpu`, and `hybrid`.
 
 ## References (background reading)
 - Quantum Surrogate Model overview and motivation: https://tzcjilwq.gensparkspace.com/
@@ -179,7 +179,7 @@ If you plan to distribute wheels, you will need to add standard packaging metada
 GNU AGPLv3 (see LICENSE)
 
 ## Copyright
-Copyright (C) 2026 rnd@norma.co.kr
+Copyright (C) 2026 rnd@norma.co.kr, ys_lee@norma.co.kr, hw_kim@norma.co.kr
 
 This program is licensed under the GNU Affero General Public License v3.0.
 
