@@ -1,6 +1,6 @@
-# Tutorial Notebooks
+# PadoPauli — Tutorial Notebooks
 
-English tutorial notebooks for the high-level tensor API and GPU memory-first workflows.
+English tutorial notebooks for the PadoPauli high-level tensor API and GPU memory-first workflows.
 
 ## Notebook index
 

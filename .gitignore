@@ -61,6 +61,9 @@ QAOA_1layer_Analysis/
 
 LWPP*/
 AGENTS.md
+CLAUDE.md
+CLAUDE.local.md
+.claude/
 .agents/
 
 # 캐시 삭제하고 싶으면 git rm -r --cached <file> 명령어 사용
